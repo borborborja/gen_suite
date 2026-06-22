@@ -1,0 +1,463 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { select } from "d3-selection";
+import { zoom as d3zoom, zoomIdentity, type ZoomBehavior } from "d3-zoom";
+import { useEstela, avatar, type TreeView } from "../store";
+import { fonts } from "../theme";
+import {
+  getStats, getRoots, getSubtree, searchPersons, importGedcom, getPerson,
+  listDuplicates, mergePersons, getHome, setHome,
+  displayName, lifespan, type TreeStats, type SearchHit, type TreeGraph, type DuplicatePair,
+  type PersonDetail,
+} from "../../../api/tree";
+import { computeLayout, NODE_W, NODE_H, type PositionedPerson } from "../../tree/layout";
+import { computePedigree } from "../../tree/pedigree";
+import { computeFan, arcPath } from "../../tree/fan";
+
+const tabs: { key: TreeView; label: string }[] = [
+  { key: "genograma", label: "Genograma" },
+  { key: "pedigree", label: "Pedigrí" },
+  { key: "abanico", label: "Abanico" },
+  { key: "lista", label: "Lista" },
+];
+
+function initials(given: string | null, surname: string | null): string {
+  return ((given?.[0] ?? "") + (surname?.[0] ?? "")).toUpperCase() || "··";
+}
+
+export default function ArbolView() {
+  const e = useEstela();
+  const [stats, setStats] = useState<TreeStats | null>(null);
+  const [focus, setFocus] = useState<string | null>(null);
+  const [home, setHomeId] = useState<string | null>(null);
+  const [graph, setGraph] = useState<TreeGraph | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [showDupes, setShowDupes] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const [s, r, h] = await Promise.all([getStats(), getRoots(), getHome().catch(() => ({ person_id: null }))]);
+      setStats(s); setHomeId(h.person_id);
+      const def = h.person_id || (r.length > 0 ? r[0].id : null);
+      if (def) setFocus((f) => f ?? def);
+    } catch { /* no backend */ }
+    setLoaded(true);
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  async function makeHome(id: string) {
+    try { await setHome(id); setHomeId(id); e.notify("Persona principal actualizada", "var(--ok)"); }
+    catch (err) { e.notify((err as Error).message, "var(--danger)"); }
+  }
+
+  const [depth, setDepth] = useState(4);
+  useEffect(() => {
+    if (!focus) return;
+    void getSubtree(focus, depth).then(setGraph).catch(() => setGraph(null));
+  }, [focus, depth]);
+
+  const empty = loaded && (stats?.persons ?? 0) === 0;
+
+  return (
+    <section style={{ padding: "32px 44px 64px" }}>
+      <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 20, flexWrap: "wrap", marginBottom: 22 }}>
+        <div>
+          <h1 style={{ fontFamily: fonts.serif, fontWeight: 600, fontSize: 34, margin: 0, letterSpacing: "-.02em" }}>Mi árbol</h1>
+          <p style={{ color: "var(--muted)", fontSize: 14, margin: "6px 0 0" }}>
+            {stats ? `${stats.persons.toLocaleString()} personas · ${stats.families.toLocaleString()} familias · ${stats.events.toLocaleString()} eventos` : "Cargando…"}
+          </p>
+        </div>
+        {!empty && (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <TreeSearch onPick={(id) => { setFocus(id); if (e.treeView === "lista") e.setTree("genograma"); }} />
+            <div style={{ display: "inline-flex", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 9, padding: 3, gap: 2 }}>
+              {tabs.map((t) => (
+                <span key={t.key} onClick={() => e.setTree(t.key)} style={{ padding: "8px 14px", borderRadius: 7, cursor: "pointer", fontSize: 13, fontWeight: e.treeView === t.key ? 600 : 500, color: e.treeView === t.key ? "#fff" : "var(--muted)", background: e.treeView === t.key ? "var(--accent)" : "transparent" }}>{t.label}</span>
+              ))}
+            </div>
+            {home && home !== focus && <button onClick={() => setFocus(home)} title="Volver a la persona principal" style={ghostBtn}>⌂ Inicio</button>}
+            <button onClick={() => setShowDupes(true)} style={ghostBtn}>Fusionar duplicados</button>
+          </div>
+        )}
+      </div>
+
+      {showDupes && <DuplicatesPanel onClose={() => setShowDupes(false)} onMerged={load} />}
+
+      {empty ? <EmptyTree onImported={load} onSuper={() => e.go("super")} /> : (
+        <>
+          <div style={{ display: "flex", gap: 18, alignItems: "center", marginBottom: 14, fontSize: 12.5, color: "var(--muted)" }}>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 7 }}><span style={{ width: 12, height: 12, borderRadius: 3, background: "var(--ok)" }} />Confirmado</span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 7 }}><span style={{ width: 12, height: 12, borderRadius: 3, border: "1.5px dashed var(--warn)", background: "var(--warn-faint)" }} />Con datos inferidos</span>
+          </div>
+
+          {e.treeView === "lista" ? <PeopleList /> : (
+            <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 18, alignItems: "start" }}>
+              {focus && <FocusCard personId={focus} isHome={home === focus} onHome={() => makeHome(focus)} />}
+              {graph ? (
+                e.treeView === "pedigree" ? <PedigreeCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} />
+                : e.treeView === "abanico" ? <FanCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} />
+                : <GraphCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} />
+              ) : <div style={{ color: "var(--muted)", padding: 40 }}>Cargando árbol…</div>}
+            </div>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function DuplicatesPanel({ onClose, onMerged }: { onClose: () => void; onMerged: () => void }) {
+  const [pairs, setPairs] = useState<DuplicatePair[] | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const reload = useCallback(() => {
+    setPairs(null);
+    listDuplicates().then(setPairs).catch(() => setPairs([]));
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  async function merge(keep: SearchHit, dup: SearchHit) {
+    if (!confirm(`Fusionar «${displayName(dup)}» dentro de «${displayName(keep)}»?\nLos nombres, hechos, parentescos y fuentes del duplicado pasan a la persona conservada. No se puede deshacer.`)) return;
+    setBusy(keep.id + dup.id);
+    try { await mergePersons(keep.id, dup.id); onMerged(); reload(); }
+    catch (err) { alert((err as Error).message); }
+    setBusy(null);
+  }
+
+  const label = (p: SearchHit) => `${displayName(p)}${lifespan(p) ? ` (${lifespan(p)})` : ""}`;
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 70, background: "rgba(15,11,6,.55)", display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "60px 20px", overflowY: "auto" }}>
+      <div onClick={(ev) => ev.stopPropagation()} style={{ width: "100%", maxWidth: 720, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16, padding: 26, boxShadow: "0 24px 80px rgba(0,0,0,.4)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+          <h2 style={{ fontFamily: fonts.serif, fontSize: 22, fontWeight: 600, margin: 0 }}>Posibles duplicados</h2>
+          <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--muted)", fontSize: 20, cursor: "pointer" }}>✕</button>
+        </div>
+        <p style={{ color: "var(--muted)", fontSize: 13, margin: "0 0 18px" }}>Personas que parecen la misma (nombre fonético + año compatible). Conserva la izquierda; la derecha se fusiona dentro.</p>
+        {pairs === null && <div style={{ color: "var(--muted)", fontSize: 13.5 }}>Buscando duplicados…</div>}
+        {pairs && pairs.length === 0 && <div style={{ color: "var(--muted)", fontSize: 13.5 }}>No se han encontrado duplicados evidentes.</div>}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {pairs?.map((pr) => (
+            <div key={pr.a.id + pr.b.id} style={{ background: "var(--bg)", border: "1px solid var(--line2)", borderRadius: 11, padding: "13px 15px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 13.5, fontWeight: 600 }}>{label(pr.a)}</span>
+                <span style={{ color: "var(--muted)" }}>↔</span>
+                <span style={{ fontSize: 13.5, fontWeight: 600 }}>{label(pr.b)}</span>
+                <span style={{ marginLeft: "auto", fontFamily: fonts.mono, fontSize: 10.5, color: "var(--accent)" }}>{Math.round(pr.score * 100)}%</span>
+              </div>
+              <div style={{ fontSize: 11.5, color: "var(--muted)", margin: "6px 0 10px" }}>{pr.reason}</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button disabled={!!busy} onClick={() => merge(pr.a, pr.b)} style={dupBtn}>Conservar «{displayName(pr.a)}»</button>
+                <button disabled={!!busy} onClick={() => merge(pr.b, pr.a)} style={dupBtn}>Conservar «{displayName(pr.b)}»</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const dupBtn: React.CSSProperties = { background: "var(--accent)", color: "#fff", border: "none", borderRadius: 8, padding: "8px 13px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" };
+
+function GraphCanvas({ graph, depth, setDepth, onRecenter }: { graph: TreeGraph; depth: number; setDepth: (d: number) => void; onRecenter: (id: string) => void }) {
+  const e = useEstela();
+  const layout = computeLayout(graph);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const zoomRef = useRef<ZoomBehavior<HTMLDivElement, unknown> | null>(null);
+
+  // set up d3 pan/zoom on the viewport, applying the transform to the content layer
+  useEffect(() => {
+    const vp = viewportRef.current, content = contentRef.current;
+    if (!vp || !content) return;
+    const zb = d3zoom<HTMLDivElement, unknown>()
+      .scaleExtent([0.1, 2.5])
+      .on("zoom", (ev) => { content.style.transform = `translate(${ev.transform.x}px,${ev.transform.y}px) scale(${ev.transform.k})`; });
+    zoomRef.current = zb;
+    select(vp).call(zb).on("dblclick.zoom", null);
+    return () => { select(vp).on(".zoom", null); };
+  }, []);
+
+  const fit = useCallback(() => {
+    const vp = viewportRef.current;
+    if (!vp || !zoomRef.current) return;
+    const w = vp.clientWidth, h = vp.clientHeight;
+    const k = Math.min(w / (layout.width + 80), h / (layout.height + 80), 1.2);
+    const tx = (w - layout.width * k) / 2, ty = 30;
+    select(vp).call(zoomRef.current.transform, zoomIdentity.translate(tx, ty).scale(k));
+  }, [layout.width, layout.height]);
+
+  // auto-fit when the graph changes
+  useEffect(() => { const t = setTimeout(fit, 50); return () => clearTimeout(t); }, [fit, graph.focus]);
+
+  const zoomBy = (factor: number) => { if (viewportRef.current && zoomRef.current) select(viewportRef.current).call(zoomRef.current.scaleBy, factor); };
+
+  return (
+    <div style={{ position: "relative", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16, overflow: "hidden", height: "72vh" }}>
+      <div ref={viewportRef} style={{ position: "absolute", inset: 0, cursor: "grab", overflow: "hidden" }}>
+        <div ref={contentRef} style={{ position: "absolute", top: 0, left: 0, transformOrigin: "0 0", width: layout.width, height: layout.height }}>
+          <svg width={layout.width} height={layout.height} style={{ position: "absolute", inset: 0, overflow: "visible" }}>
+            {layout.coupleLinks.map((l, i) => <line key={`c${i}`} x1={l.x1} y1={l.y1} x2={l.x2} y2={l.y2} stroke="var(--line)" strokeWidth={2} strokeDasharray="4 3" />)}
+            {layout.parentLinks.map((l, i) => <path key={`p${i}`} d={`M${l.x1} ${l.y1} C${l.x1} ${(l.y1 + l.y2) / 2} ${l.x2} ${(l.y1 + l.y2) / 2} ${l.x2} ${l.y2}`} fill="none" stroke="var(--line)" strokeWidth={2} />)}
+          </svg>
+          {layout.nodes.map((n: PositionedPerson) => {
+            const inferred = (n.deduction_count ?? 0) > 0;
+            const av = avatar(inferred ? "inferred" : "confirmed");
+            const sel = n.id === graph.focus;
+            return (
+              <div key={n.id} onClick={() => (sel ? e.openPerson(n.id) : onRecenter(n.id))} title={sel ? "Abrir ficha" : "Centrar aquí · clic de nuevo abre la ficha"} style={{ position: "absolute", left: n.x, top: n.y, width: NODE_W, height: NODE_H, display: "flex", alignItems: "center", gap: 10, background: "var(--bg)", border: `1.5px ${inferred ? "dashed" : "solid"} ${sel ? "var(--accent)" : inferred ? "var(--warn)" : "var(--line)"}`, borderRadius: 11, padding: "8px 10px", cursor: "pointer", boxShadow: "var(--shadow)", boxSizing: "border-box" }}>
+                <div style={{ width: 34, height: 34, borderRadius: 8, flex: "none", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: fonts.serif, fontWeight: 600, fontSize: 14, background: av.bg, color: av.fg }}>{initials(n.given, n.surname)}</div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{displayName(n)}</div>
+                  <div style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>{lifespan(n)}</div>
+                </div>
+                {sel && <span onClick={(ev) => { ev.stopPropagation(); e.openPerson(n.id); }} title="Abrir ficha" style={{ flex: "none", color: "var(--accent)", fontSize: 13, padding: "0 2px" }}>↗</span>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* controls */}
+      <div style={{ position: "absolute", top: 14, right: 14, display: "flex", flexDirection: "column", gap: 6 }}>
+        <Ctrl onClick={() => zoomBy(1.3)}>+</Ctrl>
+        <Ctrl onClick={() => zoomBy(1 / 1.3)}>−</Ctrl>
+        <Ctrl onClick={fit} title="Ajustar">⤢</Ctrl>
+      </div>
+      <div style={{ position: "absolute", bottom: 14, left: 14, display: "flex", alignItems: "center", gap: 8, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 9, padding: "6px 10px" }}>
+        <span style={{ fontFamily: fonts.mono, fontSize: 11, color: "var(--muted)" }}>generaciones</span>
+        <button onClick={() => setDepth(Math.max(2, depth - 1))} style={miniBtn}>−</button>
+        <span style={{ fontFamily: fonts.mono, fontSize: 12, minWidth: 14, textAlign: "center" }}>{depth}</span>
+        <button onClick={() => setDepth(Math.min(6, depth + 1))} style={miniBtn}>+</button>
+      </div>
+      <div style={{ position: "absolute", bottom: 14, right: 14, fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)", pointerEvents: "none" }}>arrastra para mover · rueda para zoom</div>
+    </div>
+  );
+}
+
+const miniBtn: React.CSSProperties = { background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 5, width: 22, height: 22, cursor: "pointer", color: "var(--fg)", fontSize: 13 };
+
+function Ctrl({ children, onClick, title }: { children: React.ReactNode; onClick: () => void; title?: string }) {
+  return (
+    <button onClick={onClick} title={title} style={{ width: 34, height: 34, borderRadius: 8, background: "var(--surface)", border: "1px solid var(--line)", cursor: "pointer", color: "var(--fg)", fontSize: 17, boxShadow: "var(--shadow)" }}>{children}</button>
+  );
+}
+
+const ghostBtn: React.CSSProperties = { background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 9, padding: "9px 14px", fontFamily: "inherit", fontSize: 13, fontWeight: 600, cursor: "pointer" };
+const canvasBox: React.CSSProperties = { position: "relative", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16, overflow: "hidden", height: "72vh" };
+
+// ── header person search (typeahead → recenter) ──
+function TreeSearch({ onPick }: { onPick: (id: string) => void }) {
+  const [q, setQ] = useState("");
+  const [res, setRes] = useState<SearchHit[]>([]);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (q.trim().length < 2) { setRes([]); return; }
+    const t = setTimeout(() => searchPersons(q).then(setRes).catch(() => setRes([])), 220);
+    return () => clearTimeout(t);
+  }, [q]);
+  return (
+    <div style={{ position: "relative" }}>
+      <input value={q} onChange={(ev) => { setQ(ev.target.value); setOpen(true); }} onBlur={() => setTimeout(() => setOpen(false), 150)} placeholder="Ir a una persona…" style={{ width: 200, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 9, padding: "9px 12px", color: "var(--fg)", fontFamily: "inherit", fontSize: 13 }} />
+      {open && res.length > 0 && (
+        <div style={{ position: "absolute", top: "100%", left: 0, width: 280, zIndex: 40, background: "var(--elevated)", border: "1px solid var(--line)", borderRadius: 9, marginTop: 4, boxShadow: "var(--shadow)", maxHeight: 280, overflowY: "auto" }}>
+          {res.map((p) => (
+            <div key={p.id} onMouseDown={() => { onPick(p.id); setQ(""); setRes([]); setOpen(false); }} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "9px 12px", cursor: "pointer", borderBottom: "1px solid var(--line2)" }}>
+              <span style={{ fontSize: 13, fontWeight: 600 }}>{displayName(p)}</span>
+              <span style={{ fontFamily: fonts.mono, fontSize: 11, color: "var(--muted)" }}>{lifespan(p)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── focus person card (left panel) ──
+function FocusCard({ personId, isHome, onHome }: { personId: string; isHome: boolean; onHome: () => void }) {
+  const e = useEstela();
+  const [p, setP] = useState<PersonDetail | null>(null);
+  useEffect(() => { setP(null); getPerson(personId).then(setP).catch(() => setP(null)); }, [personId]);
+  const primary = p?.names.find((n) => n.is_primary) ?? p?.names[0];
+  const name = displayName({ given: primary?.given ?? null, surname: primary?.surname ?? null });
+  const birth = p?.events.find((ev) => ev.type === "birth");
+  const death = p?.events.find((ev) => ev.type === "death");
+  const place = p?.events.find((ev) => ev.place)?.place;
+  const av = avatar((p?.names.some((n) => n.is_inferred) || p?.events.some((ev) => ev.is_inferred)) ? "inferred" : "confirmed");
+  return (
+    <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 14, padding: 18, position: "sticky", top: 12 }}>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, textAlign: "center" }}>
+        <div style={{ width: 64, height: 64, borderRadius: 16, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: fonts.serif, fontWeight: 600, fontSize: 26, background: av.bg, color: av.fg }}>{initials(primary?.given ?? null, primary?.surname ?? null)}</div>
+        <div style={{ fontFamily: fonts.serif, fontSize: 18, fontWeight: 600, lineHeight: 1.15 }}>{name}</div>
+        <div style={{ fontSize: 12.5, color: "var(--muted)" }}>{lifespan({ birth_year: birth?.date_year ?? null, death_year: death?.date_year ?? null }) || "—"}{place ? ` · ${place}` : ""}</div>
+        {isHome && <span style={{ fontFamily: fonts.mono, fontSize: 10, background: "var(--accent)", color: "#fff", borderRadius: 5, padding: "2px 7px" }}>PERSONA PRINCIPAL</span>}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 7, marginTop: 16 }}>
+        <button onClick={() => e.openPerson(personId)} style={{ ...ghostBtn, width: "100%", textAlign: "center", background: "var(--accent)", color: "#fff", border: "none" }}>Abrir ficha</button>
+        {!isHome && <button onClick={onHome} style={{ ...ghostBtn, width: "100%" }}>★ Fijar como principal</button>}
+        <button onClick={() => { import("../../../api/linkage").then(({ discover }) => discover(personId).catch(() => undefined)); e.notify("Buscando registros…"); e.go("descubrimientos"); }} style={{ ...ghostBtn, width: "100%" }}>Buscar registros</button>
+        <button onClick={() => { import("../../../api/linkage").then(({ discoverFamily }) => discoverFamily(personId).catch(() => undefined)); e.notify("Buscando hermanos y padres…"); e.go("descubrimientos"); }} style={{ ...ghostBtn, width: "100%" }} title="Busca otras partidas con los mismos padres → hermanos y confirma a los padres">Descubrir familia (hermanos)</button>
+      </div>
+    </div>
+  );
+}
+
+// Shared pan/zoom viewport with fit + zoom + generation controls (mirrors GraphCanvas's scaffold).
+function PanZoom({ width, height, depth, setDepth, children }: { width: number; height: number; depth: number; setDepth: (d: number) => void; children: React.ReactNode }) {
+  const vpRef = useRef<HTMLDivElement>(null);
+  const layerRef = useRef<HTMLDivElement>(null);
+  const zoomRef = useRef<ZoomBehavior<HTMLDivElement, unknown> | null>(null);
+  useEffect(() => {
+    const vp = vpRef.current, layer = layerRef.current;
+    if (!vp || !layer) return;
+    const zb = d3zoom<HTMLDivElement, unknown>().scaleExtent([0.1, 2.5])
+      .on("zoom", (ev) => { layer.style.transform = `translate(${ev.transform.x}px,${ev.transform.y}px) scale(${ev.transform.k})`; });
+    zoomRef.current = zb;
+    select(vp).call(zb).on("dblclick.zoom", null);
+    return () => { select(vp).on(".zoom", null); };
+  }, []);
+  const fit = useCallback(() => {
+    const vp = vpRef.current;
+    if (!vp || !zoomRef.current) return;
+    const k = Math.min(vp.clientWidth / (width + 80), vp.clientHeight / (height + 80), 1.2);
+    select(vp).call(zoomRef.current.transform, zoomIdentity.translate((vp.clientWidth - width * k) / 2, 30).scale(k));
+  }, [width, height]);
+  useEffect(() => { const t = setTimeout(fit, 50); return () => clearTimeout(t); }, [fit]);
+  const zoomBy = (f: number) => { if (vpRef.current && zoomRef.current) select(vpRef.current).call(zoomRef.current.scaleBy, f); };
+  return (
+    <div style={canvasBox}>
+      <div ref={vpRef} style={{ position: "absolute", inset: 0, cursor: "grab", overflow: "hidden" }}>
+        <div ref={layerRef} style={{ position: "absolute", top: 0, left: 0, transformOrigin: "0 0", width, height }}>{children}</div>
+      </div>
+      <div style={{ position: "absolute", top: 14, right: 14, display: "flex", flexDirection: "column", gap: 6 }}>
+        <Ctrl onClick={() => zoomBy(1.3)}>+</Ctrl><Ctrl onClick={() => zoomBy(1 / 1.3)}>−</Ctrl><Ctrl onClick={fit} title="Ajustar">⤢</Ctrl>
+      </div>
+      <div style={{ position: "absolute", bottom: 14, left: 14, display: "flex", alignItems: "center", gap: 8, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 9, padding: "6px 10px" }}>
+        <span style={{ fontFamily: fonts.mono, fontSize: 11, color: "var(--muted)" }}>generaciones</span>
+        <button onClick={() => setDepth(Math.max(2, depth - 1))} style={miniBtn}>−</button>
+        <span style={{ fontFamily: fonts.mono, fontSize: 12, minWidth: 14, textAlign: "center" }}>{depth}</span>
+        <button onClick={() => setDepth(Math.min(6, depth + 1))} style={miniBtn}>+</button>
+      </div>
+    </div>
+  );
+}
+
+function PedigreeCanvas({ graph, depth, setDepth, onRecenter }: { graph: TreeGraph; depth: number; setDepth: (d: number) => void; onRecenter: (id: string) => void }) {
+  const ped = computePedigree(graph, graph.focus, depth);
+  return (
+    <PanZoom width={ped.width} height={ped.height} depth={depth} setDepth={setDepth}>
+      <svg width={ped.width} height={ped.height} style={{ position: "absolute", inset: 0, overflow: "visible" }}>
+        {ped.links.map((l, i) => <path key={i} d={`M${l.x1} ${l.y1} C${(l.x1 + l.x2) / 2} ${l.y1} ${(l.x1 + l.x2) / 2} ${l.y2} ${l.x2} ${l.y2}`} fill="none" stroke="var(--line)" strokeWidth={2} />)}
+      </svg>
+      {ped.nodes.map((n) => {
+        const inferred = (n.deduction_count ?? 0) > 0;
+        const av = avatar(inferred ? "inferred" : "confirmed");
+        const sel = n.id === graph.focus;
+        return (
+          <div key={n.id} onClick={() => onRecenter(n.id)} style={{ position: "absolute", left: n.x, top: n.y, width: NODE_W, height: NODE_H, display: "flex", alignItems: "center", gap: 10, background: "var(--bg)", border: `1.5px ${inferred ? "dashed var(--warn)" : sel ? "solid var(--accent)" : "solid var(--line)"}`, borderRadius: 11, padding: "8px 10px", boxSizing: "border-box", boxShadow: "var(--shadow)", cursor: "pointer" }}>
+            <div style={{ width: 34, height: 34, borderRadius: 8, flex: "none", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: fonts.serif, fontWeight: 600, fontSize: 14, background: av.bg, color: av.fg }}>{initials(n.given, n.surname)}</div>
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{displayName(n)}</div>
+              <div style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>{lifespan(n)}</div>
+            </div>
+          </div>
+        );
+      })}
+    </PanZoom>
+  );
+}
+
+function FanCanvas({ graph, depth, setDepth, onRecenter }: { graph: TreeGraph; depth: number; setDepth: (d: number) => void; onRecenter: (id: string) => void }) {
+  const fan = computeFan(graph, graph.focus, depth);
+  const size = fan.R * 2;
+  const fill = (sex: string, gen: number) => gen === 0 ? "var(--accent)" : sex === "F" ? "var(--warn-faint, #f3e6d6)" : sex === "M" ? "var(--ok-faint, #e7efe6)" : "var(--bg)";
+  return (
+    <PanZoom width={size} height={size} depth={depth} setDepth={setDepth}>
+      <svg width={size} height={size} style={{ position: "absolute", inset: 0 }}>
+        {fan.segs.map((s) => {
+          const d = arcPath(fan.center, fan.center, s.r0, s.r1, s.a0, s.a1);
+          const mid = (s.a0 + s.a1) / 2, rr = (s.r0 + s.r1) / 2;
+          const tx = fan.center + rr * Math.cos(mid), ty = fan.center + rr * Math.sin(mid);
+          const deg = (mid * 180) / Math.PI;
+          const rot = deg > 90 && deg < 270 ? deg + 180 : deg;
+          return (
+            <g key={s.id} onClick={() => onRecenter(s.id)} style={{ cursor: "pointer" }}>
+              <path d={d} fill={fill(s.sex, s.gen)} stroke="var(--surface)" strokeWidth={2} />
+              {s.gen <= 3 && (
+                <text x={tx} y={ty} fontSize={s.gen === 0 ? 12 : 10.5} fontFamily={fonts.sans} fontWeight={600} fill={s.gen === 0 ? "#fff" : "var(--fg)"} textAnchor="middle" dominantBaseline="middle" transform={s.gen === 0 ? undefined : `rotate(${rot} ${tx} ${ty})`} style={{ pointerEvents: "none" }}>
+                  {s.gen === 0 ? displayName(s) : initials(s.given, s.surname)}
+                </text>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+    </PanZoom>
+  );
+}
+
+function PeopleList() {
+  const e = useEstela();
+  const [q, setQ] = useState("");
+  const [people, setPeople] = useState<SearchHit[]>([]);
+  useEffect(() => {
+    const t = setTimeout(() => {
+      (q.trim() ? searchPersons(q) : getRoots()).then(setPeople).catch(() => setPeople([]));
+    }, 250);
+    return () => clearTimeout(t);
+  }, [q]);
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "11px 16px", marginBottom: 18, maxWidth: 420 }}>
+        <svg width={17} height={17} viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth={1.8}><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
+        <input value={q} onChange={(ev) => setQ(ev.target.value)} placeholder="Buscar por nombre o apellido…" style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "var(--fg)", fontFamily: "inherit", fontSize: 14 }} />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(248px,1fr))", gap: 14 }}>
+        {people.map((p) => {
+          const av = avatar("confirmed");
+          return (
+            <div key={p.id} onClick={() => e.openPerson(p.id)} style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 13, padding: 16, cursor: "pointer" }}>
+              <div style={{ display: "flex", gap: 13, alignItems: "center" }}>
+                <div style={{ width: 44, height: 44, borderRadius: 11, flex: "none", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: fonts.serif, fontWeight: 600, fontSize: 18, background: av.bg, color: av.fg }}>{initials(p.given, p.surname)}</div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontWeight: 600, fontSize: 14.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{displayName(p)}</div>
+                  <div style={{ fontFamily: fonts.mono, fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{lifespan(p)}</div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {people.length === 0 && <div style={{ color: "var(--muted)", fontSize: 13.5 }}>Sin resultados.</div>}
+      </div>
+    </div>
+  );
+}
+
+function EmptyTree({ onImported, onSuper }: { onImported: () => void; onSuper?: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const ref = useRef<HTMLInputElement>(null);
+  async function onFile(ev: React.ChangeEvent<HTMLInputElement>) {
+    const f = ev.target.files?.[0];
+    if (!f) return;
+    setBusy(true);
+    try { await importGedcom(f); onImported(); } catch (e) { alert((e as Error).message); }
+    setBusy(false);
+  }
+  return (
+    <div style={{ textAlign: "center", padding: "60px 20px", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16 }}>
+      <h2 style={{ fontFamily: fonts.serif, fontSize: 26, fontWeight: 600, margin: "0 0 10px" }}>Tu árbol está vacío</h2>
+      <p style={{ color: "var(--muted)", fontSize: 14.5, margin: "0 0 22px" }}>Importa un GEDCOM para empezar — Estela buscará parientes en tus libros.</p>
+      <input ref={ref} type="file" accept=".ged,.gedcom" onChange={onFile} style={{ display: "none" }} />
+      <div style={{ display: "inline-flex", gap: 10, flexWrap: "wrap", justifyContent: "center" }}>
+        <button onClick={() => ref.current?.click()} disabled={busy} style={{ background: "var(--accent)", color: "#fff", border: "none", borderRadius: 9, padding: "13px 22px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1 }}>
+          {busy ? "Importando…" : "Importar árbol (GEDCOM)"}
+        </button>
+        {onSuper && (
+          <button onClick={onSuper} style={{ background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 9, padding: "13px 22px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>
+            Reconstruir desde mis libros
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}

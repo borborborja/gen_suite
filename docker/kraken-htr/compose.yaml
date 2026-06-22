@@ -1,0 +1,33 @@
+name: kraken-htr
+
+# OPTIONAL separate stack (plan §6) for local HTR. gen_suite's backend/worker reach it over a shared
+# Docker network at http://kraken-htr:8000 — set a `kraken` provider credential whose base_url is that.
+# Attach it to the same network as the main stack (e.g. `gen_suite_default`) via `external` below, or
+# run both with a single compose. Shares the models volume so corrected pages can retrain the .mlmodel.
+
+services:
+  kraken-htr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kraken-htr:latest
+    container_name: kraken-htr
+    environment:
+      KRAKEN_MODEL_DIR: /models
+      KRAKEN_DEFAULT_MODEL: ${KRAKEN_DEFAULT_MODEL:-default.mlmodel}
+    volumes:
+      - krakenmodels:/models
+    # deploy with a GPU if available (uncomment on a CUDA host):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{capabilities: [gpu]}]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:8000/health'); "]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  krakenmodels:

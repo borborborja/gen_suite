@@ -1,0 +1,31 @@
+# Secrets / env
+.env
+*.local
+
+# Private homelab deployment overlay (Cloudflare tunnel, external nets, bind IPs)
+compose.micapum.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-local/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# Node / frontend
+node_modules/
+frontend/dist/
+
+# Data (homelab persistent volumes live outside the repo, but ignore any local ones)
+dades/
+*.sqlite3
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

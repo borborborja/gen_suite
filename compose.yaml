@@ -1,0 +1,128 @@
+name: gen_suite
+
+# Generic, portable stack — works on any host (amd64/arm64) with Docker.
+#   1) cp .env.example .env   and fill the secrets (openssl rand -base64 32 → SUITE_MASTER_KEY)
+#   2) docker compose up -d --build
+# The frontend (nginx serving the build + proxying /api) is published on :8080; everything else stays
+# on the internal default network. For the homelab deployment (Cloudflare tunnel, external networks,
+# bind IPs) use the private overlay:  docker compose -f compose.micapum.yaml up -d --build
+# Build on the target arch (or: docker buildx build --platform linux/amd64) — see DEPLOY.md.
+
+services:
+  gen-suite-db:
+    image: pgvector/pgvector:pg16
+    container_name: gen-suite-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  gen-suite-redis:
+    image: redis:7-alpine
+    container_name: gen-suite-redis
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  gen-suite-minio:
+    image: minio/minio:latest
+    container_name: gen-suite-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - miniodata:/data
+    ports:
+      - 127.0.0.1:9001:9001   # console — localhost only; do not publish
+    restart: unless-stopped
+
+  gen-suite-migrate:
+    image: gen-suite-backend:latest
+    container_name: gen-suite-migrate
+    command: ["alembic", "upgrade", "head"]
+    env_file: [.env]
+    environment:
+      POSTGRES_HOST: gen-suite-db
+    depends_on:
+      gen-suite-db:
+        condition: service_healthy
+    restart: "no"
+
+  gen-suite-backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: gen-suite-backend:latest
+    container_name: gen-suite-backend
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: [.env]
+    environment:
+      POSTGRES_HOST: gen-suite-db
+      REDIS_URL: redis://:${REDIS_PASSWORD}@gen-suite-redis:6379/0
+      MINIO_ENDPOINT: gen-suite-minio:9000
+    depends_on:
+      gen-suite-db:
+        condition: service_healthy
+      gen-suite-redis:
+        condition: service_healthy
+      gen-suite-migrate:
+        condition: service_completed_successfully
+    ports:
+      - 127.0.0.1:8000:8000   # API + Swagger at /docs — localhost (the frontend proxies /api internally)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  gen-suite-worker:
+    image: gen-suite-backend:latest
+    container_name: gen-suite-worker
+    command: ["arq", "app.tasks.worker.WorkerSettings"]
+    env_file: [.env]
+    environment:
+      POSTGRES_HOST: gen-suite-db
+      REDIS_URL: redis://:${REDIS_PASSWORD}@gen-suite-redis:6379/0
+      MINIO_ENDPOINT: gen-suite-minio:9000
+    depends_on:
+      gen-suite-redis:
+        condition: service_healthy
+      gen-suite-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  gen-suite-frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    image: gen-suite-frontend:latest
+    container_name: gen-suite-frontend
+    depends_on:
+      gen-suite-backend:
+        condition: service_healthy
+    ports:
+      - ${FRONTEND_PORT:-8080}:80   # the app UI — point your reverse proxy / browser here
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

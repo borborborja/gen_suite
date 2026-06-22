@@ -1,0 +1,93 @@
+# Generic local stack — runs the whole suite on any machine (no homelab networks / fixed IP).
+#   cp .env.example .env   # fill SUITE_MASTER_KEY (openssl rand -base64 32) etc.
+#   docker compose -f compose.local.yaml up --build
+# Then open http://localhost:8080 (frontend → /api proxied to the backend).
+name: gen_suite_local
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gensuite}
+      POSTGRES_USER: ${POSTGRES_USER:-gensuite}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gensuite_dev}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    ports: ["127.0.0.1:5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gensuite} -d ${POSTGRES_DB:-gensuite}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-gensuite}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-gensuite_dev_secret}
+    volumes: [miniodata:/data]
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+
+  migrate:
+    build: { context: ., dockerfile: docker/backend.Dockerfile }
+    image: gen-suite-backend:latest
+    command: ["alembic", "upgrade", "head"]
+    env_file: [.env]
+    environment:
+      POSTGRES_HOST: db
+    depends_on:
+      db: { condition: service_healthy }
+    restart: "no"
+
+  gen-suite-backend:  # name matches docker/frontend-nginx.conf's proxy_pass target
+    image: gen-suite-backend:latest
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: [.env]
+    environment:
+      POSTGRES_HOST: db
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    ports: ["127.0.0.1:8000:8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  worker:
+    image: gen-suite-backend:latest
+    command: ["arq", "app.tasks.worker.WorkerSettings"]
+    env_file: [.env]
+    environment:
+      POSTGRES_HOST: db
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+    depends_on:
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
+  frontend:
+    build: { context: ., dockerfile: docker/frontend.Dockerfile }
+    image: gen-suite-frontend:latest
+    depends_on:
+      gen-suite-backend: { condition: service_healthy }
+    ports: ["127.0.0.1:8080:80"]
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
