@@ -24,13 +24,16 @@ def _s3():
     global _client
     if _client is None:
         scheme = "https" if settings.minio_secure else "http"
+        cfg: dict = {"signature_version": "s3v4"}
+        if settings.minio_addressing_style:  # "path" for MinIO/Backblaze; "" lets boto3 decide
+            cfg["s3"] = {"addressing_style": settings.minio_addressing_style}
         _client = boto3.client(
             "s3",
             endpoint_url=f"{scheme}://{settings.minio_endpoint}",
             aws_access_key_id=settings.minio_access_key,
             aws_secret_access_key=settings.minio_secret_key,
-            config=Config(signature_version="s3v4"),
-            region_name="us-east-1",
+            config=Config(**cfg),
+            region_name=settings.minio_region,
         )
     return _client
 
@@ -42,11 +45,19 @@ def bucket_for(visibility: str) -> str:
 async def ensure_buckets() -> None:
     def _ensure() -> None:
         s3 = _s3()
+        # AWS S3 requires a LocationConstraint to create a bucket outside us-east-1; MinIO ignores it.
+        mk: dict = {}
+        if settings.minio_region and settings.minio_region != "us-east-1":
+            mk["CreateBucketConfiguration"] = {"LocationConstraint": settings.minio_region}
         for bucket in (settings.minio_bucket_private, settings.minio_bucket_public):
             try:
                 s3.head_bucket(Bucket=bucket)
             except ClientError:
-                s3.create_bucket(Bucket=bucket)
+                # external S3 with restricted creds may forbid create — pre-create the buckets there
+                try:
+                    s3.create_bucket(Bucket=bucket, **mk)
+                except ClientError:
+                    pass
 
     await asyncio.to_thread(_ensure)
 

@@ -45,13 +45,20 @@ class Settings(BaseSettings):
     # ── Secrets at rest (AES-256-GCM envelope for provider API keys) ──────────
     suite_master_key: str = ""  # base64-encoded 32 bytes; required once Phase 3 lands
 
-    # ── Object storage (MinIO / S3) — used from Phase 2 ───────────────────────
+    # ── Object storage (MinIO / any S3: AWS, Backblaze, Wasabi) ───────────────
     minio_endpoint: str = "minio:9000"
     minio_access_key: str = "gensuite"
     minio_secret_key: str = "gensuite-secret"
     minio_secure: bool = False
     minio_bucket_private: str = "gensuite-private"
     minio_bucket_public: str = "gensuite-public"
+    minio_region: str = "us-east-1"          # AWS needs the bucket's real region for SigV4
+    minio_addressing_style: str = ""         # "path" for MinIO/Backblaze; "" = boto3 auto
+
+    # ── Backups (Postgres → S3) ───────────────────────────────────────────────
+    backup_to_s3: bool = False               # enable the daily pg_dump → S3 cron
+    backup_retention: int = 14               # keep the N most recent dumps
+    backup_hour: int = 3                      # UTC hour for the daily backup
 
     # ── Connector gates (server-admin scope) ──────────────────────────────────
     fs_connector_enabled: bool = False

@@ -14,16 +14,43 @@ tu dominio (p. ej. `https://TU-DOMINIO`). API, worker, Postgres, Redis y MinIO s
 - El proxy/túnel apunta a `gen-suite-frontend:80` (build estático), **no** al dev-server de Vite.
 
 ## Pasos de despliegue
-1. `cp .env.example .env` y rellena los secretos; `docker compose up -d --build`.
-2. **Primer arranque — bootstrap del admin**: pon temporalmente `ALLOW_FIRST_USER_ADMIN=true` en `.env`,
-   `docker compose up -d --build`, **regístrate** (ese primer usuario será server-admin), y vuelve a
-   poner `ALLOW_FIRST_USER_ADMIN=false` + `docker compose up -d` para recargar. Después nadie más se
-   autopromociona.
+1. `cp config/.env.example config/.env` y rellena los secretos; `docker compose --env-file config/.env up -d --build`.
+2. **Primer arranque — bootstrap del admin**: pon temporalmente `ALLOW_FIRST_USER_ADMIN=true` en `config/.env`,
+   `docker compose --env-file config/.env up -d --build`, **regístrate** (ese primer usuario será server-admin),
+   y vuelve a poner `ALLOW_FIRST_USER_ADMIN=false` + `docker compose --env-file config/.env up -d` para
+   recargar. Después nadie más se autopromociona.
 3. Apunta tu proxy/túnel a `gen-suite-frontend:80` y verifica: `https://TU-DOMINIO` carga el login; la
    API responde 401 sin token.
 
 > Para el despliegue privado del autor (túnel Cloudflare/Dockflare, redes externas, IPs de LAN) usa el
 > overlay `compose.micapum.yaml` (ignorado por git): `docker compose -f compose.micapum.yaml up -d --build`.
+
+## Almacenamiento: qué va a S3 vs Postgres
+| Dato | Dónde | Por qué |
+|---|---|---|
+| PDFs originales, imágenes de página (WebP/JPG), fotos de personas, descargas FamilySearch | **S3 / MinIO** | Blobs grandes, solo se leen por clave. Es para lo que sirve el almacenamiento de objetos. |
+| Texto OCR, actas, menciones, **embeddings** (pgvector) | **Postgres** | Son datos **consultables** (full-text, extracción, búsqueda vectorial). En S3 no se pueden consultar. |
+| La BBDD viva | **Disco** (`./data/postgres`) | Una BD no puede correr sobre S3. Se respalda a S3 (abajo). |
+
+### MinIO bundled (por defecto)
+La biblioteca se guarda en el MinIO del stack, con los datos en `./data/minio` (host-mapeado).
+`COMPOSE_PROFILES=bundled-storage` en `config/.env` lo activa.
+
+### S3 externo (AWS / Backblaze / Wasabi)
+1. Pre-crea los **dos buckets** (privado y público) en tu proveedor.
+2. En `config/.env`: `COMPOSE_PROFILES=` (vacío, para no arrancar el MinIO local) y
+   `MINIO_ENDPOINT` (p. ej. `s3.eu-west-1.amazonaws.com`), `MINIO_SECURE=true`, `MINIO_REGION`,
+   `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY`, `MINIO_BUCKET_PRIVATE`/`MINIO_BUCKET_PUBLIC`. (Backblaze/Wasabi:
+   añade `MINIO_ADDRESSING_STYLE=path` si hay errores de addressing.)
+3. `docker compose --env-file config/.env up -d --build` → no arranca MinIO; todo va a tu S3.
+   El acceso a los blobs sigue siendo **a través de la API** (auth + RLS), nunca por URL pública, así que
+   ambos buckets pueden ser privados a nivel de S3.
+
+### Backups de la BBDD a S3
+`BACKUP_TO_S3=true` (en `config/.env`) activa un `pg_dump` diario (hora `BACKUP_HOUR` UTC) que sube un dump
+en formato custom a `{MINIO_BUCKET_PRIVATE}/_backups/gensuite-FECHA.dump`, conservando los `BACKUP_RETENTION`
+más recientes. **Restaurar**: descarga el `.dump` y
+`pg_restore --clean --no-owner -h <host> -U <POSTGRES_USER> -d <POSTGRES_DB> archivo.dump`.
 
 ## Avisos importantes
 - **Volumen de Postgres**: las contraseñas solo se aplican al **inicializar** el volumen `pgdata`. Si ya

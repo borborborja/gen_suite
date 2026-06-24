@@ -21,18 +21,26 @@ conectan con un rol **no-superusuario** (`APP_DB_USER`) para que la RLS se apliq
 ## Arrancar (genérico, cualquier host)
 
 ```bash
-cp .env.example .env           # y rellena secretos (openssl rand -base64 32 → SUITE_MASTER_KEY)
-docker compose up -d --build
+cp config/.env.example config/.env     # rellena secretos (openssl rand -base64 32 → SUITE_MASTER_KEY)
+docker compose --env-file config/.env up -d --build
 ```
 
-- Frontend (UI): `http://localhost:8080`  (cambia `FRONTEND_PORT` en `.env`)
+- Frontend (UI): `http://localhost:8080`  (cambia `FRONTEND_PORT` en `config/.env`)
 - API + Swagger: `http://localhost:8000/docs`  (solo localhost)
 - MinIO consola: `http://localhost:9001`  (solo localhost; no la publiques)
 
-`compose.yaml` es **portable** (volúmenes nombrados, red por defecto, sin dependencias de homelab) y
-multi-arquitectura (amd64/arm64 — ver `DEPLOY.md`). El servicio `gen-suite-migrate` aplica
-`alembic upgrade head` antes de arrancar backend/worker. El **primer usuario registrado** queda como
-`server-admin`.
+`compose.yaml` es **portable** y multi-arquitectura (amd64/arm64 — ver `DEPLOY.md`). **Toda la config vive
+en `./config`** (`config/.env`) y **todos los datos en `./data`** (Postgres/Redis/MinIO; cambia con
+`DATA_DIR`) — host-mapeados, visibles y respaldables. El servicio `gen-suite-migrate` aplica
+`alembic upgrade head` antes de arrancar; el **primer usuario registrado** queda como `server-admin`.
+
+### Almacenamiento (biblioteca → MinIO bundled o S3 externo)
+La biblioteca (PDFs, imágenes de página, fotos) va a **almacenamiento de objetos**; el texto OCR, actas,
+menciones y embeddings van a **Postgres** (consultables, pgvector). Por defecto se usa un **MinIO bundled**
+(datos en `./data/minio`). Para usar un **S3 externo** (AWS/Backblaze/Wasabi): en `config/.env` pon
+`COMPOSE_PROFILES=` (vacío) y rellena `MINIO_ENDPOINT/SECURE/REGION/ACCESS_KEY/SECRET_KEY` + los 2 buckets
+(pre-creados) — el MinIO local ya no arranca. **Backups**: `BACKUP_TO_S3=true` hace un `pg_dump` diario a
+`{bucket}/_backups/` (restaurar con `pg_restore` — ver `DEPLOY.md`). Detalles y ejemplos en `config/.env.example`.
 
 > **Despliegue homelab (privado):** la config con túnel Cloudflare, redes externas e IPs fijas vive en
 > `compose.micapum.yaml` (ignorado por git). Úsalo con `docker compose -f compose.micapum.yaml up -d --build`.

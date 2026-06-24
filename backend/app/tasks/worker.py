@@ -6,7 +6,7 @@ from arq.connections import RedisSettings
 
 from ..settings import settings
 from .document_tasks import compact_to_pdf, rasterize_document, rerasterize_document
-from .maintenance_tasks import reap_stale_jobs
+from .maintenance_tasks import backup_db_to_s3, reap_stale_jobs
 from .embedding_tasks import embed_document, embed_mentions, reembed_corpus
 from .extraction_tasks import extract_records
 from .fs_tasks import fs_download
@@ -47,8 +47,12 @@ class WorkerSettings:
         extract_records, generate_candidates, rasterize_document, reconstruct_tree,
         fs_download, compact_to_pdf, parse_index, rerasterize_document, generate_family_candidates,
     ]
-    # Reap stalled/orphaned jobs every 3 minutes so no section's UI hangs on a dead job (resilience).
-    cron_jobs = [cron(reap_stale_jobs, minute=set(range(0, 60, 3)), run_at_startup=True)]
+    # Reap stalled/orphaned jobs every 3 minutes so no section's UI hangs on a dead job (resilience);
+    # daily Postgres → S3 backup (no-op unless BACKUP_TO_S3=true).
+    cron_jobs = [
+        cron(reap_stale_jobs, minute=set(range(0, 60, 3)), run_at_startup=True),
+        cron(backup_db_to_s3, hour={settings.backup_hour}, minute={0}),
+    ]
     on_startup = startup
     on_shutdown = shutdown
     max_jobs = 4  # cap concurrent transcription batches per worker

@@ -1,5 +1,6 @@
 # Secrets / env
 .env
+config/.env
 *.local
 
 # Private homelab deployment overlay (Cloudflare tunnel, external nets, bind IPs)
@@ -21,8 +22,9 @@ venv/
 node_modules/
 frontend/dist/
 
-# Data (homelab persistent volumes live outside the repo, but ignore any local ones)
+# Data (host-mapped persistent volumes: postgres/redis/minio under DATA_DIR)
 dades/
+/data/
 *.sqlite3
 
 # OS / editor
