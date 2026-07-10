@@ -209,6 +209,21 @@ async def fs_download(ctx, *, job_id, tenant_id, url, settings=None):
                 await asyncio.sleep(delay)
 
         await set_rls_context(session, tenant_id=tenant_id)
+        if index == 0:
+            # Nothing came down (bad URL, expired cookies, restricted film…). A green "completado"
+            # with an empty book would be a lie — fail the job and remove the empty shell document.
+            from sqlalchemy import delete as sa_delete
+            await session.execute(sa_delete(Document).where(Document.id == doc_id))
+            await session.execute(
+                update(Job).where(Job.id == job_id).values(
+                    status="error", finished_at=datetime.now(timezone.utc),
+                    error="No se descargó ninguna imagen — revisa la URL y que la sesión de FamilySearch (cookies) siga siendo válida.",
+                    result={"downloaded": 0, "errors": errors},
+                )
+            )
+            await session.commit()
+            await pub({"kind": "book_fail", "error": "no se descargó ninguna imagen"})
+            return
         await session.execute(update(Document).where(Document.id == doc_id).values(page_count=index))
         await session.execute(
             update(Job).where(Job.id == job_id).values(

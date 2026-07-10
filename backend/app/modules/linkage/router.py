@@ -45,6 +45,13 @@ async def discover(
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> JobOut:
+    from ..jobs.service import active_job_for
+    existing = await active_job_for(
+        db, principal.tenant_id, "linkage", body.person_id, param_key="person_id")
+    if existing:
+        return _job_out(existing)
+    from ..providers.service import assert_within_budget
+    await assert_within_budget(db, principal.tenant_id)
     job = Job(
         tenant_id=principal.tenant_id, type="linkage", status="queued",
         params={"person_id": str(body.person_id), "max_candidates": body.max_candidates},
@@ -71,6 +78,13 @@ async def discover_family(
 ) -> JobOut:
     """Discover the person's SIBLING SET (other baptisms with the same parents) → siblings + the
     parents they confirm. Mirrors /discover but uses the parent-pair (couple-key) search."""
+    from ..jobs.service import active_job_for
+    existing = await active_job_for(
+        db, principal.tenant_id, "linkage_family", body.person_id, param_key="person_id")
+    if existing:
+        return _job_out(existing)
+    from ..providers.service import assert_within_budget
+    await assert_within_budget(db, principal.tenant_id)
     job = Job(
         tenant_id=principal.tenant_id, type="linkage_family", status="queued",
         params={"person_id": str(body.person_id), "max_candidates": body.max_candidates},
@@ -118,6 +132,17 @@ async def reconstruct(
 ) -> ReconstructionOut:
     """Launch a corpus-wide tree reconstruction. Produces a reviewable proposal (not merged)."""
     from ...models.reconstruction import Reconstruction
+    from ..jobs.service import active_job_of_type
+    existing = await active_job_of_type(db, principal.tenant_id, "reconstruction")
+    if existing:  # a reconstruction is already running — return it instead of piling up another
+        rec = await db.scalar(select(Reconstruction).where(Reconstruction.job_id == existing.id))
+        if rec:
+            return ReconstructionOut(
+                id=rec.id, status=rec.status, conservative=rec.conservative,
+                include_census=rec.include_census, link_to_tree=rec.link_to_tree,
+                graph=None, stats=None, job_id=existing.id)
+    from ..providers.service import assert_within_budget
+    await assert_within_budget(db, principal.tenant_id)
     recon = Reconstruction(
         tenant_id=principal.tenant_id, status="running", conservative=body.conservative,
         include_census=body.include_census, link_to_tree=body.link_to_tree,

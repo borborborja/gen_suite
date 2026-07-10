@@ -5,11 +5,49 @@ military, residence…): type-specific fields land in ``attributes`` (plan, exte
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+import unicodedata
+
+from pydantic import BaseModel, Field, field_validator
 
 from .record_types import RECORD_TYPES
 
 RECORD_TYPE_KEYS = tuple(RECORD_TYPES.keys())
+
+# Models without strict json_schema support (json_object fallback: Ollama, some OpenRouter routes)
+# often echo the label in Spanish ("Bautismo") instead of the enum key. Fold those back to keys so
+# downstream logic (labels, RECORD_EVENT_TYPE, filters) keeps working.
+_TYPE_ALIASES: dict[str, str] = {
+    "bautismo": "baptism", "bautizo": "baptism", "baptisme": "baptism", "bateig": "baptism",
+    "matrimonio": "marriage", "matrimoni": "marriage", "boda": "marriage", "casamiento": "marriage",
+    "defuncion": "death", "obito": "death", "obit": "death", "entierro": "death", "muerte": "death",
+    "confirmacion": "confirmation", "confirmacio": "confirmation",
+    "censo": "census", "padron": "census", "padro": "census",
+    "testamento": "will", "testament": "will",
+    "juicio": "trial", "causa": "trial",
+    "quinta": "military", "militar": "military",
+    "empadronamiento": "residence", "domicilio": "residence",
+    "escritura": "notarial",
+    "otro": "other", "altre": "other",
+}
+
+
+def _fold(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s.strip().lower())
+                   if unicodedata.category(c) != "Mn")
+
+
+# the catalog's Spanish labels also count ("Censo / Padrón" → census)
+_TYPE_ALIASES.update({_fold(v["label"]): k for k, v in RECORD_TYPES.items()})
+
+
+def normalize_record_type(raw: str | None) -> str:
+    """Fold a model-emitted record type ('Bautismo', 'baptism', 'Òbits'…) to a catalog key."""
+    if not raw:
+        return "other"
+    s = _fold(raw)
+    if s in RECORD_TYPE_KEYS:
+        return s
+    return _TYPE_ALIASES.get(s) or _TYPE_ALIASES.get(s.split("/")[0].strip(), "other")
 
 
 class StatedRelation(BaseModel):
@@ -36,6 +74,11 @@ class ExtractedMention(BaseModel):
 
 class ExtractedRecord(BaseModel):
     record_type: str = Field(description="one of: " + ", ".join(RECORD_TYPE_KEYS))
+
+    @field_validator("record_type", mode="before")
+    @classmethod
+    def _normalize_record_type(cls, v: object) -> str:
+        return normalize_record_type(v if isinstance(v, str) else None)
     record_no: str | None = Field(
         default=None, description="número de acta/entrada tal como aparece ('45', '45 bis'); null si no está numerada"
     )

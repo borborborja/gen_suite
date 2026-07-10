@@ -30,6 +30,7 @@ interface EstelaState {
   selPage: number | null;
   discoveries: Discovery[];
   source: DiscSource;
+  discError: boolean; // backend unreachable on last reload — distinguish from a real empty queue
   discIndex: number;
   decisions: Record<string, Decision>;
   panelOpen: boolean;
@@ -50,15 +51,15 @@ interface EstelaCtx extends EstelaState {
   openDoc: (id: string, page?: number) => void;
   setTree: (v: TreeView) => void;
   toggleTheme: () => void;
-  confirm: () => void;
-  reject: () => void;
+  confirm: () => Promise<void>;
+  reject: () => Promise<void>;
   skip: () => void;
   advance: () => void;
   jumpTo: (index: number) => void;
   reloadDiscoveries: () => Promise<void>;
   notify: (msg: string, color?: string) => void;
-  addRel: (id: string) => void;
-  addAllRel: () => void;
+  addRel: (id: string) => Promise<void>;
+  addAllRel: () => Promise<void>;
   undo: () => void;
   setZoom: (z: boolean) => void;
   setSearchTab: (t: string) => void;
@@ -78,12 +79,13 @@ export function EstelaProvider({ children, startTheme = "light" }: { children: R
     theme: startTheme,
     nav: "inicio",
     treeView: "genograma",
-    selPerson: "joan",
+    selPerson: "", // set via openPerson() with a real person id
     selDoc: null,
     selPage: null,
     // Start empty + live so no mock relatives ever show; reloadDiscoveries() fills from the backend.
     discoveries: [],
     source: "live",
+    discError: false,
     discIndex: 0,
     decisions: {},
     panelOpen: false,
@@ -97,21 +99,27 @@ export function EstelaProvider({ children, startTheme = "light" }: { children: R
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disc = s.discoveries;
   const cur = disc[s.discIndex] ?? disc[0];
-  const pendingCount = disc.filter((d) => !s.decisions[d.id]).length;
-  const hasPending = disc.some((d) => !s.decisions[d.id]);
+  // "skip" is NOT a final decision — a skipped discovery stays in the queue (the toast promises
+  // "volverá a la cola"); only yes/no settle an item.
+  const isDecided = (d?: Decision) => d === "yes" || d === "no";
+  const pendingCount = disc.filter((d) => !isDecided(s.decisions[d.id])).length;
+  const hasPending = pendingCount > 0;
   // in live mode an empty queue means "nothing to review" (show the done state, not sample data)
-  const allDone = s.source === "live" ? pendingCount === 0 : disc.length > 0 && disc.every((d) => s.decisions[d.id]);
+  const allDone = s.source === "live"
+    ? pendingCount === 0 && !s.discError
+    : disc.length > 0 && disc.every((d) => isDecided(s.decisions[d.id]));
 
   const reloadDiscoveries = useCallback(async () => {
     try {
       const cands = await listCandidates(undefined, "pending");
       // backend answered → switch to live (even if empty: shows a real empty state, not fake data)
       setS((p) => ({
-        ...p, discoveries: cands.map(candidateToDiscovery), source: "live",
+        ...p, discoveries: cands.map(candidateToDiscovery), source: "live", discError: false,
         discIndex: 0, decisions: {}, added: {}, panelOpen: false,
       }));
     } catch {
-      /* backend unreachable → stay empty (no fake data), still in live mode */
+      // backend unreachable → flag it so the UI shows an error + retry, not "todo revisado"
+      setS((p) => ({ ...p, discError: true }));
     }
   }, []);
 
@@ -124,8 +132,12 @@ export function EstelaProvider({ children, startTheme = "light" }: { children: R
   }, []);
 
   const nextPending = useCallback((from: number, list: Discovery[], decisions: Record<string, Decision>) => {
+    // prefer never-seen items; fall back to skipped ones (they stay in the queue)
     for (let i = from; i < list.length; i++) {
       if (!decisions[list[i].id]) return i;
+    }
+    for (let i = from; i < list.length; i++) {
+      if (decisions[list[i].id] === "skip") return i;
     }
     return -1;
   }, []);

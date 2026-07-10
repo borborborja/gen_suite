@@ -52,6 +52,8 @@ async def create_embed_mentions_job(
 ) -> Job:
     if not await session.get(Document, document_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
+    from ..providers.service import assert_within_budget
+    await assert_within_budget(session, tenant_id)
     job = Job(
         tenant_id=tenant_id, type="embed_mentions", status="queued",
         params={"document_id": str(document_id)}, created_by=created_by,
@@ -102,20 +104,18 @@ async def reextract_transcription(
 
 
 async def cancel_job(session: AsyncSession, job_id: uuid.UUID) -> Job:
-    job = await session.get(Job, job_id)
-    if not job:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
-    if job.status in ("queued", "running"):
-        job.status = "cancelled"
-    return job
+    from ..jobs.service import cancel_job as cancel
+    return await cancel(session, job_id)
 
 
 async def list_for_document(session: AsyncSession, document_id: uuid.UUID) -> list[Record]:
+    # superseded rows are history (kept for audit after a correction + re-extract) — never list
+    # them next to their replacements or the Visor shows every act twice
     return list(
         (
             await session.scalars(
                 select(Record)
-                .where(Record.document_id == document_id)
+                .where(Record.document_id == document_id, Record.status != "superseded")
                 .order_by(Record.date_year)
             )
         ).all()

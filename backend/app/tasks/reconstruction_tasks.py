@@ -51,6 +51,7 @@ async def reconstruct_tree(
             await session.execute(update(Job).where(Job.id == job_id).values(
                 status="completed", finished_at=datetime.now(timezone.utc), result=stats))
             await session.commit()
+            await pub({"kind": "all_done", **stats})
         except Exception as exc:
             await session.rollback()
             await set_rls_context(session, tenant_id=tenant_id)
@@ -59,6 +60,3 @@ async def reconstruct_tree(
                 status="error", error=str(exc)[:1000], finished_at=datetime.now(timezone.utc)))
             await session.commit()
             await pub({"kind": "book_fail", "error": str(exc)[:300]})
-            return
-
-        await pub({"kind": "all_done", **stats})

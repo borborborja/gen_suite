@@ -98,7 +98,7 @@ async def delete_media(session: AsyncSession, media_id: uuid.UUID) -> None:
     await session.delete(m)
     await session.flush()
     try:
-        await storage.delete_prefix(storage.bucket_for("private"), key)
+        await storage.delete_object(storage.bucket_for("private"), key)
     except Exception:
         pass  # orphan blob is harmless; sweeper reclaims it
     if was_primary:  # promote another photo to primary so the avatar survives

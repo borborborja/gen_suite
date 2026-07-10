@@ -1,19 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useEstela } from "./store";
 import { fonts } from "./theme";
 import { listJobs, cancelJob, type JobItem } from "../../api/jobs";
 
-const JOB_LABEL: Record<string, string> = {
-  transcription: "Transcripción", extraction: "Extracción", embed_mentions: "Embeddings de menciones",
-  reembed_corpus: "Re-embeber corpus", linkage: "Descubrimiento", rasterize: "Rasterizado de PDF",
-  embedding: "Embeddings", embed_document: "Embeddings",
-};
-const label = (t: string) => JOB_LABEL[t] ?? t;
+import { jobLabel as label, STATUS_COLOR } from "./labels";
 
-const STATUS_COLOR: Record<string, string> = {
-  completed: "var(--ok)", running: "var(--accent)", queued: "var(--warn)",
-  error: "var(--danger)", cancelled: "var(--muted)",
-};
 const RUNNING = new Set(["running", "queued"]);
 const TERMINAL: Record<string, string> = { completed: "completado", error: "falló", cancelled: "cancelado" };
 
@@ -25,45 +16,47 @@ function ago(iso: string): string {
   return `hace ${Math.floor(s / 86400)} d`;
 }
 
-// A running job whose progress hasn't reached a terminal state and started a while ago is likely
-// stuck (its worker died mid-task). We surface that so the user can cancel it.
+// A queued/running job that started a while ago and never reached a terminal state is likely
+// stuck (worker dead, or nothing consuming the queue). We surface that so the user can cancel it.
 const STUCK_MIN = 15;
 const ageMin = (iso: string) => (Date.now() - new Date(iso).getTime()) / 60000;
-const isStuck = (j: JobItem) => j.status === "running" && ageMin(j.created_at) > STUCK_MIN;
+const isStuck = (j: JobItem) => RUNNING.has(j.status) && ageMin(j.created_at) > STUCK_MIN;
 
 export default function ActivityIndicator() {
   const e = useEstela();
+  const notify = e.notify; // stable (useCallback in the store) — safe effect dependency
   const [jobs, setJobs] = useState<JobItem[]>([]);
   const [open, setOpen] = useState(false);
   const [sel, setSel] = useState<string | null>(null);
   const prev = useRef<Map<string, string> | null>(null); // job id -> last status; null until first load
 
-  const refresh = useRef(async () => {
+  const refresh = useCallback(async () => {
     let list: JobItem[];
     try { list = await listJobs(); } catch { return; }
     const seen = prev.current;
     if (seen) {
       for (const j of list) {
         const before = seen.get(j.id);
-        if (before && RUNNING.has(before) && j.status in TERMINAL) {
+        if (before && RUNNING.has(before) && TERMINAL[j.status]) {
           const color = j.status === "completed" ? "var(--ok)" : j.status === "error" ? "var(--danger)" : "var(--muted)";
-          e.notify(`${label(j.type)}: ${TERMINAL[j.status]}`, color);
+          const reason = j.status === "error" && j.error ? ` — ${j.error.slice(0, 140)}` : "";
+          notify(`${label(j.type)}: ${TERMINAL[j.status]}${reason}`, color);
         }
       }
     }
     prev.current = new Map(list.map((j) => [j.id, j.status]));
     setJobs(list);
-  });
+  }, [notify]);
   useEffect(() => {
     let alive = true;
-    const tick = () => { if (alive) void refresh.current(); };
+    const tick = () => { if (alive) void refresh(); };
     tick();
     const id = setInterval(tick, 4000);
     return () => { alive = false; clearInterval(id); };
-  }, []);
+  }, [refresh]);
 
   async function cancel(id: string) {
-    try { await cancelJob(id); await refresh.current(); e.notify("Tarea cancelada", "var(--muted)"); }
+    try { await cancelJob(id); await refresh(); e.notify("Tarea cancelada", "var(--muted)"); }
     catch (err) { e.notify((err as Error).message, "var(--danger)"); }
   }
 

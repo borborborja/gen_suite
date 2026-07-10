@@ -1,5 +1,5 @@
 # Backend image — also used by the ARQ worker and the one-shot migrate service
-# (same image, different command). Tesseract is added in Phase 4 (M1 transcription).
+# (same image, different command). Includes tesseract for the local OCR engine.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \

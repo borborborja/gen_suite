@@ -1,18 +1,13 @@
-import { api } from "./client";
+import { api, authFetch } from "./client";
+import type { Job } from "./types";
 
-export interface JobItem {
-  id: string;
-  type: string;
-  status: string;
-  progress: { done?: number; total?: number } | null;
-  result: Record<string, unknown> | null;
-  error: string | null;
-  document_id: string | null;
-  created_at: string;
-  finished_at: string | null;
-}
-export const listJobs = () => api<JobItem[]>("/jobs");
-export const cancelJob = (id: string) => api<JobItem>(`/jobs/${id}/cancel`, { method: "POST" });
+export type { Job } from "./types";
+// Back-compat alias — new code should import Job from api/types.
+export type JobItem = Job;
+
+export const listJobs = () => api<Job[]>("/jobs");
+export const getJob = (id: string) => api<Job>(`/jobs/${id}`);
+export const cancelJob = (id: string) => api<Job>(`/jobs/${id}/cancel`, { method: "POST" });
 
 // Live job progress via the SSE endpoint /jobs/{id}/events. EventSource can't send the auth
 // header, so we read the text/event-stream with fetch + ReadableStream.
@@ -25,26 +20,51 @@ export interface JobEvent {
   [k: string]: unknown;
 }
 
+const TERMINAL_KINDS = new Set(["all_done", "book_fail", "cancelled", "error"]);
+
+// The stream can end without a terminal event (network drop, proxy timeout, worker crash).
+// Never report success from a mid-stream event: ask the API for the job's real status and
+// synthesize the final event from it, so "completado" is only shown for a completed job.
+async function finalEventFromStatus(id: string): Promise<JobEvent | undefined> {
+  try {
+    const job = await getJob(id);
+    const kind =
+      job.status === "completed" ? "all_done" :
+      job.status === "cancelled" ? "cancelled" :
+      job.status === "error" ? "book_fail" : "stream_lost"; // still queued/running
+    return { kind, done: job.progress?.done, total: job.progress?.total,
+             error: job.error ?? undefined, status: job.status };
+  } catch {
+    return undefined;
+  }
+}
+
+// How a finished stream should be reported to the user. Success ONLY on a real all_done —
+// a dropped stream or unknown state must never show as "completado".
+export function jobOutcome(last?: JobEvent): "ok" | "cancelled" | "error" | "unknown" {
+  if (!last) return "unknown";
+  if (last.kind === "all_done") return "ok";
+  if (last.kind === "cancelled") return "cancelled";
+  if (last.kind === "book_fail" || last.kind === "error") return "error";
+  return "unknown"; // stream_lost / mid-stream event
+}
+
 export function streamJob(
   id: string,
   onEvent: (e: JobEvent) => void,
   onDone?: (last?: JobEvent) => void,
 ): () => void {
   const ctrl = new AbortController();
+  let aborted = false;
   (async () => {
-    const token = localStorage.getItem("gs_access");
     let res: Response;
     try {
-      res = await fetch(`/api/jobs/${id}/events`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        signal: ctrl.signal,
-      });
-    } catch { onDone?.(); return; }
-    if (!res.ok || !res.body) { onDone?.(); return; }
+      res = await authFetch(`/jobs/${id}/events`, { signal: ctrl.signal });
+    } catch { if (!aborted) onDone?.(await finalEventFromStatus(id)); return; }
+    if (!res.ok || !res.body) { onDone?.(await finalEventFromStatus(id)); return; }
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
-    let last: JobEvent | undefined;
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -57,17 +77,17 @@ export function streamJob(
           if (!data) continue;
           try {
             const evt = JSON.parse(data.slice(5).trim()) as JobEvent;
-            last = evt;
             onEvent(evt);
-            if (evt.kind === "all_done" || evt.kind === "book_fail" || evt.kind === "cancelled") {
+            if (TERMINAL_KINDS.has(evt.kind)) {
               onDone?.(evt);
               return;
             }
           } catch { /* keepalive / non-json */ }
         }
       }
-    } catch { /* aborted */ }
-    onDone?.(last);
+    } catch { if (aborted) return; }
+    // Stream ended with no terminal event — resolve against the job's actual status.
+    onDone?.(await finalEventFromStatus(id));
   })();
-  return () => ctrl.abort();
+  return () => { aborted = true; ctrl.abort(); };
 }

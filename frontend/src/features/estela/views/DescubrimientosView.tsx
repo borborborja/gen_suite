@@ -160,6 +160,17 @@ export default function DescubrimientosView() {
         </div>
       )}
 
+      {e.discError && !e.hasPending && (
+        <div style={{ marginTop: 60, textAlign: "center", padding: "60px 20px" }}>
+          <div style={{ width: 76, height: 76, borderRadius: "50%", background: "rgba(192,57,43,.08)", display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: 22 }}>
+            <Cross size={36} stroke="var(--danger)" />
+          </div>
+          <h2 style={{ fontFamily: fonts.serif, fontSize: 28, fontWeight: 600, margin: 0 }}>No se pudo cargar la cola</h2>
+          <p style={{ color: "var(--muted)", fontSize: 15, margin: "12px 0 24px" }}>No hay conexión con el servidor. Comprueba que está en marcha y reintenta.</p>
+          <button onClick={() => e.reloadDiscoveries()} style={{ background: "var(--accent)", color: "#fff", border: "none", borderRadius: 8, padding: "13px 22px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>↻ Reintentar</button>
+        </div>
+      )}
+
       {e.allDone && (
         <div style={{ marginTop: 60, textAlign: "center", padding: "60px 20px" }}>
           <div style={{ width: 76, height: 76, borderRadius: "50%", background: "var(--ok-faint)", display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: 22 }}>

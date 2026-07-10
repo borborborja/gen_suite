@@ -257,8 +257,10 @@ async def compact_to_pdf(ctx, *, job_id, tenant_id, document_id):
 
         total = len(raw)
         await pub({"kind": "book_start", "total": total})
+        _EXT = {"image/jpeg": ".jpg", "image/webp": ".webp", "image/png": ".png"}
         for i, (pno, data, sref, ct) in enumerate(raw, start=1):
-            key = f"{new_prefix}pages/{pno}.jpg"
+            # keep the stored key's extension in sync with the actual content type
+            key = f"{new_prefix}pages/{pno}{_EXT.get(ct or 'image/jpeg', '.jpg')}"
             await storage.put_object(bucket, key, data, ct or "image/jpeg")
             await set_rls_context(session, tenant_id=tenant_id)
             session.add(Page(

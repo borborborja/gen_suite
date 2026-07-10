@@ -3,13 +3,12 @@ import { select } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type ZoomBehavior } from "d3-zoom";
 import { useEstela } from "../store";
 import { fonts } from "../theme";
+import { roleLabel } from "../labels";
 import { ArrowLeft } from "../icons";
-import { ManuscriptPlate } from "../Chrome";
-import { transcription as sampleTx, visorActas } from "../data";
 import { fetchPageObjectUrl, getPages, getDocument, setPageKind, splitDocument, type PageOut, type DocumentOut } from "../../../api/documents";
 import { getTranscriptions, correctTranscription, type TranscriptionOut } from "../../../api/transcription";
 import { documentRecords, reextract, mergeNext, splitRecord, type ExtractedRecordOut, type MentionLite } from "../../../api/extraction";
-import { streamJob } from "../../../api/jobs";
+import { streamJob, jobOutcome } from "../../../api/jobs";
 
 export default function VisorView() {
   const e = useEstela();
@@ -163,7 +162,11 @@ function LiveVisor({ docId }: { docId: string }) {
                     reextract(tx.id).then((job) => {
                       streamJob(job.id,
                         (ev) => { if (ev.kind === "page_ok" || ev.kind === "book_start") setRetxMsg("Re-extrayendo… analizando la página"); },
-                        (ev) => { setRetxMsg(ev?.kind === "book_fail" ? "✗ Falló la re-extracción" : "✓ Re-extraído"); reloadData(); setTimeout(() => setRetxMsg(null), 4000); });
+                        (ev) => {
+                          const o = jobOutcome(ev);
+                          setRetxMsg(o === "ok" ? "✓ Re-extraído" : o === "unknown" ? "✗ Conexión perdida (puede seguir en curso)" : "✗ Falló la re-extracción");
+                          reloadData(); setTimeout(() => setRetxMsg(null), 4000);
+                        });
                     }).catch(() => setRetxMsg("✗ Error al lanzar"));
                   }} style={{ background: "transparent", color: "var(--accent)", border: "1px solid var(--line)", borderRadius: 8, padding: "9px 16px", fontFamily: "inherit", fontSize: 13.5, fontWeight: 600, cursor: "pointer", opacity: retxMsg && retxMsg.startsWith("Re-extra") ? 0.6 : 1 }}>
                     Re-extraer
@@ -209,7 +212,7 @@ function LiveVisor({ docId }: { docId: string }) {
                     <div style={{ marginTop: 7, display: "flex", flexDirection: "column", gap: 3 }}>
                       {r.mentions.slice(0, treeOpen.has(r.id) ? r.mentions.length : 5).map((m, i) => (
                         <div key={i} style={{ display: "flex", gap: 8, fontSize: 12.5 }}>
-                          <span style={{ fontFamily: fonts.mono, fontSize: 10, color: "var(--muted)", textTransform: "uppercase", width: 78, flex: "none", paddingTop: 1 }}>{ROLE_ES[m.role] ?? m.role}</span>
+                          <span style={{ fontFamily: fonts.mono, fontSize: 10, color: "var(--muted)", textTransform: "uppercase", width: 78, flex: "none", paddingTop: 1 }}>{roleLabel(m.role, r.record_type)}</span>
                           <span style={{ fontWeight: 500 }}>{mName(m)}</span>
                         </div>
                       ))}
@@ -224,7 +227,7 @@ function LiveVisor({ docId }: { docId: string }) {
                   {r.sequence_warning && (
                     <div style={{ fontSize: 11.5, color: "var(--warn)", marginTop: 6 }}>⚠ {r.sequence_warning}</div>
                   )}
-                  {treeOpen.has(r.id) && r.mentions && r.mentions.length > 0 && <ActaTree mentions={r.mentions} />}
+                  {treeOpen.has(r.id) && r.mentions && r.mentions.length > 0 && <ActaTree mentions={r.mentions} recordType={r.record_type} />}
                   <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
                     {r.mentions && r.mentions.length > 0 && (
                       <button onClick={() => setTreeOpen((s) => { const x = new Set(s); x.has(r.id) ? x.delete(r.id) : x.add(r.id); return x; })} style={miniBtn} title="Ver el árbol de esta acta">
@@ -253,13 +256,6 @@ function LiveVisor({ docId }: { docId: string }) {
 const navBtn: React.CSSProperties = { background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 6, width: 26, height: 26, cursor: "pointer", color: "var(--fg)", fontSize: 15 };
 const miniBtn: React.CSSProperties = { background: "transparent", border: "1px solid var(--line)", borderRadius: 6, padding: "4px 9px", cursor: "pointer", color: "var(--fg)", fontFamily: "inherit", fontSize: 11.5, fontWeight: 600 };
 
-const ROLE_ES: Record<string, string> = {
-  principal: "Bautizado/a", head: "Cabeza", testator: "Testador", defendant: "Procesado", soldier: "Soldado",
-  father: "Padre", mother: "Madre", spouse: "Cónyuge", godfather: "Padrino", godmother: "Madrina",
-  son: "Hijo", daughter: "Hija", child: "Hijo/a", sibling: "Hermano/a", grandparent: "Abuelo/a",
-  spouse_father: "Suegro", spouse_mother: "Suegra", witness: "Testigo", declarant: "Declarante",
-  officiant: "Oficiante", in_law: "Pariente pol.", servant: "Sirviente", lodger: "Huésped", other: "Otro",
-};
 function mName(m: MentionLite): string {
   return m.name_raw || [m.given, m.surname].filter(Boolean).join(" ") || "—";
 }
@@ -270,7 +266,7 @@ function actaDate(r: ExtractedRecordOut): string {
 }
 
 // Compact per-act family diagram: parents on top, the focal person (+ spouse) below, then godparents/others.
-function ActaTree({ mentions }: { mentions: MentionLite[] }) {
+function ActaTree({ mentions, recordType }: { mentions: MentionLite[]; recordType?: string | null }) {
   const by = (role: string) => mentions.filter((m) => m.role === role);
   const principal = mentions.find((m) => ["principal", "head", "testator", "defendant", "soldier"].includes(m.role));
   const father = by("father")[0], mother = by("mother")[0], spouse = by("spouse")[0];
@@ -295,7 +291,7 @@ function ActaTree({ mentions }: { mentions: MentionLite[] }) {
         </>
       )}
       <div style={{ display: "flex", gap: 8, justifyContent: "center", alignItems: "center" }}>
-        {box(ROLE_ES[principal?.role ?? "principal"] ?? "Principal", principal, true)}
+        {box(roleLabel(principal?.role ?? "principal", recordType), principal, true)}
         {spouse && <span style={{ color: "var(--muted)" }}>⚭</span>}
         {spouse && box("Cónyuge", spouse)}
       </div>
@@ -306,7 +302,7 @@ function ActaTree({ mentions }: { mentions: MentionLite[] }) {
       )}
       {others.length > 0 && (
         <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 5, textAlign: "center" }}>
-          {others.map((m) => `${ROLE_ES[m.role] ?? m.role}: ${mName(m)}`).join(" · ")}
+          {others.map((m) => `${roleLabel(m.role, recordType)}: ${mName(m)}`).join(" · ")}
         </div>
       )}
     </div>
@@ -419,41 +415,15 @@ function PageMosaic({ docId, pages, onOpen, onChanged }: { docId: string; pages:
   );
 }
 
-// ── original sample visor (shown when no real document is selected) ──
+// ── empty state (shown when no real document is selected) ──
 function SampleVisor() {
   const e = useEstela();
   return (
     <section style={{ padding: "32px 44px 64px", maxWidth: 1280 }}>
-      <div onClick={() => e.go("biblioteca")} style={{ display: "inline-flex", alignItems: "center", gap: 7, color: "var(--muted)", fontSize: 13, cursor: "pointer", marginBottom: 20 }}>
-        <ArrowLeft size={16} />Volver a la Biblioteca
-      </div>
-      <h1 style={{ fontFamily: fonts.serif, fontWeight: 600, fontSize: 30, margin: "0 0 6px", letterSpacing: "-.02em" }}>Baptismes de Vallbona</h1>
-      <p style={{ color: "var(--muted)", fontSize: 14, margin: "0 0 20px" }}>Ejemplo · abre un libro real desde la Biblioteca para ver el visor con tus datos.</p>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 22, alignItems: "start" }}>
-        <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16, overflow: "hidden", boxShadow: "var(--shadow)" }}>
-          <div style={{ height: 280 }}><ManuscriptPlate quote="Baptisme de Joannes Vidal · Als XVIII dies del mes de mars de l'any MDCCL…" /></div>
-          <div style={{ padding: 22 }}>
-            <div style={{ fontFamily: fonts.mono, fontSize: 10.5, letterSpacing: ".14em", color: "var(--muted)", marginBottom: 14 }}>TRANSCRIPCIÓN</div>
-            <div style={{ fontFamily: fonts.serif, fontSize: 14.5, lineHeight: "26px", color: "var(--fg)" }}>
-              {sampleTx.map((l, i) => l.text === "" ? <div key={i} style={{ height: 12 }} /> : <div key={i}><span style={l.hl ? { background: "rgba(187,125,26,.16)", borderRadius: 4, padding: "1px 4px" } : undefined}>{l.text}</span></div>)}
-            </div>
-          </div>
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          {visorActas.map((a) => (
-            <div key={a.id} style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 14, padding: 20 }}>
-              <div style={{ fontFamily: fonts.serif, fontSize: 17, fontWeight: 600 }}>{a.type} · {a.date}</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10, fontSize: 13 }}>
-                {a.mentions.map((m, i) => (
-                  <div key={i} style={{ display: "flex", gap: 10 }}>
-                    <span style={{ fontFamily: fonts.mono, fontSize: 10, color: "var(--muted)", textTransform: "uppercase", width: 74, flex: "none", paddingTop: 2 }}>{m.role}</span>
-                    <span style={{ fontWeight: 500 }}>{m.name}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
+      <div style={{ marginTop: 60, textAlign: "center", padding: "60px 20px" }}>
+        <h1 style={{ fontFamily: fonts.serif, fontWeight: 600, fontSize: 30, margin: "0 0 10px", letterSpacing: "-.02em" }}>Ningún documento abierto</h1>
+        <p style={{ color: "var(--muted)", fontSize: 15, margin: "0 0 24px" }}>Abre un libro desde la Biblioteca para ver aquí sus páginas, la transcripción y las actas extraídas.</p>
+        <button onClick={() => e.go("biblioteca")} style={{ background: "var(--accent)", color: "#fff", border: "none", borderRadius: 8, padding: "13px 22px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>Ir a la Biblioteca</button>
       </div>
     </section>
   );

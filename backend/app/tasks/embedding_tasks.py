@@ -14,9 +14,18 @@ from ..models.job import Job
 from ..models.mention import PersonMention
 from ..models.record import Record
 from ..models.transcription import Transcription
-from ..modules.providers.service import ProviderService, embed_texts
+from ..modules.providers.service import ProviderService, embed_texts_with_usage, record_usage
 
 BATCH = 16
+
+
+async def _record_embed_usage(session, *, tenant_id, job_id, rc, tokens: dict) -> None:
+    """Log the job's aggregated embedding spend (best-effort)."""
+    await set_rls_context(session, tenant_id=tenant_id)
+    await record_usage(session, tenant_id=tenant_id, job_id=job_id, task_type="embedding",
+                       model=rc.model, prompt_tokens=tokens.get("prompt", 0),
+                       completion_tokens=tokens.get("completion", 0))
+    await session.commit()
 
 
 def _mention_text(m: PersonMention) -> str:
@@ -75,10 +84,13 @@ async def embed_document(ctx, *, job_id, tenant_id, document_id):
 
         total = len(targets)
         done = 0
+        tokens = {"prompt": 0, "completion": 0}
         await pub({"kind": "book_start", "total": total, "engine": rc.engine})
         for i in range(0, total, BATCH):
             chunk = targets[i : i + BATCH]
-            vectors = await asyncio.to_thread(embed_texts, rc, [t for _, t in chunk])
+            vectors, usage = await asyncio.to_thread(
+                embed_texts_with_usage, rc, [t for _, t in chunk])
+            tokens["prompt"] += usage.get("prompt", 0)
             await set_rls_context(session, tenant_id=tenant_id)
             for (tid, _), vec in zip(chunk, vectors):
                 await session.execute(
@@ -99,6 +111,7 @@ async def embed_document(ctx, *, job_id, tenant_id, document_id):
             )
         )
         await session.commit()
+        await _record_embed_usage(session, tenant_id=tenant_id, job_id=job_id, rc=rc, tokens=tokens)
         await pub({"kind": "all_done", "embedded": done, "total": total})
 
 
@@ -153,12 +166,15 @@ async def reembed_corpus(ctx, *, job_id, tenant_id):
 
         total = len(ttargets) + len(mtargets)
         done = 0
+        tokens = {"prompt": 0, "completion": 0}
         await pub({"kind": "book_start", "total": total, "engine": rc.engine})
 
         for label, targets, model in (("tx", ttargets, Transcription), ("mn", mtargets, PersonMention)):
             for i in range(0, len(targets), BATCH):
                 chunk = targets[i : i + BATCH]
-                vectors = await asyncio.to_thread(embed_texts, rc, [t for _, t in chunk])
+                vectors, usage = await asyncio.to_thread(
+                    embed_texts_with_usage, rc, [t for _, t in chunk])
+                tokens["prompt"] += usage.get("prompt", 0)
                 await set_rls_context(session, tenant_id=tenant_id)
                 for (rid, _), vec in zip(chunk, vectors):
                     await session.execute(update(model).where(model.id == rid).values(embedding=vec))
@@ -177,6 +193,7 @@ async def reembed_corpus(ctx, *, job_id, tenant_id):
             )
         )
         await session.commit()
+        await _record_embed_usage(session, tenant_id=tenant_id, job_id=job_id, rc=rc, tokens=tokens)
         await pub({"kind": "all_done", "total": total, "model": rc.model})
 
 
@@ -228,10 +245,13 @@ async def embed_mentions(ctx, *, job_id, tenant_id, document_id):
 
         total = len(targets)
         done = 0
+        tokens = {"prompt": 0, "completion": 0}
         await pub({"kind": "book_start", "total": total, "engine": rc.engine})
         for i in range(0, total, BATCH):
             chunk = targets[i : i + BATCH]
-            vectors = await asyncio.to_thread(embed_texts, rc, [t for _, t in chunk])
+            vectors, usage = await asyncio.to_thread(
+                embed_texts_with_usage, rc, [t for _, t in chunk])
+            tokens["prompt"] += usage.get("prompt", 0)
             await set_rls_context(session, tenant_id=tenant_id)
             for (mid, _), vec in zip(chunk, vectors):
                 await session.execute(
@@ -252,4 +272,5 @@ async def embed_mentions(ctx, *, job_id, tenant_id, document_id):
             )
         )
         await session.commit()
+        await _record_embed_usage(session, tenant_id=tenant_id, job_id=job_id, rc=rc, tokens=tokens)
         await pub({"kind": "all_done", "embedded": done, "total": total})

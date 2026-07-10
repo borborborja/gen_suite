@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ...core.deps import get_current_principal, get_tenant_db, require_roles
+from ...core.deps import _client_ip, get_current_principal, get_tenant_db, require_roles
 from ...core.security import Principal
 from ...models.membership import MembershipRole
 from . import service
@@ -43,13 +43,6 @@ async def _read_capped(files: list[UploadFile]) -> list[tuple[str | None, str | 
             raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "subida total demasiado grande")
         out.append((f.filename, f.content_type, data))
     return out
-
-
-def _client_ip(request: Request) -> str | None:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else None
 
 
 def _out(doc) -> DocumentOut:

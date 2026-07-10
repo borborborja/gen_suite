@@ -1,4 +1,4 @@
-import { api } from "./client";
+import { api, authFetch } from "./client";
 
 export interface TreePerson {
   id: string;
@@ -147,24 +147,23 @@ export const getSubtree = (id: string, depth = 3) =>
   api<TreeGraph>(`/tree/persons/${id}/subtree?depth=${depth}`);
 export const getPerson = (id: string) => api<PersonDetail>(`/tree/persons/${id}`);
 
-export async function importGedcom(file: File): Promise<any> {
+export interface GedcomImportResult {
+  individuals: number;
+  families: number;
+  places: number;
+  [k: string]: unknown;
+}
+
+export async function importGedcom(file: File): Promise<GedcomImportResult> {
   const fd = new FormData();
   fd.append("file", file);
-  const token = localStorage.getItem("gs_access");
-  const res = await fetch("/api/tree/import/gedcom", {
-    method: "POST",
-    body: fd,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
+  const res = await authFetch("/tree/import/gedcom", { method: "POST", body: fd });
   if (!res.ok) throw new Error((await res.text()) || `${res.status}`);
   return res.json();
 }
 
 export async function downloadGedcom(): Promise<void> {
-  const token = localStorage.getItem("gs_access");
-  const res = await fetch("/api/tree/export/gedcom", {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
+  const res = await authFetch("/tree/export/gedcom");
   if (!res.ok) throw new Error(`${res.status}`);
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);

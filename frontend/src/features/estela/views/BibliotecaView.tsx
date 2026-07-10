@@ -9,8 +9,10 @@ import {
 } from "../../../api/documents";
 import { startTranscription, getVersions, reconcile, type VersionPair, type ReconcileBody } from "../../../api/transcription";
 import { startExtraction } from "../../../api/extraction";
-import { streamJob, listJobs } from "../../../api/jobs";
+import { streamJob, listJobs, jobOutcome } from "../../../api/jobs";
 import { geoSearch, type GeoResult } from "../../../api/geo";
+import { useConfirm, useDebouncedSearch } from "../ui";
+import { jobGerund } from "../labels";
 import { getCatalog, listCredentials, type CatalogEntry, type Credential } from "../../../api/providers";
 
 interface Prog { label: string; done: number; total: number; status: string }
@@ -39,6 +41,7 @@ export default function BibliotecaView() {
   const [extractDoc, setExtractDoc] = useState<DocumentOut | null>(null);
   const [indexDoc, setIndexDoc] = useState<DocumentOut | null>(null);
   const streamed = useRef<Set<string>>(new Set());
+  const { confirmDialog, ask } = useConfirm();
 
   const [gaps, setGaps] = useState<SeriesGap[]>([]);
   const load = useCallback(async () => {
@@ -54,8 +57,11 @@ export default function BibliotecaView() {
       (last) => {
         setProgress((p) => { const n = { ...p }; delete n[docId]; return n; });
         streamed.current.delete(jobId); void load();
-        if (last?.kind === "book_fail") e.notify(`${label}: error`, "var(--danger)");
-        else e.notify(`${label}: completado`, "var(--ok)");
+        const outcome = jobOutcome(last);
+        if (outcome === "ok") e.notify(`${label}: completado`, "var(--ok)");
+        else if (outcome === "cancelled") e.notify(`${label}: cancelado`, "var(--muted)");
+        else if (outcome === "error") e.notify(`${label}: error${last?.error ? ` — ${last.error}` : ""}`, "var(--danger)");
+        else e.notify(`${label}: conexión perdida; sigue en segundo plano`, "var(--muted)");
       },
     );
   }, [load, e]);
@@ -78,10 +84,6 @@ export default function BibliotecaView() {
     if (ids.size === 0) return;
     let alive = true;
     const RUNNING = new Set(["running", "queued"]);
-    const LABEL: Record<string, string> = {
-      transcription: "Transcribiendo", extraction: "Extrayendo", rasterize: "Rasterizando",
-      embedding: "Embeddings", embed_document: "Embeddings",
-    };
     const poll = async () => {
       let jobs;
       try { jobs = await listJobs(); } catch { return; }
@@ -97,7 +99,7 @@ export default function BibliotecaView() {
         if (!RUNNING.has(j.status) || !j.document_id || !ids.has(j.document_id)) continue;
         if (streamed.current.has(j.id)) continue;
         streamed.current.add(j.id);
-        track(j.document_id, LABEL[j.type] ?? j.type, j.id, j.progress ?? undefined);
+        track(j.document_id, jobGerund(j.type), j.id, j.progress ?? undefined);
       }
     };
     void poll();
@@ -132,6 +134,7 @@ export default function BibliotecaView() {
       }}
       style={{ padding: "32px 44px 64px", maxWidth: 1200, position: "relative", minHeight: "70vh" }}
     >
+      {confirmDialog}
       {pageDrag && (
         <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "var(--accent-faint)", border: "3px dashed var(--accent)", display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
           <div style={{ fontFamily: fonts.serif, fontSize: 26, fontWeight: 600, color: "var(--accent)" }}>Suelta tus PDFs para añadirlos</div>
@@ -202,11 +205,17 @@ export default function BibliotecaView() {
                   <Act on={!!progress[d.id]} label="Re-reconocer" onClick={() => setRetxDoc(d)} />
                   <Act label="Reconciliar" onClick={() => setReconDoc(d)} />
                   <Act label="Índice" onClick={() => setIndexDoc(d)} />
-                  <Act label="Re-procesar" onClick={() => { if (window.confirm("Re-rasteriza este libro a la calidad actual (Ajustes) desde el PDF original y borra sus transcripciones/actas para volver a procesarlo. ¿Continuar?")) runJob(d.id, "Re-procesando", () => rerasterize(d.id)); }} />
+                  <Act label="Re-procesar" onClick={async () => {
+                    if (await ask({ title: "¿Re-procesar el libro?", body: "Re-rasteriza este libro a la calidad actual (Ajustes) desde el PDF original y borra sus transcripciones/actas para volver a procesarlo.", confirmLabel: "Re-procesar" }))
+                      runJob(d.id, "Re-procesando", () => rerasterize(d.id));
+                  }} />
                   <Act on={busy === `${d.id}:ex` || !!progress[d.id]} label="Extraer" onClick={() => setExtractDoc(d)} />
                   {d.image_policy !== "data_only" && (
                     <Act danger on={busy === `${d.id}:di`} label="Descartar imágenes"
-                      onClick={() => confirm("¿Descartar las imágenes? Se conservan los datos y la cita, pero no podrás volver a ver el escaneo.") && action(d.id, "di", () => discardImages(d.id))} />
+                      onClick={async () => {
+                        if (await ask({ title: "¿Descartar las imágenes?", body: "Se conservan los datos y la cita, pero no podrás volver a ver el escaneo.", danger: true, confirmLabel: "Descartar" }))
+                          void action(d.id, "di", () => discardImages(d.id));
+                      }} />
                   )}
                 </div>
               </div>
@@ -270,7 +279,8 @@ function RetxPanel({ doc, onClose, onStart }: { doc: DocumentOut; onClose: () =>
     Promise.all([listCredentials(), getCatalog()]).then(([c, cat]) => { setCreds(c); setCatalog(cat); }).catch(() => { setCreds([]); setCatalog([]); });
   }, []);
   const capsByKey = Object.fromEntries(catalog.map((c) => [c.key, c.capabilities]));
-  const txCreds = creds.filter((c) => (capsByKey[c.provider_key] || []).includes("transcription"));
+  // vision LLMs + local OCR/HTR engines can all transcribe (mirrors AjustesView TASK_CAPS)
+  const txCreds = creds.filter((c) => (capsByKey[c.provider_key] || []).some((cap) => cap === "vision" || cap === "ocr_local"));
   const sel = txCreds.find((c) => c.id === credId);
   return (
     <div onClick={onClose} style={ov}>
@@ -355,7 +365,11 @@ function IndexPanel({ doc, onClose, notify }: { doc: DocumentOut; onClose: () =>
     try {
       const job = await parseIndex(doc.id);
       notify("Parseando índice…");
-      streamJob(job.id, () => {}, () => { setBusy(false); load(); notify("Índice procesado", "var(--ok)"); });
+      streamJob(job.id, () => {}, (last) => {
+        setBusy(false); load();
+        if (jobOutcome(last) === "ok") notify("Índice procesado", "var(--ok)");
+        else notify(`Índice: ${last?.error || "no completado"}`, "var(--danger)");
+      });
     } catch (err) { setBusy(false); notify((err as Error).message, "var(--danger)"); }
   }
   const missing = (rep?.entries || []).filter((e) => e.matched === false);
@@ -683,13 +697,8 @@ function UploadForm({ initial = [], onDone }: { initial?: File[]; onDone: () => 
 
 function MunicipalityInput({ field, value, onPick }: { field: React.CSSProperties; value: string; onPick: (name: string, coords: { lat: number; lng: number } | null) => void }) {
   const [q, setQ] = useState(value);
-  const [results, setResults] = useState<GeoResult[]>([]);
   const [open, setOpen] = useState(false);
-  useEffect(() => {
-    if (q.trim().length < 2) { setResults([]); return; }
-    const t = setTimeout(() => geoSearch(q).then(setResults).catch(() => setResults([])), 350);
-    return () => clearTimeout(t);
-  }, [q]);
+  const results = useDebouncedSearch<GeoResult>(q, (v) => geoSearch(v), { delay: 350 });
   return (
     <label style={{ display: "flex", flexDirection: "column", gap: 5, fontSize: 12, color: "var(--muted)", position: "relative" }}>
       Municipio de origen

@@ -6,7 +6,7 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from ..core import events
 from ..db.rls import set_rls_context
@@ -98,7 +98,7 @@ async def parse_index(ctx, *, job_id, tenant_id, document_id):
         rows = (await session.scalars(select(Transcription).where(*page_filter))).all()
         targets = [(t.id, t.page_id, t.text) for t in rows]
         # fresh parse: drop prior index entries for this doc
-        await session.execute(IndexEntry.__table__.delete().where(IndexEntry.document_id == document_id))
+        await session.execute(delete(IndexEntry).where(IndexEntry.document_id == document_id))
         await session.commit()
         await pub({"kind": "book_start", "total": len(targets)})
 

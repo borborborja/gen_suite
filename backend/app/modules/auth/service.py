@@ -40,6 +40,11 @@ async def register_user(
     # The very first user bootstraps the server administrator — but only when explicitly enabled,
     # so an internet-exposed fresh deploy can't be admin-claimed by whoever registers first. The
     # operator sets ALLOW_FIRST_USER_ADMIN=true for initial setup, then turns it back off.
+    # Serialized via an advisory xact lock so two concurrent first registrations can't BOTH see
+    # count==0 and both be promoted (check-then-act race).
+    if settings.allow_first_user_admin:
+        from sqlalchemy import text
+        await session.execute(text("SELECT pg_advisory_xact_lock(hashtext('first_user_admin'))"))
     is_first = (await session.scalar(select(func.count()).select_from(User))) == 0
     grant_admin = is_first and settings.allow_first_user_admin
     user = User(

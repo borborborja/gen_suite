@@ -24,7 +24,8 @@ Transcribe exactamente el texto visible en este documento histórico manuscrito.
 def _ocr_via_anthropic(img_data: bytes, *,
                        model: str = "claude-haiku-4-5-20251001",
                        api_key: str | None = None,
-                       prompt: str | None = None) -> str:
+                       prompt: str | None = None) -> tuple[str, dict]:
+    """Returns (text, usage) — usage is {prompt, completion} token counts for the spending control."""
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
@@ -41,14 +42,18 @@ def _ocr_via_anthropic(img_data: bytes, *,
             ],
         }],
     )
-    return response.content[0].text
+    u = getattr(response, "usage", None)
+    usage = {"prompt": getattr(u, "input_tokens", 0) or 0,
+             "completion": getattr(u, "output_tokens", 0) or 0}
+    return response.content[0].text, usage
 
 
 def _ocr_via_openai_compat(img_data: bytes, *,
                            model: str,
                            api_key: str | None = None,
                            base_url: str | None = None,
-                           prompt: str | None = None) -> str:
+                           prompt: str | None = None) -> tuple[str, dict]:
+    """Returns (text, usage) — usage is {prompt, completion} token counts for the spending control."""
     from openai import OpenAI
     client = OpenAI(
         api_key=api_key or os.environ.get("OPENAI_API_KEY", "none"),
@@ -68,4 +73,7 @@ def _ocr_via_openai_compat(img_data: bytes, *,
             ],
         }],
     )
-    return response.choices[0].message.content
+    u = getattr(response, "usage", None)
+    usage = {"prompt": getattr(u, "prompt_tokens", 0) or 0,
+             "completion": getattr(u, "completion_tokens", 0) or 0}
+    return response.choices[0].message.content, usage

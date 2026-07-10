@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from sqlalchemy import update
 
 from ..core import events
-from ..db.rls import set_rls_context
+from ..db.rls import commit_keep_rls, set_rls_context
 from ..db.session import SessionLocal
 from ..models.job import Job
 from ..modules.linkage import service as linkage_service
@@ -42,7 +42,10 @@ async def generate_candidates(ctx, *, job_id, tenant_id, person_id, max_candidat
                 update(Job).where(Job.id == job_id).values(
                     progress={"done": done, "total": total, "phase": ev.get("phase")})
             )
-            await session.commit()
+            # commit_keep_rls, not bare commit: the GUCs are transaction-local, so a plain commit
+            # here would drop them and every tenant-scoped query that follows in
+            # linkage_service.generate_candidates would silently see zero rows.
+            await commit_keep_rls(session, tenant_id=tenant_id)
 
         await set_rls_context(session, tenant_id=tenant_id)
         try:

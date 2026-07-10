@@ -9,7 +9,20 @@ from PIL import Image, ImageDraw, ImageFont
 from app.core import storage
 from app.tasks.transcription_tasks import transcribe_document
 
-_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux (CI/Docker)
+    "/System/Library/Fonts/Supplemental/Arial.ttf",     # macOS
+    "/Library/Fonts/Arial.ttf",
+)
+
+
+def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in _FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default(size)
 
 
 def _auth(token: str) -> dict:
@@ -19,7 +32,7 @@ def _auth(token: str) -> dict:
 def _text_png(text: str) -> bytes:
     img = Image.new("RGB", (640, 160), "white")
     draw = ImageDraw.Draw(img)
-    draw.text((20, 50), text, fill="black", font=ImageFont.truetype(_FONT, 48))
+    draw.text((20, 50), text, fill="black", font=_font(48))
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()

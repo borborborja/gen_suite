@@ -14,13 +14,22 @@ from app.settings import settings
 
 @pytest_asyncio.fixture(autouse=True)
 async def clean_db():
-    """Truncate identity tables before each test (uses the admin role, bypassing RLS)."""
+    """Truncate identity tables before each test (uses the admin role, bypassing RLS), and clear
+    the per-IP rate-limit buckets — every test registers from the same client IP, so with a live
+    Redis the auth limiter would otherwise start returning 429 after a few tests."""
     admin = create_async_engine(settings.admin_database_url)
     async with admin.begin() as conn:
         await conn.execute(
             text("TRUNCATE memberships, refresh_tokens, tenants, users RESTART IDENTITY CASCADE;")
         )
     await admin.dispose()
+    try:
+        r = _events.get_redis()
+        keys = [k async for k in r.scan_iter("rl:*")]
+        if keys:
+            await r.delete(*keys)
+    except Exception:
+        pass  # no Redis (fail-open limiter) → nothing to clear
     yield
     # pytest-asyncio uses a fresh event loop per test; drop pooled connections (DB + ARQ
     # Redis pool) so the next test never reuses one bound to a now-closed loop.

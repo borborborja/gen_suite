@@ -38,7 +38,10 @@ async def publish(tenant_id: uuid.UUID, job_id: uuid.UUID, event: dict) -> None:
 
 
 # Event kinds that mean the job is over — the SSE relay closes the stream when it sees one.
-_TERMINAL_KINDS = {"all_done", "book_fail", "cancelled", "error"}
+# (Imported lazily to avoid a core → modules import cycle at module load.)
+def _terminal_kinds() -> set[str]:
+    from ..modules.jobs.constants import TERMINAL_EVENT_KINDS
+    return TERMINAL_EVENT_KINDS
 
 
 async def sse_stream(
@@ -68,7 +71,7 @@ async def sse_stream(
                 quiet = 0
                 yield f"data: {msg['data']}\n\n"
                 try:
-                    if json.loads(msg["data"]).get("kind") in _TERMINAL_KINDS:
+                    if json.loads(msg["data"]).get("kind") in _terminal_kinds():
                         return  # job finished — close the stream so the client stops waiting
                 except (ValueError, TypeError):
                     pass

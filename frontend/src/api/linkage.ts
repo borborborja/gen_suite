@@ -1,16 +1,10 @@
-// Client for the linkage/discovery API (plan §5). Mirrors api/transcription.ts. The Estela
-// DiscoveryView currently renders sample data from features/estela/data.ts; swapping it onto
-// these calls is the wiring step once a corpus has been extracted.
+// Client for the linkage/discovery API (plan §5). Mirrors api/transcription.ts. The
+// Descubrimientos queue loads live candidates from here (store.reloadDiscoveries).
 import { api } from "./client";
+import type { Job } from "./types";
 
-export interface JobOut {
-  id: string;
-  type: string;
-  status: string;
-  progress: Record<string, unknown> | null;
-  result: Record<string, unknown> | null;
-  error: string | null;
-}
+// Back-compat alias — new code should import Job from api/types.
+export type JobOut = Job;
 
 export interface MentionOut {
   id: string;

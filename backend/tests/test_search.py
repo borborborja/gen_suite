@@ -15,7 +15,7 @@ from app.modules.search import service as search_service
 from app.settings import settings
 from app.tasks.transcription_tasks import transcribe_document
 
-_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+from .test_transcription import _font
 
 
 def _auth(t: str) -> dict:
@@ -24,7 +24,7 @@ def _auth(t: str) -> dict:
 
 def _png(word: str) -> bytes:
     img = Image.new("RGB", (640, 160), "white")
-    ImageDraw.Draw(img).text((20, 50), word, fill="black", font=ImageFont.truetype(_FONT, 48))
+    ImageDraw.Draw(img).text((20, 50), word, fill="black", font=_font(48))
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()

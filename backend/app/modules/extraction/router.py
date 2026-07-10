@@ -153,6 +153,18 @@ async def cancel_extraction(
     return _job_out(await service.cancel_job(db, job_id))
 
 
+async def _load_record_out(db: AsyncSession, r) -> RecordOut:
+    """Fetch the mentions + place name a single record needs and build its RecordOut."""
+    ments = (await db.scalars(
+        select(PersonMention).where(PersonMention.record_id == r.id))).all()
+    places: dict = {}
+    if r.place_id:
+        name = await db.scalar(select(Place.name).where(Place.id == r.place_id))
+        if name:
+            places[r.place_id] = name
+    return _record_out(r, list(ments), places)
+
+
 def _record_out(r, mentions: list[PersonMention], places: dict) -> RecordOut:
     ms = sorted(mentions, key=lambda m: _ROLE_ORDER.get(m.role, 99))
     return RecordOut(
@@ -196,7 +208,7 @@ async def merge_next(
 ) -> RecordOut:
     """Manually join this record with the first record on the following page into one spanning record
     (when auto-detection missed a split entry)."""
-    return _record_out(await service.merge_with_next(db, principal.tenant_id, record_id))
+    return await _load_record_out(db, await service.merge_with_next(db, principal.tenant_id, record_id))
 
 
 @router.post("/records/{record_id}/split", response_model=RecordOut,
@@ -208,4 +220,4 @@ async def split_record(
 ) -> RecordOut:
     """Unlink a spanning record from its second page (keeps it on its start page; auto-stitch will
     leave it alone afterwards)."""
-    return _record_out(await service.split_record(db, principal.tenant_id, record_id))
+    return await _load_record_out(db, await service.split_record(db, principal.tenant_id, record_id))

@@ -80,4 +80,6 @@ ARM, x86 o cualquier sitio**. Las únicas dependencias con binarios (`pymupdf`, 
 ## Desarrollo local (no afectado por lo anterior)
 El stack nativo de desarrollo usa `backend/.env` (sin `ENVIRONMENT` → `development`), así que la
 validación estricta no aplica. Servicios: API `uvicorn app.main:app`, worker `backend/run_worker.sh`
-(supervisado), y Vite `npx vite --host`. Datastores en contenedores `gs-db`/`gs-redis`/`gs-minio`.
+(bucle supervisado **solo para dev nativo**; en Docker el worker es el servicio compose con
+`arq app.tasks.worker.WorkerSettings`), y Vite `npx vite --host`. Datastores en contenedores
+`gs-db`/`gs-redis`/`gs-minio`.

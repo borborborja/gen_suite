@@ -1,6 +1,8 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEstela, avatar } from "../store";
 import { fonts } from "../theme";
+import { RECORD_TYPE_LABEL, roleLabel } from "../labels";
+import { useConfirm, useDebouncedSearch } from "../ui";
 import SourceScan from "../SourceScan";
 import {
   searchPersons, getSubtree, displayName, lifespan,
@@ -11,6 +13,10 @@ import {
   type CandidateOut,
 } from "../../../api/linkage";
 import { computeLayout, NODE_W, NODE_H } from "../../tree/layout";
+import { streamJob, jobOutcome } from "../../../api/jobs";
+import {
+  startReconstruction, latestReconstruction, mergeReconstruction, type ReconstructionOut,
+} from "../../../api/reconstruction";
 
 // roles that become tree nodes around the focus (others are shown in the act but not placed)
 const REL: Record<string, { rel: "parent" | "spouse" | "child" | "sibling"; sex: string }> = {
@@ -20,11 +26,6 @@ const REL: Record<string, { rel: "parent" | "spouse" | "child" | "sibling"; sex:
   sibling: { rel: "sibling", sex: "U" },
 };
 const FAMILY_ROLES = new Set(Object.keys(REL));
-const ROLE_LABEL: Record<string, string> = {
-  principal: "Principal", father: "Padre", mother: "Madre", spouse: "Cónyuge",
-  son: "Hijo", daughter: "Hija", child: "Hijo/a", sibling: "Hermano/a",
-  godfather: "Padrino", godmother: "Madrina", witness: "Testigo", other: "Otro",
-};
 
 function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -65,6 +66,7 @@ export default function SuperView() {
   const [cand, setCand] = useState<CandidateOut | null>(null);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("");
+  const { confirmDialog, ask } = useConfirm();
 
   const discovered = useRef<Set<string>>(new Set());
   const queue = useRef<CandidateOut[]>([]);   // pending candidates for the current focus
@@ -114,6 +116,14 @@ export default function SuperView() {
 
   async function start() {
     if (!seed) return;
+    // The crawl fires a discovery job per person of the tree, unattended — each may call al LLM.
+    // Make the cost explicit before letting it run.
+    const ok = await ask({
+      title: "¿Iniciar el superdescubrimiento?",
+      body: "Recorrerá tu árbol persona a persona lanzando búsquedas (y adjudicación con IA si está configurada) hasta que lo detengas. Puede tardar y consumir presupuesto de IA.",
+      confirmLabel: "Iniciar",
+    });
+    if (!ok) return;
     stop.current = false; setRunning(true);
     discovered.current = new Set();
     const g = await reloadGraph(seed.id);
@@ -128,7 +138,9 @@ export default function SuperView() {
     try {
       await confirmCandidate(cand.id);
       const rels = (cand.record?.mentions ?? []).filter((m) => m.id !== cand.person_mention_id && FAMILY_ROLES.has(m.role));
-      for (const m of rels) { try { await acceptProposal(cand.id, m.id); } catch { /* skip */ } }
+      let failed = 0;
+      for (const m of rels) { try { await acceptProposal(cand.id, m.id); } catch { failed++; } }
+      if (failed) e.notify(`${failed} pariente(s) no se pudieron añadir — revísalos en Descubrimientos`, "var(--warn)");
     } catch (err) { e.notify((err as Error).message, "var(--danger)"); }
     queue.current = [];
     setCand(null);
@@ -141,15 +153,31 @@ export default function SuperView() {
     try { await rejectCandidate(cand.id); } catch { /* */ }
     queue.current.shift();
     if (queue.current.length) { setCand(queue.current[0]); setStatus("Otra posibilidad."); }
-    else { setCand(null); setStatus("No quedan más posibilidades para esta persona."); if (running && !stop.current) await processNext(graph); }
+    else {
+      setCand(null); setStatus("No quedan más posibilidades para esta persona.");
+      // reload before continuing (like confirm()) — the closed-over `graph` is stale here
+      if (running && !stop.current) await processNext(await reloadGraph(seed!.id));
+    }
   }
 
   const built = useMemo(() => graph ? buildGraph(graph, focusId ?? graph.focus, cand) : null, [graph, focusId, cand]);
   const layout = useMemo(() => built ? computeLayout(built.graph) : null, [built]);
 
+  const [mode, setMode] = useState<"crawl" | "corpus">("crawl");
+
   return (
     <section style={{ padding: "32px 44px 64px" }}>
+      {confirmDialog}
       <h1 style={{ fontFamily: fonts.serif, fontWeight: 600, fontSize: 34, margin: 0, letterSpacing: "-.02em" }}>Superdescubrimiento</h1>
+      <div style={{ display: "inline-flex", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 9, padding: 3, gap: 2, margin: "14px 0 10px" }}>
+        {([["crawl", "Persona a persona"], ["corpus", "Todo el corpus"]] as const).map(([k, l]) => (
+          <span key={k} onClick={() => setMode(k)} style={{ padding: "8px 14px", borderRadius: 7, cursor: "pointer", fontSize: 13, fontWeight: mode === k ? 600 : 500, color: mode === k ? "#fff" : "var(--muted)", background: mode === k ? "var(--accent)" : "transparent" }}>{l}</span>
+        ))}
+      </div>
+
+      {mode === "corpus" ? (
+        <CorpusReconstruction ask={ask} />
+      ) : (<>
       <p style={{ color: "var(--muted)", fontSize: 14, margin: "6px 0 20px", maxWidth: 720 }}>
         Elige una persona de tu árbol y Estela irá descubriendo padres, madres, hermanos e hijos en tus libros, generación a generación. Los hallazgos aparecen <span style={{ color: "var(--accent)", fontWeight: 600 }}>en naranja</span>: púlsalos para ver la fuente y confirmarlos.
       </p>
@@ -208,14 +236,14 @@ export default function SuperView() {
               <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16, padding: 18, position: "sticky", top: 12 }}>
                 <div style={{ fontFamily: fonts.mono, fontSize: 10.5, letterSpacing: ".14em", color: "var(--accent)", marginBottom: 8 }}>POSIBLE ACTA · {Math.round(cand.score * 100)}%</div>
                 <div style={{ fontFamily: fonts.serif, fontSize: 16, fontWeight: 600, marginBottom: 10 }}>
-                  {cand.record?.record_type ? (cand.record.record_type[0].toUpperCase() + cand.record.record_type.slice(1)) : "Acta"}{cand.record?.date_year ? ` · ${cand.record.date_year}` : ""}{cand.record?.parish_raw ? ` · ${cand.record.parish_raw}` : ""}
+                  {cand.record?.record_type ? (RECORD_TYPE_LABEL[cand.record.record_type] ?? cand.record.record_type) : "Acta"}{cand.record?.date_year ? ` · ${cand.record.date_year}` : ""}{cand.record?.parish_raw ? ` · ${cand.record.parish_raw}` : ""}
                 </div>
                 <SourceScan docId={cand.record?.document_id ?? undefined} pageNo={cand.record?.page_no ?? undefined} quote={cand.record?.summary ?? ""} folio={cand.record?.page_no ? `pág. ${cand.record.page_no}` : undefined} />
                 {cand.record?.summary && <div style={{ fontFamily: fonts.serif, fontStyle: "italic", fontSize: 13.5, lineHeight: 1.5, background: "var(--bg)", border: "1px solid var(--line2)", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>“{cand.record.summary}”</div>}
                 <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 12, fontSize: 12.5 }}>
                   {(cand.record?.mentions ?? []).map((m) => (
                     <div key={m.id} style={{ display: "flex", gap: 9 }}>
-                      <span style={{ fontFamily: fonts.mono, fontSize: 10, color: "var(--muted)", textTransform: "uppercase", width: 70, flex: "none", paddingTop: 1 }}>{ROLE_LABEL[m.role] ?? m.role}</span>
+                      <span style={{ fontFamily: fonts.mono, fontSize: 10, color: "var(--muted)", textTransform: "uppercase", width: 70, flex: "none", paddingTop: 1 }}>{roleLabel(m.role, cand.record?.record_type)}</span>
                       <span style={{ fontWeight: 500 }}>{m.name_raw || [m.given, m.surname].filter(Boolean).join(" ") || "—"}</span>
                     </div>
                   ))}
@@ -230,22 +258,135 @@ export default function SuperView() {
           </div>
         </>
       )}
+      </>)}
     </section>
   );
 }
 
 const primaryBtn: React.CSSProperties = { background: "var(--accent)", color: "#fff", border: "none", borderRadius: 9, padding: "10px 18px", fontFamily: "inherit", fontSize: 14, fontWeight: 600, cursor: "pointer" };
 
+// ── Corpus-wide reconstruction: launch → follow job → review proposal → merge ──
+function CorpusReconstruction({ ask }: { ask: (o: import("../ui").ConfirmOpts) => Promise<boolean> }) {
+  const e = useEstela();
+  const [recon, setRecon] = useState<ReconstructionOut | null | undefined>(undefined); // undefined = loading
+  const [launching, setLaunching] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
+  const [merging, setMerging] = useState(false);
+
+  const reload = useCallback(() => {
+    latestReconstruction().then(setRecon).catch(() => setRecon(null));
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  // follow a running reconstruction's job live
+  useEffect(() => {
+    if (!recon || recon.status !== "running" || !recon.job_id) return;
+    const stop = streamJob(recon.job_id,
+      (ev) => setProgress(ev.phase ? `${ev.phase} · ${ev.done ?? 0}/${ev.total ?? "?"}` : `${ev.done ?? 0}/${ev.total ?? "?"}`),
+      (last) => {
+        setProgress(null);
+        const o = jobOutcome(last);
+        if (o === "error") e.notify(`Reconstrucción: ${last?.error || "falló"}`, "var(--danger)");
+        reload();
+      });
+    return stop;
+  }, [recon, reload, e]);
+
+  async function launch() {
+    const ok = await ask({
+      title: "¿Reconstruir el árbol desde el corpus?",
+      body: "Analiza TODAS las actas extraídas y propone un árbol completo (personas + familias). No toca tu árbol: obtienes una propuesta revisable que luego puedes fusionar. Puede usar IA para adjudicar casos dudosos.",
+      confirmLabel: "Reconstruir",
+    });
+    if (!ok) return;
+    setLaunching(true);
+    try { setRecon(await startReconstruction({ conservative: true, link_to_tree: true })); }
+    catch (err) { e.notify((err as Error).message, "var(--danger)"); }
+    setLaunching(false);
+  }
+
+  async function merge() {
+    if (!recon) return;
+    const ok = await ask({
+      title: "¿Fusionar la propuesta en tu árbol?",
+      body: `Se crearán ${recon.stats?.persons ?? "?"} personas y ${recon.stats?.families ?? "?"} familias (las ya enlazadas a personas existentes se reutilizan). Las conclusiones llevan su fuente.`,
+      confirmLabel: "Fusionar",
+    });
+    if (!ok) return;
+    setMerging(true);
+    try {
+      const r = await mergeReconstruction(recon.id);
+      e.notify(`Fusionado: ${r.persons} personas y ${r.families} familias añadidas`, "var(--ok)");
+      e.go("arbol");
+    } catch (err) { e.notify((err as Error).message, "var(--danger)"); }
+    setMerging(false);
+  }
+
+  const card: React.CSSProperties = { background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 14, padding: 20, maxWidth: 760 };
+
+  return (
+    <div>
+      <p style={{ color: "var(--muted)", fontSize: 14, margin: "6px 0 20px", maxWidth: 720 }}>
+        Reconstruye un árbol completo a partir de <b>todas las actas extraídas</b> del corpus (agrupando por parejas de padres) y te lo presenta como propuesta para revisar y fusionar.
+      </p>
+      {recon === undefined && <div style={{ color: "var(--muted)" }}>Cargando…</div>}
+
+      {recon !== undefined && (!recon || recon.status === "error") && (
+        <div style={card}>
+          {recon?.status === "error" && <div style={{ color: "var(--danger)", fontSize: 13, marginBottom: 10 }}>La última reconstrucción falló. Puedes lanzarla de nuevo.</div>}
+          <button onClick={launch} disabled={launching} style={{ ...primaryBtn, opacity: launching ? 0.6 : 1 }}>{launching ? "Lanzando…" : "Reconstruir árbol del corpus"}</button>
+        </div>
+      )}
+
+      {recon?.status === "running" && (
+        <div style={card}>
+          <div style={{ fontWeight: 600, fontSize: 15, marginBottom: 6 }}>Reconstruyendo…</div>
+          <div style={{ fontFamily: fonts.mono, fontSize: 12.5, color: "var(--muted)" }}>{progress ?? "en cola / procesando"}</div>
+        </div>
+      )}
+
+      {recon?.status === "completed" && (
+        <div style={card}>
+          <div style={{ fontWeight: 600, fontSize: 16, marginBottom: 8 }}>Propuesta lista</div>
+          {recon.stats && (
+            <div style={{ display: "flex", gap: 22, flexWrap: "wrap", marginBottom: 14, fontSize: 13.5 }}>
+              <span><b style={{ fontFamily: fonts.serif, fontSize: 22 }}>{recon.stats.persons}</b> personas</span>
+              <span><b style={{ fontFamily: fonts.serif, fontSize: 22 }}>{recon.stats.families}</b> familias</span>
+              <span><b style={{ fontFamily: fonts.serif, fontSize: 22 }}>{recon.stats.generations}</b> generaciones</span>
+              <span><b style={{ fontFamily: fonts.serif, fontSize: 22 }}>{recon.stats.linked_to_existing}</b> enlazadas a tu árbol</span>
+            </div>
+          )}
+          {recon.graph && recon.graph.families.length > 0 && (
+            <div style={{ maxHeight: 320, overflowY: "auto", border: "1px solid var(--line2)", borderRadius: 10, marginBottom: 14 }}>
+              {recon.graph.families.map((f) => {
+                const name = (k: string | null) => {
+                  const p = k ? recon.graph!.persons.find((x) => x.key === k) : null;
+                  return p ? [p.given, p.surname].filter(Boolean).join(" ") || "¿?" : "¿?";
+                };
+                return (
+                  <div key={f.key} style={{ padding: "9px 13px", borderBottom: "1px solid var(--line2)", fontSize: 13 }}>
+                    <b>{name(f.husband_key)}</b> ⚭ <b>{name(f.wife_key)}</b>
+                    <span style={{ color: "var(--muted)" }}> · {f.child_keys.length} hijo(s): {f.child_keys.map(name).join(", ")}</span>
+                    <span style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}> · {f.record_ids.length} acta(s)</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 10 }}>
+            <button onClick={merge} disabled={merging} style={{ ...primaryBtn, background: "var(--ok)", opacity: merging ? 0.6 : 1 }}>{merging ? "Fusionando…" : "Fusionar en mi árbol"}</button>
+            <button onClick={launch} disabled={launching} style={{ ...primaryBtn, background: "transparent", color: "var(--fg)", border: "1px solid var(--line)" }}>Rehacer</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SeedPicker({ onPick }: { onPick: (p: SearchHit) => void }) {
   const [q, setQ] = useState("");
-  const [results, setResults] = useState<SearchHit[]>([]);
-  const t = useRef<ReturnType<typeof setTimeout> | null>(null);
-  function onChange(v: string) {
-    setQ(v);
-    if (t.current) clearTimeout(t.current);
-    if (v.trim().length < 2) { setResults([]); return; }
-    t.current = setTimeout(() => { searchPersons(v).then(setResults).catch(() => setResults([])); }, 250);
-  }
+  const results = useDebouncedSearch(q, (v) => searchPersons(v), { delay: 250 });
+  const onChange = (v: string) => setQ(v);
   return (
     <div style={{ maxWidth: 460 }}>
       <div style={{ fontSize: 13, color: "var(--muted)", marginBottom: 8 }}>¿Desde quién empezamos?</div>

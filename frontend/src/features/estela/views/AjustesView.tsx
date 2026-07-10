@@ -4,12 +4,14 @@ import { fonts } from "../theme";
 import { api } from "../../../api/client";
 import { getRasterSettings, setRasterSettings, type RasterSettings } from "../../../api/documents";
 import {
-  getCatalog, listBindings, listCredentials, upsertBinding, reembedCorpus, getJob,
-  getSpend, setBudget,
+  getCatalog, listBindings, listCredentials, createCredential, deleteCredential,
+  upsertBinding, reembedCorpus, getJob, getSpend, setBudget,
   type CatalogEntry, type Credential, type Binding,
 } from "../../../api/providers";
-import { getMe, updateMe, changePassword } from "../../../api/account";
+import { getMe, updateMe, changePassword, type MeOut } from "../../../api/account";
+import { setTokens } from "../../../api/client";
 import { listApiKeys, createApiKey, revokeApiKey, type ApiKey } from "../../../api/apiKeys";
+import { useConfirm } from "../ui";
 
 const TASK_LABEL: Record<string, string> = {
   transcription: "Lectura del manuscrito (HTR / visión)",
@@ -35,8 +37,14 @@ export default function AjustesView() {
 
   useEffect(() => { void load(); }, [load]);
 
+  // Task → catalog capabilities that can serve it (mirrors backend TASK_CAPABILITY, plus the
+  // local OCR/HTR engines which are valid transcription providers without a key).
+  const TASK_CAPS: Record<string, string[]> = {
+    transcription: ["vision", "ocr_local"], inference: ["text"], embedding: ["embedding"],
+  };
   const capsByKey = Object.fromEntries(catalog.map((c) => [c.key, c.capabilities]));
-  const credsFor = (cap: string) => creds.filter((c) => (capsByKey[c.provider_key] || []).includes(cap));
+  const credsFor = (task: string) =>
+    creds.filter((c) => (capsByKey[c.provider_key] || []).some((cap) => (TASK_CAPS[task] ?? [task]).includes(cap)));
   const bindingFor = (task: string) => bindings.find((b) => b.task_type === task);
 
   async function pick(task: string, credId: string, model: string | null) {
@@ -82,10 +90,12 @@ export default function AjustesView() {
       {!loaded && <p style={{ color: "var(--muted)" }}>Cargando proveedores…</p>}
 
       {loaded && creds.length === 0 && (
-        <div style={{ background: "var(--warn-faint)", border: "1px solid var(--warn)", borderRadius: 12, padding: 16, color: "var(--warn)", fontSize: 13.5 }}>
+        <div style={{ background: "var(--warn-faint)", border: "1px solid var(--warn)", borderRadius: 12, padding: 16, color: "var(--warn)", fontSize: 13.5, marginBottom: 14 }}>
           No hay proveedores configurados todavía. Añade una credencial (OpenRouter, OpenAI, Ollama, Jina…) para activar la lectura y extracción.
         </div>
       )}
+
+      {loaded && <CredentialsSection catalog={catalog} creds={creds} onChanged={load} />}
 
       {/* per-task model selectors */}
       {loaded && creds.length > 0 && ["transcription", "inference", "embedding"].map((task) => {
@@ -153,6 +163,116 @@ export default function AjustesView() {
   );
 }
 
+// Add/list/delete AI provider credentials — the entry point the bindings below depend on.
+function CredentialsSection({ catalog, creds, onChanged }: {
+  catalog: CatalogEntry[]; creds: Credential[]; onChanged: () => Promise<void> | void;
+}) {
+  const e = useEstela();
+  const { confirmDialog, ask } = useConfirm();
+  const [open, setOpen] = useState(creds.length === 0);
+  const [provider, setProvider] = useState("");
+  const [label, setLabel] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [model, setModel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const sel = catalog.find((c) => c.key === provider);
+
+  async function add() {
+    if (!provider) { setMsg("Elige un proveedor"); return; }
+    if (sel?.requires_key && !apiKey.trim()) { setMsg("Este proveedor necesita una clave API"); return; }
+    setBusy(true); setMsg(null);
+    try {
+      await createCredential({
+        scope: "tenant", provider_key: provider,
+        label: label.trim() || sel?.display_name || provider,
+        api_key: apiKey.trim() || undefined,
+        base_url: baseUrl.trim() || undefined,
+        model_default: model.trim() || undefined,
+      });
+      setProvider(""); setLabel(""); setApiKey(""); setBaseUrl(""); setModel("");
+      await onChanged();
+      e.notify("Proveedor añadido", "var(--ok)");
+    } catch (err) { setMsg((err as Error).message); }
+    setBusy(false);
+  }
+
+  async function remove(c: Credential) {
+    const ok = await ask({
+      title: `¿Eliminar «${c.label}»?`,
+      body: "Las tareas que lo tengan asignado dejarán de funcionar hasta que elijas otro proveedor.",
+      danger: true, confirmLabel: "Eliminar",
+    });
+    if (!ok) return;
+    try { await deleteCredential(c.id); await onChanged(); }
+    catch (err) { e.notify((err as Error).message, "var(--danger)"); }
+  }
+
+  const fld: React.CSSProperties = { background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 8, padding: "9px 11px", color: "var(--fg)", fontFamily: "inherit", fontSize: 13.5, boxSizing: "border-box", width: "100%" };
+  const lbl: React.CSSProperties = { display: "flex", flexDirection: "column", gap: 5, fontSize: 12, color: "var(--muted)" };
+
+  return (
+    <div style={{ marginBottom: 22 }}>
+      {confirmDialog}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "0 0 10px" }}>
+        <h3 style={{ fontSize: 15, fontWeight: 600, margin: 0 }}>Proveedores de IA</h3>
+        <button onClick={() => setOpen((v) => !v)} style={{ background: "transparent", color: "var(--accent)", border: "1px solid var(--line)", borderRadius: 8, padding: "7px 13px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
+          {open ? "Cerrar" : "+ Añadir proveedor"}
+        </button>
+      </div>
+
+      {creds.length > 0 && (
+        <div style={{ border: "1px solid var(--line)", borderRadius: 12, overflow: "hidden", marginBottom: 12 }}>
+          {creds.map((c, i) => (
+            <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", background: "var(--surface)", borderBottom: i < creds.length - 1 ? "1px solid var(--line2)" : "none" }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13.5, fontWeight: 600 }}>{c.label} <span style={{ fontFamily: fonts.mono, fontSize: 11, color: "var(--muted)", fontWeight: 400 }}>{c.provider_key}</span></div>
+                <div style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)", marginTop: 2 }}>
+                  {c.key_masked ? `clave ${c.key_masked}` : "sin clave"}{c.model_default ? ` · ${c.model_default}` : ""}{c.base_url ? ` · ${c.base_url}` : ""}
+                </div>
+              </div>
+              <button onClick={() => remove(c)} style={{ flex: "none", background: "transparent", color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: 8, padding: "6px 12px", fontFamily: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Eliminar</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {open && (
+        <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 12, padding: 18 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <label style={lbl}>Proveedor
+              <select style={fld} value={provider} onChange={(ev) => { setProvider(ev.target.value); const c = catalog.find((x) => x.key === ev.target.value); setBaseUrl(""); setModel(c?.default_model ?? ""); }}>
+                <option value="">(elige)</option>
+                {catalog.map((c) => <option key={c.key} value={c.key}>{c.display_name}{c.requires_key ? "" : " (sin clave)"}</option>)}
+              </select>
+            </label>
+            <label style={lbl}>Nombre para mostrar
+              <input style={fld} value={label} onChange={(ev) => setLabel(ev.target.value)} placeholder={sel?.display_name ?? "Mi proveedor"} />
+            </label>
+            <label style={lbl}>Clave API {sel && !sel.requires_key ? "(no necesaria)" : ""}
+              <input style={fld} type="password" value={apiKey} onChange={(ev) => setApiKey(ev.target.value)} placeholder={sel?.requires_key ? "sk-…" : ""} disabled={!!sel && !sel.requires_key} />
+            </label>
+            <label style={lbl}>Modelo por defecto
+              <input style={fld} value={model} onChange={(ev) => setModel(ev.target.value)} placeholder={sel?.default_model ?? ""} />
+            </label>
+            <label style={{ ...lbl, gridColumn: "1 / -1" }}>URL base (solo si no es la estándar)
+              <input style={fld} value={baseUrl} onChange={(ev) => setBaseUrl(ev.target.value)} placeholder={sel?.default_base_url ?? ""} />
+            </label>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 14 }}>
+            <button onClick={add} disabled={busy} style={{ background: "var(--accent)", color: "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontFamily: "inherit", fontSize: 13.5, fontWeight: 600, cursor: "pointer", opacity: busy ? 0.6 : 1 }}>
+              {busy ? "Guardando…" : "Guardar proveedor"}
+            </button>
+            {msg && <span style={{ fontSize: 12.5, color: "var(--danger)" }}>{msg}</span>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AccountSection() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -161,11 +281,25 @@ function AccountSection() {
   const [cur, setCur] = useState("");
   const [nw, setNw] = useState("");
   const [pmsg, setPmsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [me, setMe] = useState<MeOut | null>(null);
+  const [switching, setSwitching] = useState(false);
 
   useEffect(() => {
-    getMe().then((m) => { setName(m.user.full_name ?? ""); setEmail(m.user.email); setLoaded(true); })
+    getMe().then((m) => { setMe(m); setName(m.user.full_name ?? ""); setEmail(m.user.email); setLoaded(true); })
       .catch(() => setLoaded(true));
   }, []);
+
+  async function switchTenant(tid: string) {
+    setSwitching(true);
+    try {
+      const t = await api<{ access_token: string; refresh_token: string }>(`/auth/switch/${tid}`, { method: "POST" });
+      setTokens(t.access_token, t.refresh_token);
+      window.location.reload(); // whole app state is per-tenant — a clean reload is the honest reset
+    } catch (err) {
+      setSwitching(false);
+      setMsg({ kind: "err", text: (err as Error).message });
+    }
+  }
 
   async function saveProfile() {
     setMsg(null);
@@ -202,6 +336,28 @@ function AccountSection() {
           {pmsg && <div style={{ fontSize: 12.5, color: pmsg.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>{pmsg.text}</div>}
         </div>
       </div>
+
+      {me && me.memberships.length > 1 && (
+        <>
+          <h3 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 10px" }}>Espacios de investigación</h3>
+          <div style={{ border: "1px solid var(--line)", borderRadius: 12, overflow: "hidden", marginBottom: 28 }}>
+            {me.memberships.map((m, i) => {
+              const active = m.tenant_id === me.active_tenant_id;
+              return (
+                <div key={m.tenant_id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", background: "var(--surface)", borderBottom: i < me.memberships.length - 1 ? "1px solid var(--line2)" : "none" }}>
+                  <div style={{ flex: 1, fontSize: 13.5, fontWeight: active ? 600 : 500 }}>
+                    {m.tenant_name} <span style={{ color: "var(--muted)", fontSize: 12, fontWeight: 400 }}>· {m.role}</span>
+                  </div>
+                  {active
+                    ? <span style={{ fontSize: 12, color: "var(--ok)", fontWeight: 600 }}>✓ activo</span>
+                    : <button disabled={switching} onClick={() => switchTenant(m.tenant_id)} style={{ background: "transparent", color: "var(--accent)", border: "1px solid var(--line)", borderRadius: 8, padding: "6px 13px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer", opacity: switching ? 0.5 : 1 }}>Cambiar</button>}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+
       <h3 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 10px" }}>Modelos de IA</h3>
     </>
   );
@@ -298,6 +454,7 @@ function ApiKeysSection() {
   const [token, setToken] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const { confirmDialog, ask } = useConfirm();
 
   const base = `${window.location.origin}/api`;
   const load = () => listApiKeys().then(setKeys).catch(() => setKeys([]));
@@ -313,7 +470,7 @@ function ApiKeysSection() {
     setBusy(false);
   }
   async function revoke(id: string) {
-    if (!confirm("¿Revocar este token? Las integraciones que lo usen dejarán de funcionar.")) return;
+    if (!(await ask({ title: "¿Revocar este token?", body: "Las integraciones que lo usen dejarán de funcionar.", danger: true, confirmLabel: "Revocar" }))) return;
     try { await revokeApiKey(id); await load(); } catch (err) { setMsg((err as Error).message); }
   }
 
@@ -322,6 +479,7 @@ function ApiKeysSection() {
 
   return (
     <>
+      {confirmDialog}
       <h3 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 6px" }}>API externa</h3>
       <p style={{ color: "var(--muted)", fontSize: 13, margin: "0 0 12px" }}>
         Crea tokens para acceder a la API desde fuera (scripts, integraciones). Envíalos en la cabecera
@@ -373,7 +531,9 @@ function ApiKeysSection() {
 }
 
 function DangerZone() {
+  const e = useEstela();
   const [done, setDone] = useState<string | null>(null);
+  const { confirmDialog, ask } = useConfirm();
   const items: { scope: string; label: string; desc: string }[] = [
     { scope: "discoveries", label: "Borrar descubrimientos", desc: "Elimina los candidatos de coincidencia (no toca el árbol ni los libros)." },
     { scope: "library", label: "Borrar biblioteca", desc: "Elimina libros, páginas, transcripciones y actas extraídas." },
@@ -381,14 +541,18 @@ function DangerZone() {
     { scope: "all", label: "Borrar TODO", desc: "Árbol + biblioteca + descubrimientos + lugares. No toca tus proveedores de IA." },
   ];
   async function reset(scope: string, label: string) {
-    if (!confirm(`${label}\n\nEsta acción es IRREVERSIBLE. Escribe Aceptar para continuar.`)) return;
-    const typed = prompt(`Confirma escribiendo BORRAR para "${label}"`);
-    if (typed !== "BORRAR") return;
-    try { await api(`/tenants/reset?scope=${scope}`, { method: "POST" }); setDone(scope); }
-    catch (err) { alert((err as Error).message); }
+    const ok = await ask({
+      title: label,
+      body: "Esta acción es IRREVERSIBLE.",
+      danger: true, typed: "BORRAR", confirmLabel: "Borrar definitivamente",
+    });
+    if (!ok) return;
+    try { await api(`/tenants/reset`, { method: "POST", body: JSON.stringify({ scope }) }); setDone(scope); }
+    catch (err) { e.notify((err as Error).message, "var(--danger)"); }
   }
   return (
     <>
+      {confirmDialog}
       <h3 style={{ fontSize: 15, fontWeight: 600, margin: "28px 0 10px", color: "var(--danger)" }}>Zona peligrosa</h3>
       <div style={{ border: "1px solid var(--danger)", borderRadius: 12, padding: 6, background: "rgba(192,57,43,.04)" }}>
         {items.map((it) => (

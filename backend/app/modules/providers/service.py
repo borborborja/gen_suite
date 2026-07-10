@@ -41,6 +41,15 @@ EMBEDDING_DIM = 1024
 def embed_texts(rc: ResolvedCredential, texts: list[str]) -> list[list[float]]:
     """Embed texts via an OpenAI-compatible endpoint (OpenAI/OpenRouter/Ollama). Sync — call
     from a thread. Standardized on 1024 dims to match the transcriptions.embedding column."""
+    vectors, _ = embed_texts_with_usage(rc, texts)
+    return vectors
+
+
+def embed_texts_with_usage(
+    rc: ResolvedCredential, texts: list[str]
+) -> tuple[list[list[float]], dict]:
+    """Like ``embed_texts`` but also returns token usage ``{prompt, completion}`` for the
+    spending control. Sync — call from a thread."""
     from openai import OpenAI
 
     if rc.engine not in ("openai", "ollama", "jina"):
@@ -56,7 +65,9 @@ def embed_texts(rc: ResolvedCredential, texts: list[str]) -> list[list[float]]:
     for v in vectors:
         if len(v) != EMBEDDING_DIM:
             raise ValueError(f"embedding dim {len(v)} != {EMBEDDING_DIM}; choose a 1024-dim model")
-    return vectors
+    u = getattr(resp, "usage", None)
+    usage = {"prompt": getattr(u, "prompt_tokens", 0) or 0, "completion": 0}
+    return vectors, usage
 
 
 def extract_structured_with_usage(
@@ -85,8 +96,13 @@ def extract_structured_with_usage(
         resp = client.chat.completions.create(
             model=rc.model, messages=messages, response_format=response_format, temperature=0,
         )
-    except Exception:
-        # Model/endpoint lacks json_schema support → retry with plain json_object.
+    except Exception as exc:
+        # Model/endpoint lacks json_schema support → retry with plain json_object. Log the original
+        # error so a genuine auth/network failure isn't silently masked by the fallback.
+        import logging
+        logging.getLogger(__name__).warning(
+            "json_schema request failed (%s: %s); retrying with json_object", type(exc).__name__, exc
+        )
         resp = client.chat.completions.create(
             model=rc.model, messages=messages,
             response_format={"type": "json_object"}, temperature=0,
@@ -157,12 +173,16 @@ def poll_batch(rc: ResolvedCredential, batch_id: str) -> tuple[str, str | None]:
     return b.status, getattr(b, "output_file_id", None)
 
 
-def fetch_batch_results(rc: ResolvedCredential, output_file_id: str) -> dict[str, dict | None]:
-    """Map each custom_id → its parsed JSON body (None if that line errored)."""
+def fetch_batch_results(
+    rc: ResolvedCredential, output_file_id: str
+) -> tuple[dict[str, dict | None], dict]:
+    """Map each custom_id → its parsed JSON body (None if that line errored), plus the aggregated
+    token usage ``{prompt, completion, total}`` across all lines (for the spending control)."""
     import json as _json
 
     text = _client(rc).files.content(output_file_id).text
     out: dict[str, dict | None] = {}
+    usage = {"prompt": 0, "completion": 0, "total": 0}
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -170,13 +190,17 @@ def fetch_batch_results(rc: ResolvedCredential, output_file_id: str) -> dict[str
         try:
             obj = _json.loads(line)
             body = (obj.get("response") or {}).get("body") or {}
+            u = body.get("usage") or {}
+            usage["prompt"] += int(u.get("prompt_tokens") or 0)
+            usage["completion"] += int(u.get("completion_tokens") or 0)
+            usage["total"] += int(u.get("total_tokens") or 0)
             content = body["choices"][0]["message"]["content"]
             out[obj["custom_id"]] = _json.loads(content)
         except Exception:
             cid = obj.get("custom_id") if isinstance(obj, dict) else None
             if cid:
                 out[cid] = None
-    return out
+    return out, usage
 
 
 async def record_usage(

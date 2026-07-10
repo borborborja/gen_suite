@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, status
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.deps import get_authn_db, get_current_principal, get_tenant_db, require_roles
@@ -13,14 +14,19 @@ from .schemas import AddMemberRequest, CreateTenantRequest, MemberOut, TenantOut
 router = APIRouter(prefix="/tenants", tags=["tenancy"])
 
 
+class ResetRequest(BaseModel):
+    scope: str
+
+
 @router.post("/reset", dependencies=[Depends(require_roles(MembershipRole.tenant_admin.value))])
 async def reset_data(
-    scope: str,
+    body: ResetRequest,
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
-    """Destructive: wipe the tenant's tree | library | discoveries | all (Ajustes danger zone)."""
-    return await reset_tenant_data(db, principal.tenant_id, scope)
+    """Destructive: wipe the tenant's tree | library | discoveries | all (Ajustes danger zone).
+    Scope goes in the body, like every other mutating POST."""
+    return await reset_tenant_data(db, principal.tenant_id, body.scope)
 
 
 @router.post("", response_model=TenantOut, status_code=status.HTTP_201_CREATED)

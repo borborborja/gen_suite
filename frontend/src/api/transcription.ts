@@ -1,13 +1,7 @@
 import { api } from "./client";
+import type { Job } from "./types";
 
-export interface Job {
-  id: string;
-  type: string;
-  status: string;
-  progress: { done?: number; total?: number; errors?: number } | null;
-  result: Record<string, unknown> | null;
-  error: string | null;
-}
+export type { Job } from "./types";
 export interface TranscriptionOut {
   id: string;
   page_no: number;

@@ -7,6 +7,8 @@ import { searchPersons, displayName, lifespan, type SearchHit as PersonHit } fro
 import { listSources, type ExternalSource } from "../../../api/sources";
 import { getRecordTypes, listDocuments, type RecordType, type DocumentOut } from "../../../api/documents";
 import { geoSearch, type GeoResult } from "../../../api/geo";
+import { roleLabel } from "../labels";
+import { useDebouncedSearch } from "../ui";
 
 const tabs = [
   { key: "archivo", label: "En el archivo" },
@@ -14,19 +16,14 @@ const tabs = [
   { key: "fuentes", label: "Fuentes externas" },
 ];
 
+// Search filter options, labelled from the shared dictionary. "principal" is generic here
+// because the filter spans all record types.
+const ROLE_KEYS = ["principal", "head", "father", "mother", "spouse", "son", "daughter",
+  "child", "sibling", "godfather", "godmother", "witness", "testator"];
 const ROLES = [
   { v: "", l: "(cualquier rol)" },
-  { v: "principal", l: "Principal / titular" },
-  { v: "head", l: "Cabeza de familia" },
-  { v: "father", l: "Padre" }, { v: "mother", l: "Madre" },
-  { v: "spouse", l: "Cónyuge" },
-  { v: "son", l: "Hijo" }, { v: "daughter", l: "Hija" }, { v: "child", l: "Hijo/a" },
-  { v: "sibling", l: "Hermano/a" },
-  { v: "godfather", l: "Padrino" }, { v: "godmother", l: "Madrina" },
-  { v: "witness", l: "Testigo" }, { v: "testator", l: "Testador" },
+  ...ROLE_KEYS.map((k) => ({ v: k, l: roleLabel(k) })),
 ];
-
-const ROLE_LABEL: Record<string, string> = Object.fromEntries(ROLES.map((r) => [r.v, r.l]));
 
 interface Filters {
   text: string; given: string; surname: string; recordType: string; documentId: string;
@@ -224,7 +221,7 @@ export default function BuscarView() {
               </div>
               <div style={{ fontSize: 13.5, marginTop: 6 }}>
                 <span style={{ fontWeight: 600 }}>{displayName({ given: r.given, surname: r.surname })}</span>
-                {r.role && <span style={{ color: "var(--muted)" }}> · {ROLE_LABEL[r.role] ?? r.role}</span>}
+                {r.role && <span style={{ color: "var(--muted)" }}> · {roleLabel(r.role, r.record_type)}</span>}
               </div>
               {r.summary && <div style={{ fontFamily: fonts.serif, fontSize: 13, color: "var(--muted)", marginTop: 4, lineHeight: 1.45 }}>{r.summary}</div>}
             </div>
@@ -258,13 +255,8 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 }
 
 function PlaceInput({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const [results, setResults] = useState<GeoResult[]>([]);
   const [open, setOpen] = useState(false);
-  useEffect(() => {
-    if (value.trim().length < 2) { setResults([]); return; }
-    const t = setTimeout(() => geoSearch(value).then(setResults).catch(() => setResults([])), 350);
-    return () => clearTimeout(t);
-  }, [value]);
+  const results = useDebouncedSearch<GeoResult>(value, (v) => geoSearch(v), { delay: 350 });
   return (
     <>
       <input style={fld} value={value} onChange={(ev) => { onChange(ev.target.value); setOpen(true); }} onBlur={() => setTimeout(() => setOpen(false), 150)} placeholder="Belmez…" />

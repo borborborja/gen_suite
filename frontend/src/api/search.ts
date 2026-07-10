@@ -1,24 +1,5 @@
 import { api } from "./client";
 
-export interface SearchHit {
-  transcription_id: string;
-  document_id: string;
-  document_title: string | null;
-  page_no: number;
-  snippet: string | null;
-  score: number;
-}
-
-export const search = (
-  q: string,
-  mode: "keyword" | "semantic" | "hybrid" = "hybrid",
-  scope: "tenant" | "public" | "all" = "all",
-  limit = 20,
-) =>
-  api<SearchHit[]>(
-    `/search?q=${encodeURIComponent(q)}&mode=${mode}&scope=${scope}&limit=${limit}`,
-  );
-
 export interface RecordHit {
   record_id: string;
   mention_id: string | null;

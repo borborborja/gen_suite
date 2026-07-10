@@ -35,6 +35,13 @@ CONFIDENCE_FLOOR = 0.45
 _ACTIVE = ("extracted", "needs_review", "reviewed")  # non-superseded, non-rejected
 
 
+def _final_status(failed: int, attempted: int) -> str:
+    """A run where most pages failed (provider out of credit, rate-limited…) is NOT a clean
+    success — mark it 'error' so the UI flags it and the user can switch provider and re-run
+    (the anti-join reprocesses the failed pages). A few failures stay 'completed'."""
+    return "error" if failed and failed > attempted * 0.3 else "completed"
+
+
 def _parse_page(raw: dict) -> ExtractedPage:
     """Tolerant parse of a model's page output. LLMs (esp. richer ones like Gemini Pro) occasionally
     emit one malformed record/field; salvage the records that validate individually instead of
@@ -353,7 +360,7 @@ async def _run_batch_extraction(session, *, job_id, tenant_id, document_id, rc, 
         await session.commit()
         await pub({"kind": "book_fail", "error": f"batch {status}"}); return
 
-    results = await asyncio.to_thread(fetch_batch_results, rc, out_file)
+    results, tokens = await asyncio.to_thread(fetch_batch_results, rc, out_file)
     await set_rls_context(session, tenant_id=tenant_id)
     records_made = failed = flagged = 0
     for tid, raw in results.items():
@@ -386,18 +393,29 @@ async def _run_batch_extraction(session, *, job_id, tenant_id, document_id, rc, 
     seq = await _validate_sequence(session, document_id=document_id)
     await session.commit()
 
-    final_status = "error" if failed and failed > len(results) * 0.3 else "completed"
+    final_status = _final_status(failed, len(results))
     await set_rls_context(session, tenant_id=tenant_id)
     await session.execute(update(Job).where(Job.id == job_id).values(
         status=final_status, finished_at=datetime.now(timezone.utc),
         error=(f"{failed}/{len(results)} páginas fallaron" if final_status == "error" else None),
         result={"pages": len(results), "records": records_made, "failed": failed,
                 "needs_review": flagged + seq, "stitched": merges, "sequence_flags": seq,
-                "folios_filled": folios, "modality": "batch", "model": rc.model}))
+                "folios_filled": folios, "modality": "batch", "model": rc.model,
+                "tokens": tokens}))
     await session.commit()
+
+    # Log AI spend for the spending control (best-effort) — same as the sync path.
+    from ..modules.providers.service import record_usage
+    await set_rls_context(session, tenant_id=tenant_id)
+    await record_usage(session, tenant_id=tenant_id, job_id=job_id, task_type="extraction",
+                       model=rc.model, prompt_tokens=tokens["prompt"],
+                       completion_tokens=tokens["completion"])
+    await session.commit()
+
     if records_made:
         try:
             from ..core.queue import get_queue
+            await set_rls_context(session, tenant_id=tenant_id)
             ej = Job(tenant_id=tenant_id, type="embed_mentions", status="queued",
                      params={"document_id": str(document_id)})
             session.add(ej); await session.commit()
@@ -579,10 +597,7 @@ async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None,
         await session.commit()
 
         per_page = round(tokens["total"] / (done - failed), 1) if (done - failed) else 0
-        # If most pages failed (e.g. provider out of credit / rate-limited), the run is NOT a clean
-        # success — mark it 'error' so the UI flags it and the user can switch provider and re-run
-        # (the anti-join reprocesses the failed pages). A few failures stay 'completed'.
-        final_status = "error" if failed and failed > done * 0.3 else "completed"
+        final_status = _final_status(failed, done)
         err_msg = (f"{failed}/{done} páginas fallaron en la extracción · ej.: {last_error}"
                    if final_status == "error" else None)
         await set_rls_context(session, tenant_id=tenant_id)

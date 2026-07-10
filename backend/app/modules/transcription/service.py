@@ -65,12 +65,8 @@ async def create_job(
 
 
 async def cancel_job(session: AsyncSession, job_id: uuid.UUID) -> Job:
-    job = await session.get(Job, job_id)
-    if not job:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
-    if job.status in ("queued", "running"):
-        job.status = "cancelled"
-    return job
+    from ..jobs.service import cancel_job as cancel
+    return await cancel(session, job_id)
 
 
 async def correct_text(

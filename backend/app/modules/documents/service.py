@@ -247,6 +247,10 @@ async def compact_pdf_job(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
     if doc.doc_type != "image_set":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "only image documents can be compacted to PDF")
+    from ..jobs.service import active_job_for
+    existing = await active_job_for(session, tenant_id, "compact_pdf", document_id)
+    if existing:
+        return existing
     job = Job(tenant_id=tenant_id, type="compact_pdf", status="queued",
               params={"document_id": str(document_id)}, created_by=created_by)
     session.add(job)
@@ -350,6 +354,10 @@ async def parse_index_job(
     if not has_index:
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             "marca primero las páginas de índice en el mosaico, o sube el índice como documento de tipo índice")
+    from ..jobs.service import active_job_for
+    existing = await active_job_for(session, tenant_id, "index", document_id)
+    if existing:
+        return existing
     job = Job(tenant_id=tenant_id, type="index", status="queued",
               params={"document_id": str(document_id)}, created_by=created_by)
     session.add(job)
@@ -473,8 +481,6 @@ async def split_document(
 
     async def _renumber(seg: list[Page], target_doc: Document) -> None:
         for new_no, pg in enumerate(seg, start=1):
-            tx_ids = [t for t in (await session.scalars(
-                select(Transcription.id).where(Transcription.page_id == pg.id))).all()]
             pg.document_id = target_doc.id
             pg.page_no = new_no
             pg.visibility = target_doc.visibility
@@ -483,7 +489,6 @@ async def split_document(
                 document_id=target_doc.id, page_no=new_no))
             await session.execute(update(Record).where(
                 (Record.page_id == pg.id) | (Record.page_end_id == pg.id)).values(document_id=target_doc.id))
-            _ = tx_ids
         target_doc.page_count = len(seg)
 
     # First segment stays in the original document (renumbered from 1).

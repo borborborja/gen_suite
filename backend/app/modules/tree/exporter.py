@@ -192,7 +192,9 @@ async def export_gedcom(session: AsyncSession, tenant_id: uuid.UUID) -> str:
     ).all():
         children_of[fc.family_id].append(fc.person_id)
         famc_of[fc.person_id].append(fc.family_id)
-        fc_to_family[fc.id] = fc.family_id
+        # FamilyChild has a composite PK (family_id, person_id) — no surrogate id — so a
+        # "family_child" citation stores the child's person_id as its target.
+        fc_to_family.setdefault(fc.person_id, fc.family_id)
 
     fams_of: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
     for f in families:

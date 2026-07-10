@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -14,6 +13,7 @@ from ...db.rls import set_rls_context
 from ...db.session import SessionLocal
 from ...models.job import Job
 from . import service
+from .constants import TERMINAL_STATUSES, terminal_event
 from .schemas import JobOut
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -47,15 +47,7 @@ async def get_job(job_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)) 
 
 @router.post("/{job_id}/cancel", response_model=JobOut)
 async def cancel_job(job_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)) -> JobOut:
-    """Cancel/dismiss a job: a still-active worker stops at its next checkpoint; a stuck/orphaned job
-    is simply marked done so it leaves the activity list."""
-    job = await service.get_job(db, job_id)
-    if job.status in ("queued", "running"):
-        job.status = "cancelled"
-        job.finished_at = datetime.now(timezone.utc)
-        if not job.error:
-            job.error = "Cancelada por el usuario"
-    return _out(job)
+    return _out(await service.cancel_job(db, job_id))
 
 
 @router.get("/{job_id}/events")
@@ -76,14 +68,8 @@ async def job_events(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
         # If the job already finished, the live pub/sub has nothing to replay — hand the relay a
         # synthetic final event so the client gets closure instead of hanging on keepalives forever.
-        if job.status in ("completed", "error", "cancelled"):
-            kind = "all_done" if job.status == "completed" else (
-                "cancelled" if job.status == "cancelled" else "book_fail")
-            prog = job.progress or {}
-            already_done = {
-                "kind": kind, "done": prog.get("done"), "total": prog.get("total"),
-                "error": job.error, "status": job.status,
-            }
+        if job.status in TERMINAL_STATUSES:
+            already_done = terminal_event(job.status, job.progress, job.error)
 
     tid, uid, role = principal.tenant_id, principal.user_id, principal.role
 
@@ -93,12 +79,10 @@ async def job_events(
         async with SessionLocal() as s:
             await set_rls_context(s, user_id=uid, tenant_id=tid, role=role)
             j = await s.get(Job, job_id)
-            if not j or j.status in ("completed", "error", "cancelled"):
-                prog = (j.progress or {}) if j else {}
-                st = j.status if j else "error"
-                kind = "all_done" if st == "completed" else ("cancelled" if st == "cancelled" else "book_fail")
-                return {"kind": kind, "done": prog.get("done"), "total": prog.get("total"),
-                        "error": (j.error if j else "job gone"), "status": st}
+            if not j:
+                return terminal_event("error", None, "job gone")
+            if j.status in TERMINAL_STATUSES:
+                return terminal_event(j.status, j.progress, j.error)
         return None
 
     return StreamingResponse(

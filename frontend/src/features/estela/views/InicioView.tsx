@@ -4,15 +4,8 @@ import { fonts } from "../theme";
 import { ArrowRight } from "../icons";
 import { getStats, type TreeStats } from "../../../api/tree";
 import { listJobs, type JobItem } from "../../../api/jobs";
+import { JOB_LABEL, STATUS_COLOR, statusLabel } from "../labels";
 
-const JOB_LABEL: Record<string, string> = {
-  transcription: "Transcripción", extraction: "Extracción", embed_mentions: "Embeddings de menciones",
-  reembed_corpus: "Re-embeber corpus", linkage: "Descubrimiento", rasterize: "Rasterizado de PDF",
-  embedding: "Embeddings", embed_document: "Embeddings",
-};
-const STATUS_COLOR: Record<string, string> = {
-  completed: "var(--ok)", running: "var(--accent)", queued: "var(--warn)", error: "var(--danger)", cancelled: "var(--muted)",
-};
 function ago(iso: string): string {
   const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
   if (s < 60) return "hace un momento";
@@ -81,7 +74,7 @@ export default function InicioView() {
                 <div key={j.id} style={{ display: "flex", alignItems: "center", gap: 13, padding: "10px 0", borderBottom: "1px solid var(--line2)" }}>
                   <span style={{ width: 9, height: 9, borderRadius: "50%", marginTop: 1, flex: "none", background: STATUS_COLOR[j.status] ?? "var(--muted)", ...(j.status === "running" ? { animation: "estPulse 1.4s infinite" } : {}) }} />
                   <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 13.5 }}>{JOB_LABEL[j.type] ?? j.type} <span style={{ color: STATUS_COLOR[j.status] ?? "var(--muted)", fontSize: 12 }}>· {j.status === "running" && p ? `${p.done ?? 0}/${p.total ?? "?"}` : j.status}</span></div>
+                    <div style={{ fontSize: 13.5 }}>{JOB_LABEL[j.type] ?? j.type} <span style={{ color: STATUS_COLOR[j.status] ?? "var(--muted)", fontSize: 12 }}>· {j.status === "running" && p ? `${p.done ?? 0}/${p.total ?? "?"}` : statusLabel(j.status)}</span></div>
                     <div style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)", marginTop: 2 }}>{ago(j.finished_at || j.created_at)}</div>
                   </div>
                 </div>

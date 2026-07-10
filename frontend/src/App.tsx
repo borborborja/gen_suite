@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
+import type { CSSProperties } from "react";
 import { api, clearTokens, hasToken, setTokens } from "./api/client";
-import TreeView from "./features/tree/TreeView";
-import DocumentsView from "./features/documents/DocumentsView";
-import ProvidersView from "./features/providers/ProvidersView";
 import EstelaApp from "./features/estela/EstelaApp";
 
 interface Membership {
@@ -17,39 +15,31 @@ interface Me {
   active_role: string | null;
   memberships: Membership[];
 }
-interface Member {
-  user_id: string;
-  email: string;
-  full_name: string | null;
-  role: string;
-}
 interface TokenPair {
   access_token: string;
   refresh_token: string;
 }
 
-// ── TEMPORARY: login disabled while gen_suite is not a public product. The app auto-signs-in to a
-// single dev account and lands straight in Estela. Restore the <Auth> gate (remove DEV_BYPASS) when
-// reinstating login. Credentials live only in this client during the private phase.
-const DEV_BYPASS = true;
-const DEV_EMAIL = "test@example.com";
-const DEV_PASSWORD = "estela12345";
-// Land directly on the tenant that holds the imported tree (Vallbona). Temporary, dev-only.
-const DEV_TENANT_ID = "36a4aac0-2b87-42d6-97d9-7206e59b82b8";
+// Optional dev auto-login: set VITE_DEV_BYPASS=true (plus VITE_DEV_EMAIL / VITE_DEV_PASSWORD)
+// in frontend/.env.local. Nothing is hardcoded in the bundle; production builds without these
+// vars always show the login screen.
+const DEV_BYPASS = import.meta.env.VITE_DEV_BYPASS === "true";
+const DEV_EMAIL = import.meta.env.VITE_DEV_EMAIL as string | undefined;
+const DEV_PASSWORD = import.meta.env.VITE_DEV_PASSWORD as string | undefined;
 
 export default function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [booting, setBooting] = useState(DEV_BYPASS);
+  const [booting, setBooting] = useState(true);
+  // set on explicit logout so the dev bypass doesn't immediately sign back in
+  const [loggedOut, setLoggedOut] = useState(false);
 
   const loadMe = useCallback(async () => {
     try {
       const m = await api<Me>("/auth/me");
-      // land on the tree's tenant (DEV) or the first membership, so we open Estela not the picker
-      const target = DEV_BYPASS
-        ? (m.memberships.find((x) => x.tenant_id === DEV_TENANT_ID)?.tenant_id ?? m.memberships[0]?.tenant_id)
-        : m.memberships[0]?.tenant_id;
-      if (target && m.active_tenant_id !== target) {
+      // exactly one membership and none active → auto-select it so we land in Estela, not the picker
+      const target = m.active_tenant_id ? null : (m.memberships.length === 1 ? m.memberships[0].tenant_id : null);
+      if (target) {
         const t = await api<TokenPair>(`/auth/switch/${target}`, { method: "POST" });
         setTokens(t.access_token, t.refresh_token);
         setMe(await api<Me>("/auth/me"));
@@ -77,8 +67,9 @@ export default function App() {
   }, [loadMe]);
 
   useEffect(() => {
-    if (DEV_BYPASS) { void autoLogin(); return; }  // always fresh login, ignore stale tokens
-    if (hasToken()) void loadMe().finally(() => setBooting(false));
+    if (hasToken()) { void loadMe().finally(() => setBooting(false)); return; }
+    if (DEV_BYPASS && DEV_EMAIL && DEV_PASSWORD) { void autoLogin(); return; }
+    setBooting(false);
   }, [loadMe, autoLogin]);
 
   // The API client fires this when a refresh fails (session truly expired) — drop to the login view.
@@ -98,50 +89,69 @@ export default function App() {
       /* ignore */
     }
     clearTokens();
-    await loadMe();
-  }, [loadMe]);
+    setMe(null);
+    setError(null);
+    setLoggedOut(true); // show the login screen even with the dev bypass enabled
+  }, []);
+
+  const onAuthed = useCallback(async () => { setLoggedOut(false); await loadMe(); }, [loadMe]);
 
   if (booting) {
     return (
-      <div className="wrap" style={{ textAlign: "center", paddingTop: "20vh" }}>
-        <h1><span className="brand">Estela</span></h1>
-        <p className="muted">Entrando…</p>
-        {error && <p className="error">{error}</p>}
-      </div>
+      <Shell>
+        <h1 style={styles.brand}>Estela</h1>
+        <p style={styles.muted}>Entrando…</p>
+        {error && <p style={styles.error}>{error}</p>}
+      </Shell>
     );
   }
-  if (!me) {
-    if (DEV_BYPASS) {
-      return (
-        <div className="wrap" style={{ textAlign: "center", paddingTop: "20vh" }}>
-          <p className="error">No se pudo entrar automáticamente. ¿Está el backend arriba?</p>
-          {error && <p className="error">{error}</p>}
-        </div>
-      );
-    }
-    return <Auth onAuthed={loadMe} error={error} setError={setError} />;
-  }
+  // initialError: only session-level messages (expired, dev auto-login failed) — the form's own
+  // submit errors live inside <Auth>, so they always show even right after a logout.
+  if (!me) return <Auth onAuthed={onAuthed} initialError={loggedOut ? null : error} />;
   // With an active tenant, the Estela UI is the product surface. Without one,
-  // fall back to the tenant-setup dashboard so the user can create/select a tenant.
+  // a minimal setup screen lets the user create or select a tenant.
   if (me.active_tenant_id) return <EstelaApp account={{ email: me.user.email, onLogout: logout }} />;
-  return <Dashboard me={me} reload={loadMe} setError={setError} error={error} />;
+  return <TenantSetup me={me} reload={loadMe} onLogout={logout} error={error} setError={setError} />;
+}
+
+// ── shared minimal styling for the pre-Estela screens (login / tenant setup) ──
+const styles: Record<string, CSSProperties> = {
+  shell: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#faf7f2", color: "#1f1b16", fontFamily: "'Inter', system-ui, sans-serif" },
+  panel: { width: "100%", maxWidth: 400, padding: "32px 28px", textAlign: "center" },
+  brand: { fontFamily: "'Source Serif 4', Georgia, serif", fontSize: 34, fontWeight: 600, letterSpacing: "-.02em", margin: "0 0 4px" },
+  sub: { color: "#8a8074", fontSize: 14, margin: "0 0 28px" },
+  muted: { color: "#8a8074", fontSize: 14 },
+  error: { color: "#c0392b", fontSize: 13.5, margin: "12px 0 0" },
+  input: { width: "100%", boxSizing: "border-box", background: "#fff", border: "1px solid #e2dbd0", borderRadius: 9, padding: "12px 14px", fontFamily: "inherit", fontSize: 14.5, marginBottom: 10 },
+  primary: { width: "100%", background: "#d9531e", color: "#fff", border: "none", borderRadius: 9, padding: "12px 16px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: "pointer" },
+  ghost: { background: "transparent", border: "none", color: "#8a8074", fontFamily: "inherit", fontSize: 13.5, cursor: "pointer", textDecoration: "underline" },
+  card: { background: "#fff", border: "1px solid #e2dbd0", borderRadius: 12, padding: 18, textAlign: "left", marginBottom: 14 },
+};
+
+function Shell({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={styles.shell}>
+      <div style={styles.panel}>{children}</div>
+    </div>
+  );
 }
 
 function Auth({
   onAuthed,
-  error,
-  setError,
+  initialError,
 }: {
   onAuthed: () => Promise<void>;
-  error: string | null;
-  setError: (e: string | null) => void;
+  initialError: string | null;
 }) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(initialError);
 
   async function submit() {
     setError(null);
+    setBusy(true);
     try {
       const t = await api<TokenPair>(`/auth/${mode}`, {
         method: "POST",
@@ -152,66 +162,51 @@ function Auth({
     } catch (e) {
       setError((e as Error).message);
     }
+    setBusy(false);
   }
 
   return (
-    <div className="wrap">
-      <h1>
-        <span className="brand">gen_suite</span> · investigación genealógica
-      </h1>
-      <div className="card" style={{ maxWidth: 420 }}>
-        <div className="tabs">
-          <button className={mode === "login" ? "" : "secondary"} onClick={() => setMode("login")}>
-            Entrar
-          </button>
-          <button className={mode === "register" ? "" : "secondary"} onClick={() => setMode("register")}>
-            Registrarse
-          </button>
-        </div>
-        <div className="row" style={{ flexDirection: "column", alignItems: "stretch" }}>
-          <input placeholder="email" value={email} onChange={(e) => setEmail(e.target.value)} />
-          <input
-            placeholder="contraseña (mín. 8)"
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
-          <button onClick={submit} disabled={!email || password.length < 8}>
-            {mode === "login" ? "Entrar" : "Crear cuenta"}
-          </button>
-          {error && <p className="error">{error}</p>}
-        </div>
-      </div>
-    </div>
+    <Shell>
+      <h1 style={styles.brand}>Estela</h1>
+      <p style={styles.sub}>Investigación genealógica sobre tus libros parroquiales</p>
+      <form onSubmit={(ev) => { ev.preventDefault(); if (email && password.length >= 8) void submit(); }}>
+        <input style={styles.input} placeholder="email" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+        <input
+          style={styles.input}
+          placeholder="contraseña (mín. 8 caracteres)"
+          type="password"
+          autoComplete={mode === "login" ? "current-password" : "new-password"}
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+        <button type="submit" style={{ ...styles.primary, opacity: !email || password.length < 8 || busy ? 0.6 : 1 }} disabled={!email || password.length < 8 || busy}>
+          {busy ? "Un momento…" : mode === "login" ? "Entrar" : "Crear cuenta"}
+        </button>
+      </form>
+      <p style={{ marginTop: 16 }}>
+        <button style={styles.ghost} onClick={() => { setError(null); setMode(mode === "login" ? "register" : "login"); }}>
+          {mode === "login" ? "¿No tienes cuenta? Regístrate" : "¿Ya tienes cuenta? Entra"}
+        </button>
+      </p>
+      {error && <p style={styles.error}>{error}</p>}
+    </Shell>
   );
 }
 
-function Dashboard({
+function TenantSetup({
   me,
   reload,
+  onLogout,
   error,
   setError,
 }: {
   me: Me;
   reload: () => Promise<void>;
+  onLogout: () => Promise<void>;
   error: string | null;
   setError: (e: string | null) => void;
 }) {
-  const [members, setMembers] = useState<Member[]>([]);
-  const [tenantName, setTenantName] = useState("");
-
-  const loadMembers = useCallback(async () => {
-    if (!me.active_tenant_id) return setMembers([]);
-    try {
-      setMembers(await api<Member[]>("/tenants/members"));
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }, [me.active_tenant_id, setError]);
-
-  useEffect(() => {
-    void loadMembers();
-  }, [loadMembers]);
+  const [name, setName] = useState("");
 
   async function switchTenant(tid: string) {
     setError(null);
@@ -227,112 +222,37 @@ function Dashboard({
   async function createTenant() {
     setError(null);
     try {
-      const t = await api<{ id: string }>("/tenants", {
-        method: "POST",
-        body: JSON.stringify({ name: tenantName }),
-      });
-      setTenantName("");
+      const t = await api<{ id: string }>("/tenants", { method: "POST", body: JSON.stringify({ name }) });
+      setName("");
       await switchTenant(t.id);
     } catch (e) {
       setError((e as Error).message);
     }
   }
 
-  async function logout() {
-    try {
-      await api("/auth/logout", {
-        method: "POST",
-        body: JSON.stringify({ refresh_token: localStorage.getItem("gs_refresh") }),
-      });
-    } catch {
-      /* ignore */
-    }
-    clearTokens();
-    await reload();
-  }
-
-  const active = me.memberships.find((m) => m.tenant_id === me.active_tenant_id);
-
   return (
-    <div className="wrap">
-      <div className="row" style={{ justifyContent: "space-between" }}>
-        <h1>
-          <span className="brand">gen_suite</span>
-        </h1>
-        <div className="row">
-          <span className="muted">{me.user.email}</span>
-          {me.user.is_server_admin && <span className="badge admin">server-admin</span>}
-          <button className="secondary" onClick={logout}>
-            Salir
-          </button>
-        </div>
-      </div>
-
-      {error && <p className="error">{error}</p>}
-
-      <div className="card">
-        <strong>Tenant activo:</strong>{" "}
-        {active ? (
-          <>
-            {active.tenant_name} <span className="badge">{active.role}</span>
-          </>
-        ) : (
-          <span className="muted">ninguno — crea uno o selecciona abajo</span>
-        )}
-      </div>
-
-      {me.active_tenant_id && <TreeView onError={setError} />}
-      {me.active_tenant_id && <DocumentsView onError={setError} />}
-      {me.active_tenant_id && (me.active_role === "tenant_admin" || me.user.is_server_admin) && (
-        <ProvidersView onError={setError} />
-      )}
-
-      <div className="card">
-        <h3>Mis tenants</h3>
-        <ul className="list">
+    <Shell>
+      <h1 style={styles.brand}>Estela</h1>
+      <p style={styles.sub}>{me.user.email} — elige o crea un espacio de investigación</p>
+      {me.memberships.length > 0 && (
+        <div style={styles.card}>
           {me.memberships.map((m) => (
-            <li key={m.tenant_id}>
-              <span>
-                {m.tenant_name} <span className="badge">{m.role}</span>
-              </span>
-              {m.tenant_id !== me.active_tenant_id && (
-                <button className="secondary" onClick={() => switchTenant(m.tenant_id)}>
-                  Activar
-                </button>
-              )}
-            </li>
+            <div key={m.tenant_id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 0" }}>
+              <span style={{ fontSize: 14.5 }}>{m.tenant_name} <span style={{ ...styles.muted, fontSize: 12 }}>· {m.role}</span></span>
+              <button style={{ ...styles.primary, width: "auto", padding: "7px 14px", fontSize: 13 }} onClick={() => switchTenant(m.tenant_id)}>Abrir</button>
+            </div>
           ))}
-          {me.memberships.length === 0 && <li className="muted">Sin tenants todavía.</li>}
-        </ul>
-        <div className="row" style={{ marginTop: ".75rem" }}>
-          <input
-            placeholder="Nombre del nuevo tenant"
-            value={tenantName}
-            onChange={(e) => setTenantName(e.target.value)}
-          />
-          <button onClick={createTenant} disabled={!tenantName}>
-            Crear tenant
-          </button>
-        </div>
-      </div>
-
-      {me.active_tenant_id && (
-        <div className="card">
-          <h3>Miembros del tenant</h3>
-          <ul className="list">
-            {members.map((m) => (
-              <li key={m.user_id}>
-                <span>{m.email}</span>
-                <span className="badge">{m.role}</span>
-              </li>
-            ))}
-          </ul>
         </div>
       )}
-
-      <p className="muted">
-        Fundación (Fase 0). Próximo: importar GEDCOM y el visor del árbol.
+      <div style={styles.card}>
+        <div style={{ ...styles.muted, fontSize: 12.5, marginBottom: 8 }}>Nuevo espacio</div>
+        <input style={styles.input} placeholder="Nombre (p. ej. Familia Vidal)" value={name} onChange={(e) => setName(e.target.value)} />
+        <button style={{ ...styles.primary, opacity: name ? 1 : 0.6 }} disabled={!name} onClick={createTenant}>Crear</button>
+      </div>
+      {error && <p style={styles.error}>{error}</p>}
+      <p style={{ marginTop: 18 }}>
+        <button style={styles.ghost} onClick={() => void onLogout()}>Salir</button>
       </p>
-    </div>
+    </Shell>
   );
 }

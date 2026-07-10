@@ -1,4 +1,5 @@
 import { api } from "./client";
+import type { Job } from "./types";
 
 export interface CatalogEntry {
   key: string;
@@ -49,15 +50,7 @@ export const getSpend = () => api<Spend>("/providers/spend");
 export const setBudget = (monthly_budget_cents: number | null) =>
   api<Spend>("/providers/budget", { method: "PUT", body: JSON.stringify({ monthly_budget_cents }) });
 
-export interface JobOut {
-  id: string;
-  type: string;
-  status: string;
-  progress: Record<string, unknown> | null;
-  result: Record<string, unknown> | null;
-  error: string | null;
-}
 // Re-embed the whole corpus with the active embedding model (run after switching providers —
 // vectors from different models aren't comparable).
-export const reembedCorpus = () => api<JobOut>("/providers/reembed-corpus", { method: "POST" });
-export const getJob = (id: string) => api<JobOut>(`/jobs/${id}`);
+export const reembedCorpus = () => api<Job>("/providers/reembed-corpus", { method: "POST" });
+export const getJob = (id: string) => api<Job>(`/jobs/${id}`);

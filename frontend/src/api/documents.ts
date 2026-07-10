@@ -1,4 +1,4 @@
-import { api } from "./client";
+import { api, authFetch } from "./client";
 
 export interface DocumentOut {
   id: string;
@@ -101,21 +101,13 @@ export async function uploadDocument(
   if (flags.book_number != null) fd.append("book_number", String(flags.book_number));
   if (flags.is_index) fd.append("is_index", "true");
   for (const f of Array.from(files)) fd.append("files", f);
-  const token = localStorage.getItem("gs_access");
-  const res = await fetch("/api/documents", {
-    method: "POST",
-    body: fd,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
+  const res = await authFetch("/documents", { method: "POST", body: fd });
   if (!res.ok) throw new Error((await res.text()) || `${res.status}`);
   return res.json();
 }
 
 export async function fetchPageObjectUrl(id: string, pageNo: number, thumb = false): Promise<string> {
-  const token = localStorage.getItem("gs_access");
-  const res = await fetch(`/api/documents/${id}/pages/${pageNo}/content${thumb ? "?thumb=1" : ""}`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
+  const res = await authFetch(`/documents/${id}/pages/${pageNo}/content${thumb ? "?thumb=1" : ""}`);
   if (!res.ok) throw new Error(`${res.status}`);
   return URL.createObjectURL(await res.blob());
 }

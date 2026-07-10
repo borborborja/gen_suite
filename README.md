@@ -32,7 +32,9 @@ docker compose --env-file config/.env up -d --build
 `compose.yaml` es **portable** y multi-arquitectura (amd64/arm64 — ver `DEPLOY.md`). **Toda la config vive
 en `./config`** (`config/.env`) y **todos los datos en `./data`** (Postgres/Redis/MinIO; cambia con
 `DATA_DIR`) — host-mapeados, visibles y respaldables. El servicio `gen-suite-migrate` aplica
-`alembic upgrade head` antes de arrancar; el **primer usuario registrado** queda como `server-admin`.
+`alembic upgrade head` antes de arrancar. El **primer usuario registrado** queda como `server-admin`
+**solo si** `ALLOW_FIRST_USER_ADMIN=true` en `config/.env` (actívalo para el registro inicial y
+vuelve a desactivarlo — ver `DEPLOY.md`).
 
 ### Almacenamiento (biblioteca → MinIO bundled o S3 externo)
 La biblioteca (PDFs, imágenes de página, fotos) va a **almacenamiento de objetos**; el texto OCR, actas,

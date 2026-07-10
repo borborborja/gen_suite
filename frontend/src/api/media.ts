@@ -1,4 +1,4 @@
-import { api } from "./client";
+import { api, authFetch } from "./client";
 
 export interface MediaItem {
   id: string;
@@ -20,21 +20,14 @@ export async function uploadMedia(personId: string, file: File, caption?: string
   const fd = new FormData();
   fd.append("file", file);
   if (caption) fd.append("caption", caption);
-  const token = localStorage.getItem("gs_access");
-  const res = await fetch(`/api/persons/${personId}/media`, {
-    method: "POST", body: fd,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
+  const res = await authFetch(`/persons/${personId}/media`, { method: "POST", body: fd });
   if (!res.ok) throw new Error((await res.text()) || `${res.status}`);
   return res.json();
 }
 
 // Streams the (private) blob with the auth header → object URL for <img src>.
 export async function mediaObjectUrl(mediaId: string): Promise<string> {
-  const token = localStorage.getItem("gs_access");
-  const res = await fetch(`/api/media/${mediaId}/raw`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
+  const res = await authFetch(`/media/${mediaId}/raw`);
   if (!res.ok) throw new Error(`${res.status}`);
   return URL.createObjectURL(await res.blob());
 }

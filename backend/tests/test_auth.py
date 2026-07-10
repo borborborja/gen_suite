@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from httpx import AsyncClient
 
+from app.settings import settings
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def test_register_first_user_is_server_admin(client: AsyncClient):
+async def test_register_first_user_is_server_admin(client: AsyncClient, monkeypatch):
+    # the bootstrap grant is opt-in (ALLOW_FIRST_USER_ADMIN); enable it for this test only
+    monkeypatch.setattr(settings, "allow_first_user_admin", True)
     r = await client.post(
         "/api/auth/register",
         json={"email": "admin@example.com", "password": "supersecret123"},

@@ -4,7 +4,7 @@ import { zoom as d3zoom, zoomIdentity, type ZoomBehavior } from "d3-zoom";
 import { useEstela, avatar, type TreeView } from "../store";
 import { fonts } from "../theme";
 import {
-  getStats, getRoots, getSubtree, searchPersons, importGedcom, getPerson,
+  getStats, getRoots, getSubtree, searchPersons, importGedcom, downloadGedcom, getPerson,
   listDuplicates, mergePersons, getHome, setHome,
   displayName, lifespan, type TreeStats, type SearchHit, type TreeGraph, type DuplicatePair,
   type PersonDetail,
@@ -12,6 +12,7 @@ import {
 import { computeLayout, NODE_W, NODE_H, type PositionedPerson } from "../../tree/layout";
 import { computePedigree } from "../../tree/pedigree";
 import { computeFan, arcPath } from "../../tree/fan";
+import { useConfirm, useDebouncedSearch } from "../ui";
 
 const tabs: { key: TreeView; label: string }[] = [
   { key: "genograma", label: "Genograma" },
@@ -76,6 +77,11 @@ export default function ArbolView() {
             </div>
             {home && home !== focus && <button onClick={() => setFocus(home)} title="Volver a la persona principal" style={ghostBtn}>⌂ Inicio</button>}
             <button onClick={() => setShowDupes(true)} style={ghostBtn}>Fusionar duplicados</button>
+            <button
+              onClick={() => downloadGedcom().catch((err) => e.notify(`No se pudo exportar: ${(err as Error).message}`, "var(--danger)"))}
+              title="Descargar el árbol completo como GEDCOM (con fuentes)"
+              style={ghostBtn}
+            >⬇ Exportar GEDCOM</button>
           </div>
         )}
       </div>
@@ -106,8 +112,10 @@ export default function ArbolView() {
 }
 
 function DuplicatesPanel({ onClose, onMerged }: { onClose: () => void; onMerged: () => void }) {
+  const e = useEstela();
   const [pairs, setPairs] = useState<DuplicatePair[] | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const { confirmDialog, ask } = useConfirm();
 
   const reload = useCallback(() => {
     setPairs(null);
@@ -116,10 +124,15 @@ function DuplicatesPanel({ onClose, onMerged }: { onClose: () => void; onMerged:
   useEffect(() => { reload(); }, [reload]);
 
   async function merge(keep: SearchHit, dup: SearchHit) {
-    if (!confirm(`Fusionar «${displayName(dup)}» dentro de «${displayName(keep)}»?\nLos nombres, hechos, parentescos y fuentes del duplicado pasan a la persona conservada. No se puede deshacer.`)) return;
+    const ok = await ask({
+      title: `¿Fusionar «${displayName(dup)}» dentro de «${displayName(keep)}»?`,
+      body: "Los nombres, hechos, parentescos y fuentes del duplicado pasan a la persona conservada. No se puede deshacer.",
+      danger: true, confirmLabel: "Fusionar",
+    });
+    if (!ok) return;
     setBusy(keep.id + dup.id);
     try { await mergePersons(keep.id, dup.id); onMerged(); reload(); }
-    catch (err) { alert((err as Error).message); }
+    catch (err) { e.notify((err as Error).message, "var(--danger)"); }
     setBusy(null);
   }
 
@@ -128,6 +141,7 @@ function DuplicatesPanel({ onClose, onMerged }: { onClose: () => void; onMerged:
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 70, background: "rgba(15,11,6,.55)", display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "60px 20px", overflowY: "auto" }}>
       <div onClick={(ev) => ev.stopPropagation()} style={{ width: "100%", maxWidth: 720, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16, padding: 26, boxShadow: "0 24px 80px rgba(0,0,0,.4)" }}>
+        {confirmDialog}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
           <h2 style={{ fontFamily: fonts.serif, fontSize: 22, fontWeight: 600, margin: 0 }}>Posibles duplicados</h2>
           <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--muted)", fontSize: 20, cursor: "pointer" }}>✕</button>
@@ -249,20 +263,15 @@ const canvasBox: React.CSSProperties = { position: "relative", background: "var(
 // ── header person search (typeahead → recenter) ──
 function TreeSearch({ onPick }: { onPick: (id: string) => void }) {
   const [q, setQ] = useState("");
-  const [res, setRes] = useState<SearchHit[]>([]);
   const [open, setOpen] = useState(false);
-  useEffect(() => {
-    if (q.trim().length < 2) { setRes([]); return; }
-    const t = setTimeout(() => searchPersons(q).then(setRes).catch(() => setRes([])), 220);
-    return () => clearTimeout(t);
-  }, [q]);
+  const res = useDebouncedSearch(q, (v) => searchPersons(v));
   return (
     <div style={{ position: "relative" }}>
       <input value={q} onChange={(ev) => { setQ(ev.target.value); setOpen(true); }} onBlur={() => setTimeout(() => setOpen(false), 150)} placeholder="Ir a una persona…" style={{ width: 200, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 9, padding: "9px 12px", color: "var(--fg)", fontFamily: "inherit", fontSize: 13 }} />
       {open && res.length > 0 && (
         <div style={{ position: "absolute", top: "100%", left: 0, width: 280, zIndex: 40, background: "var(--elevated)", border: "1px solid var(--line)", borderRadius: 9, marginTop: 4, boxShadow: "var(--shadow)", maxHeight: 280, overflowY: "auto" }}>
           {res.map((p) => (
-            <div key={p.id} onMouseDown={() => { onPick(p.id); setQ(""); setRes([]); setOpen(false); }} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "9px 12px", cursor: "pointer", borderBottom: "1px solid var(--line2)" }}>
+            <div key={p.id} onMouseDown={() => { onPick(p.id); setQ(""); setOpen(false); }} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "9px 12px", cursor: "pointer", borderBottom: "1px solid var(--line2)" }}>
               <span style={{ fontSize: 13, fontWeight: 600 }}>{displayName(p)}</span>
               <span style={{ fontFamily: fonts.mono, fontSize: 11, color: "var(--muted)" }}>{lifespan(p)}</span>
             </div>
@@ -399,13 +408,8 @@ function FanCanvas({ graph, depth, setDepth, onRecenter }: { graph: TreeGraph; d
 function PeopleList() {
   const e = useEstela();
   const [q, setQ] = useState("");
-  const [people, setPeople] = useState<SearchHit[]>([]);
-  useEffect(() => {
-    const t = setTimeout(() => {
-      (q.trim() ? searchPersons(q) : getRoots()).then(setPeople).catch(() => setPeople([]));
-    }, 250);
-    return () => clearTimeout(t);
-  }, [q]);
+  const people = useDebouncedSearch(
+    q, (v) => (v.trim() ? searchPersons(v) : getRoots()), { delay: 250, minLength: 0 });
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 12, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "11px 16px", marginBottom: 18, maxWidth: 420 }}>
@@ -434,13 +438,14 @@ function PeopleList() {
 }
 
 function EmptyTree({ onImported, onSuper }: { onImported: () => void; onSuper?: () => void }) {
+  const est = useEstela();
   const [busy, setBusy] = useState(false);
   const ref = useRef<HTMLInputElement>(null);
   async function onFile(ev: React.ChangeEvent<HTMLInputElement>) {
     const f = ev.target.files?.[0];
     if (!f) return;
     setBusy(true);
-    try { await importGedcom(f); onImported(); } catch (e) { alert((e as Error).message); }
+    try { await importGedcom(f); onImported(); } catch (e) { est.notify((e as Error).message, "var(--danger)"); }
     setBusy(false);
   }
   return (

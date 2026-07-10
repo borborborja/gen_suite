@@ -44,7 +44,6 @@ async function tryRefresh(): Promise<boolean> {
 
 async function doFetch(path: string, opts: RequestInit, auth: boolean): Promise<Response> {
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
     ...((opts.headers as Record<string, string>) || {}),
   };
   if (auth) {
@@ -54,18 +53,38 @@ async function doFetch(path: string, opts: RequestInit, auth: boolean): Promise<
   return fetch(`/api${path}`, { ...opts, headers });
 }
 
+// Authenticated fetch with the same single-flight 401→refresh→retry behavior as api(), but
+// returning the raw Response. Use this for anything that isn't plain JSON (uploads/FormData,
+// blobs/images, SSE streams) instead of re-implementing the token header by hand.
+export async function authFetch(path: string, opts: RequestInit = {}): Promise<Response> {
+  let res = await doFetch(path, opts, true);
+  if (res.status === 401 && localStorage.getItem(REFRESH)) {
+    if (await tryRefresh()) {
+      res = await doFetch(path, opts, true);
+    } else {
+      clearTokens();
+      window.dispatchEvent(new Event("gs-auth-expired"));
+    }
+  }
+  return res;
+}
+
 export async function api<T = any>(
   path: string,
   opts: RequestInit = {},
   auth = true,
 ): Promise<T> {
-  let res = await doFetch(path, opts, auth);
+  const withJson: RequestInit = {
+    ...opts,
+    headers: { "Content-Type": "application/json", ...((opts.headers as Record<string, string>) || {}) },
+  };
+  let res = await doFetch(path, withJson, auth);
 
   // Access token likely expired — refresh once (deduped) and retry the original request. If the
   // refresh fails, the session is truly gone: clear tokens and signal the app to show login.
   if (res.status === 401 && auth && localStorage.getItem(REFRESH)) {
     if (await tryRefresh()) {
-      res = await doFetch(path, opts, auth);
+      res = await doFetch(path, withJson, auth);
     } else {
       clearTokens();
       window.dispatchEvent(new Event("gs-auth-expired"));

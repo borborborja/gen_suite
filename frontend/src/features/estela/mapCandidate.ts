@@ -3,17 +3,7 @@
 import type { CandidateOut } from "../../api/linkage";
 import type { ColorKey, ConfLevel, Discovery, Evidence, Mention, Relative, TreeField } from "./data";
 
-const RECORD_TYPE_LABEL: Record<string, string> = {
-  baptism: "Bautismo", marriage: "Matrimonio", death: "Defunción",
-  confirmation: "Confirmación", census: "Padrón", other: "Acta",
-};
-
-const ROLE_LABEL: Record<string, string> = {
-  principal: "Principal", father: "Padre", mother: "Madre",
-  godfather: "Padrino", godmother: "Madrina", spouse: "Cónyuge",
-  spouse_father: "Suegro", spouse_mother: "Suegra", witness: "Testigo",
-  declarant: "Declarante", other: "Otro",
-};
+import { RECORD_TYPE_LABEL, roleLabel } from "./labels";
 
 const SIGNAL_LABEL: Record<string, string> = {
   name: "NOMBRE", date: "FECHA", place: "LUGAR", relational: "FAMILIA",
@@ -49,7 +39,7 @@ export function candidateToDiscovery(c: CandidateOut): Discovery {
   const sibName = sibMention ? (sibMention.name_raw || [sibMention.given, sibMention.surname].filter(Boolean).join(" ")) : "";
 
   const mentions: Mention[] = (rec?.mentions ?? []).map((m) => ({
-    role: ROLE_LABEL[m.role] ?? m.role,
+    role: roleLabel(m.role, rec?.record_type),
     name: m.name_raw || [m.given, m.surname].filter(Boolean).join(" ") || "—",
   }));
 
@@ -65,7 +55,7 @@ export function candidateToDiscovery(c: CandidateOut): Discovery {
       id: m.id,
       mentionId: m.id,
       name: m.name_raw || [m.given, m.surname].filter(Boolean).join(" ") || "—",
-      rel: `${ROLE_LABEL[m.role] ?? m.role} · sugerido`,
+      rel: `${roleLabel(m.role, rec?.record_type)} · sugerido`,
     }));
 
   const treeFields: TreeField[] = [

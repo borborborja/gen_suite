@@ -8,11 +8,8 @@ import {
 } from "../../../api/familysearch";
 import { listDocuments, compactPdf, type DocumentOut } from "../../../api/documents";
 import { startTranscription } from "../../../api/transcription";
-import { streamJob } from "../../../api/jobs";
-
-const field: React.CSSProperties = { background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 9, padding: "10px 12px", color: "var(--fg)", fontFamily: "inherit", fontSize: 14, boxSizing: "border-box" };
-const primaryBtn: React.CSSProperties = { background: "var(--accent)", color: "#fff", border: "none", borderRadius: 9, padding: "10px 18px", fontFamily: "inherit", fontSize: 14, fontWeight: 600, cursor: "pointer" };
-const ghostBtn: React.CSSProperties = { background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 8, padding: "7px 12px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" };
+import { streamJob, jobOutcome } from "../../../api/jobs";
+import { field, ghostBtn, primaryBtn } from "../ui";
 
 export default function FsView() {
   const e = useEstela();
@@ -40,7 +37,11 @@ export default function FsView() {
       (last) => {
         setProgress((p) => { const n = { ...p }; delete n[key]; return n; });
         streamed.current.delete(jobId); loadDocs();
-        e.notify(last?.kind === "book_fail" ? `${label}: error` : `${label}: completado`, last?.kind === "book_fail" ? "var(--danger)" : "var(--ok)");
+        const outcome = jobOutcome(last);
+        if (outcome === "ok") e.notify(`${label}: completado`, "var(--ok)");
+        else if (outcome === "cancelled") e.notify(`${label}: cancelado`, "var(--muted)");
+        else if (outcome === "error") e.notify(`${label}: error${last?.error ? ` — ${last.error}` : ""}`, "var(--danger)");
+        else e.notify(`${label}: conexión perdida; sigue en segundo plano`, "var(--muted)");
       });
   }, [loadDocs, e]);
 

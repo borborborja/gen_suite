@@ -129,6 +129,10 @@ async def search_records(
         select_score = "0.0 AS score"
         order_by = "r.date_year DESC NULLS LAST"
 
+    # superseded records are audit history (replaced after a correction + re-extract) — a search
+    # hit on them would open the Visor on an act that no longer exists
+    conds.append("r.status != 'superseded'")
+
     where = (" AND ".join(conds)) if conds else "TRUE"
     where += _REC_SCOPE_SQL.get(scope, "")
 

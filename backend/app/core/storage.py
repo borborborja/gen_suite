@@ -4,7 +4,7 @@ boto3 is synchronous; we wrap calls in ``asyncio.to_thread`` so they don't block
 loop. Object content is streamed back through the API (auth + RLS enforced) rather than via
 presigned URLs, so MinIO stays internal and private documents stay access-controlled.
 
-Key layout:  {tenant_id}/{document_id}/original/{filename}
+Key layout:  {tenant_id}/{document_id}/original.pdf
              {tenant_id}/{document_id}/pages/{page_no}{ext}
 """
 from __future__ import annotations
@@ -99,6 +99,11 @@ async def move_prefix(src_bucket: str, dst_bucket: str, prefix: str) -> None:
                 s3.delete_object(Bucket=src_bucket, Key=key)
 
     await asyncio.to_thread(_move)
+
+
+async def delete_object(bucket: str, key: str) -> None:
+    """Delete one exact object (use ``delete_prefix`` to remove a whole subtree)."""
+    await asyncio.to_thread(lambda: _s3().delete_object(Bucket=bucket, Key=key))
 
 
 async def delete_prefix(bucket: str, prefix: str) -> None:

@@ -10,6 +10,7 @@ import {
 import LifeMap, { type MapPoint } from "../LifeMap";
 import { geoSearch } from "../../../api/geo";
 import { listMedia, uploadMedia, updateMedia, deleteMedia, mediaObjectUrl, type MediaItem } from "../../../api/media";
+import { useConfirm, useDebouncedSearch } from "../ui";
 
 function fsUrl(s: ResearchGap["search"]): string {
   const p = new URLSearchParams();
@@ -48,6 +49,15 @@ export default function PersonaView() {
   const [media, setMedia] = useState<MediaItem[]>([]);
   const [urls, setUrls] = useState<Record<string, string>>({});
   const [lightbox, setLightbox] = useState<string | null>(null);
+  const { confirmDialog, ask } = useConfirm();
+
+  // Blob object-URLs must be revoked when replaced (person change, reload) or on unmount,
+  // or every photo ever viewed stays pinned in memory for the session.
+  const revokeAll = (u: Record<string, string>) => Object.values(u).forEach((x) => URL.revokeObjectURL(x));
+  const setUrlsRevoking = (next: Record<string, string>) => {
+    setUrls((prev) => { revokeAll(prev); return next; });
+  };
+  useEffect(() => () => { setUrls((prev) => { revokeAll(prev); return {}; }); }, []);
 
   const loadMedia = (id: string) => {
     listMedia(id).then(async (items) => {
@@ -56,8 +66,8 @@ export default function PersonaView() {
       await Promise.all(items.map(async (m) => {
         try { next[m.id] = await mediaObjectUrl(m.id); } catch { /* skip */ }
       }));
-      setUrls(next);
-    }).catch(() => { setMedia([]); setUrls({}); });
+      setUrlsRevoking(next);
+    }).catch(() => { setMedia([]); setUrlsRevoking({}); });
   };
 
   const reload = () => {
@@ -68,7 +78,7 @@ export default function PersonaView() {
     loadMedia(e.selPerson);
   };
   useEffect(() => {
-    setP(null); setErr(false); setEditOpen(false); setGaps([]); setCites([]); setMedia([]); setUrls({});
+    setP(null); setErr(false); setEditOpen(false); setGaps([]); setCites([]); setMedia([]); setUrlsRevoking({});
     if (!UUID_RE.test(e.selPerson)) { setErr(true); return; }
     getPerson(e.selPerson).then(setP).catch(() => setErr(true));
     getGaps(e.selPerson).then(setGaps).catch(() => setGaps([]));
@@ -102,15 +112,15 @@ export default function PersonaView() {
   ];
 
   async function removeRelative(relativeId: string, relation: string) {
-    if (!confirm("¿Desvincular este familiar? La persona no se borra, solo el parentesco.")) return;
+    if (!(await ask({ title: "¿Desvincular este familiar?", body: "La persona no se borra, solo el parentesco.", confirmLabel: "Desvincular" }))) return;
     await unlinkRelative(p!.id, relativeId, relation); reload();
   }
   async function removeEvent(eventId: string) {
-    if (!confirm("¿Borrar este hecho?")) return;
+    if (!(await ask({ title: "¿Borrar este hecho?", danger: true, confirmLabel: "Borrar" }))) return;
     await deleteEvent(eventId); reload();
   }
   async function removePerson() {
-    if (!confirm(`¿Eliminar a ${name}? Se borran sus nombres, hechos y parentescos. No se puede deshacer.`)) return;
+    if (!(await ask({ title: `¿Eliminar a ${name}?`, body: "Se borran sus nombres, hechos y parentescos. No se puede deshacer.", danger: true, confirmLabel: "Eliminar" }))) return;
     await deletePerson(p!.id); e.go("arbol");
   }
   async function onUploadPhoto(file: File) {
@@ -118,7 +128,7 @@ export default function PersonaView() {
   }
   async function onSetPrimary(id: string) { await updateMedia(id, { make_primary: true }); loadMedia(p!.id); }
   async function onDeletePhoto(id: string) {
-    if (!confirm("¿Borrar esta foto?")) return;
+    if (!(await ask({ title: "¿Borrar esta foto?", danger: true, confirmLabel: "Borrar" }))) return;
     await deleteMedia(id); loadMedia(p!.id);
   }
   async function onGeocode() {
@@ -134,6 +144,7 @@ export default function PersonaView() {
 
   return (
     <section style={{ padding: "32px 44px 64px", maxWidth: 1080 }}>
+      {confirmDialog}
       <Back />
       <div style={{ display: "flex", gap: 22, alignItems: "flex-start", flexWrap: "wrap", marginBottom: 30 }}>
         {(() => {
@@ -461,13 +472,8 @@ function EventEditor({ event, onClose, onSaved }: { event: EventOut; onClose: ()
 
 function PlaceField({ value, onPick }: { value: string; onPick: (name: string, coords: { lat: number; lng: number } | null) => void }) {
   const [q, setQ] = useState(value);
-  const [results, setResults] = useState<{ name: string; display_name: string; lat: number; lng: number }[]>([]);
   const [open, setOpen] = useState(false);
-  useEffect(() => {
-    if (q.trim().length < 2) { setResults([]); return; }
-    const t = setTimeout(() => geoSearch(q).then(setResults).catch(() => setResults([])), 350);
-    return () => clearTimeout(t);
-  }, [q]);
+  const results = useDebouncedSearch(q, (v) => geoSearch(v), { delay: 350 });
   return (
     <label style={{ ...lbl, position: "relative" }}>Lugar
       <input style={fld} value={q} onChange={(e) => { setQ(e.target.value); onPick(e.target.value, null); setOpen(true); }} onBlur={() => setTimeout(() => setOpen(false), 150)} placeholder="Escribe y elige…" />

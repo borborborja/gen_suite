@@ -40,6 +40,16 @@ async def reembed_corpus(
     """Re-embed the whole corpus with the currently-bound embedding model. Run this after switching
     the `embedding` provider — vectors from different models aren't comparable, so the old ones must
     be recomputed or vector search breaks."""
+    from ..jobs.service import active_job_of_type
+    existing = await active_job_of_type(db, principal.tenant_id, "reembed_corpus")
+    if existing:
+        return JobOut(
+            id=existing.id, type=existing.type, status=existing.status, progress=existing.progress,
+            result=existing.result, error=existing.error, created_at=existing.created_at,
+            started_at=existing.started_at, finished_at=existing.finished_at,
+        )
+    from .service import assert_within_budget
+    await assert_within_budget(db, principal.tenant_id)
     job = Job(
         tenant_id=principal.tenant_id, type="reembed_corpus", status="queued",
         params={}, created_by=principal.user_id,

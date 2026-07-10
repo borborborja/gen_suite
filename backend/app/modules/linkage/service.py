@@ -21,7 +21,8 @@ from ...models.person import Name, Person
 from ...models.place import Place
 from ...models.record import Record
 from ..extraction.normalize import block_key_surname, norm_given, norm_surname, parse_age, split_name
-from ..providers.service import ProviderService, embed_texts, extract_structured
+from ..providers.service import (
+    ProviderService, embed_texts, extract_structured_with_usage, record_usage)
 from ..tree.service import get_person_detail
 from .scoring import Candidate, ENQUEUE_FLOOR, Seed, score_candidate
 
@@ -59,6 +60,7 @@ async def _adjudicate_band(session, tenant_id, seed: Seed, scored: list, max_llm
         f"padres/cónyuge conocidos: {', '.join(sorted(seed.parent_names | seed.spouse_names)) or '—'}."
     )
     total = len(band)
+    tokens = {"prompt": 0, "completion": 0}
     for i, (mc, m, rec, result) in enumerate(band, start=1):
         if on_progress:
             await on_progress({"phase": "adjudicating", "done": i, "total": total})
@@ -68,10 +70,12 @@ async def _adjudicate_band(session, tenant_id, seed: Seed, scored: list, max_llm
             "¿Son la misma persona?"
         )
         try:
-            out = await asyncio.to_thread(
-                extract_structured, rc, prompt,
+            out, usage = await asyncio.to_thread(
+                extract_structured_with_usage, rc, prompt,
                 schema=_ADJ_SCHEMA, system=_ADJ_SYSTEM, schema_name="adjudication",
             )
+            tokens["prompt"] += usage.get("prompt", 0)
+            tokens["completion"] += usage.get("completion", 0)
         except Exception:
             continue
         match = bool(out.get("match"))
@@ -82,6 +86,11 @@ async def _adjudicate_band(session, tenant_id, seed: Seed, scored: list, max_llm
         mc.score = round(min(1.0, mc.score + 0.2 * conf) if match else max(0.0, mc.score - 0.2 * conf), 4)
         result["score"] = mc.score
         mc.evidence = result
+    # Log the adjudication spend (best-effort; no job_id here — the caller's job context varies).
+    if tokens["prompt"] or tokens["completion"]:
+        await record_usage(session, tenant_id=tenant_id, job_id=None, task_type="linkage",
+                           model=rc.model, prompt_tokens=tokens["prompt"],
+                           completion_tokens=tokens["completion"])
 
 # Which inferred Event a confirmed record implies for the principal (None = no person event).
 RECORD_EVENT_TYPE = {
@@ -201,6 +210,11 @@ async def generate_candidates(
     records = {
         r.id: r for r in (await session.scalars(select(Record).where(Record.id.in_(record_ids)))).all()
     }
+    # never propose a mention from a superseded act (replaced after correction + re-extract)
+    mentions = [m for m in mentions if records.get(m.record_id) is None or records[m.record_id].status != "superseded"]
+    records = {rid: r for rid, r in records.items() if r.status != "superseded"}
+    if not mentions:
+        return 0
     place_keys = await _place_keys(session, {r.place_id for r in records.values() if r.place_id})
     co = await _co_mentions(session, record_ids)
 
@@ -333,11 +347,18 @@ async def generate_family_candidates(
     seed.parent_names = {n for n in (
         norm_surname(fs), norm_given(fg), norm_surname(ms), norm_given(mg)) if n}
 
-    existing = set((await session.scalars(
-        select(MatchCandidate.person_mention_id).where(
-            MatchCandidate.tree_person_id == person_id))).all())
+    # One candidate per (person, mention) — DB unique constraint. A generic /discover may already
+    # hold a PENDING self-candidate on the same mention (person X ≟ act of Y); when the couple-key
+    # proves that act is a SIBLING's baptism, upgrade that row in place instead of skipping it
+    # (skipping would let a weak self-match permanently block the sibling interpretation).
+    existing_rows = (await session.scalars(
+        select(MatchCandidate).where(MatchCandidate.tree_person_id == person_id))).all()
+    upgradable = {mc.person_mention_id: mc for mc in existing_rows
+                  if mc.status == "pending" and mc.relation != "sibling"}
+    existing = {mc.person_mention_id for mc in existing_rows}
 
     scored: list[MatchCandidate] = []
+    upgraded = 0
     for rid, rec in recs.items():
         ms_list = co.get(rid, [])
         f = next((x for x in ms_list if x.role == "father"), None)
@@ -347,7 +368,16 @@ async def generate_family_candidates(
         if rkey != key:
             continue  # different parents → not a sibling
         principal = next((x for x in ms_list if x.role == "principal"), None)
-        if not principal or principal.id in existing:
+        if not principal:
+            continue
+        if principal.id in existing:
+            mc = upgradable.get(principal.id)
+            if mc is not None:
+                mc.relation = "sibling"
+                ev = dict(mc.evidence or {})
+                ev["sibling_couple_key"] = key
+                mc.evidence = ev
+                upgraded += 1
             continue
         others = {norm_surname(x.surname) for x in ms_list if x.id != principal.id and x.surname}
         others |= {norm_surname(x.given) for x in ms_list if x.id != principal.id and x.given}
@@ -373,7 +403,7 @@ async def generate_family_candidates(
     for mc in keep:
         session.add(mc)
     await session.flush()
-    return len(keep)
+    return len(keep) + upgraded
 
 
 async def _materialize_parents(

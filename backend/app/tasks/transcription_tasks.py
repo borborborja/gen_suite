@@ -50,20 +50,24 @@ def _tesseract_text(img_data: bytes, lang: str, psm: int) -> str:
     return proc.stdout.decode("utf-8", "replace").strip()
 
 
+_NO_USAGE = {"prompt": 0, "completion": 0}
+
+
 def transcribe_image(
     img_data: bytes, rc: ResolvedCredential, *, prompt: str | None, lang: str, psm: int
-) -> str:
-    """Blocking OCR for one image — runs in a thread. Uses the in-app vision OCR engines."""
+) -> tuple[str, dict]:
+    """Blocking OCR for one image — runs in a thread. Uses the in-app vision OCR engines.
+    Returns (text, usage); local engines (tesseract/kraken) report zero token usage."""
     from ..modules.transcription.ocr_engines import (
         DEFAULT_VISION_PROMPT, _ocr_via_anthropic, _ocr_via_openai_compat)
 
     if rc.engine == "tesseract":
-        return _tesseract_text(img_data, lang, psm)
+        return _tesseract_text(img_data, lang, psm), dict(_NO_USAGE)
     jpeg = _to_jpeg(img_data)
     if rc.engine == "kraken":  # local HTR microservice (plan §6); upstream of extraction
         from ..modules.transcription.htr_kraken import htr_via_kraken
 
-        return htr_via_kraken(jpeg, model=rc.model, base_url=rc.base_url)
+        return htr_via_kraken(jpeg, model=rc.model, base_url=rc.base_url), dict(_NO_USAGE)
     effective_prompt = prompt or DEFAULT_VISION_PROMPT
     if rc.engine == "claude":
         return _ocr_via_anthropic(jpeg, model=rc.model, api_key=rc.api_key, prompt=effective_prompt)
@@ -147,9 +151,10 @@ async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=N
         await pub({"kind": "book_start", "total": total, "engine": rc.engine, "model": rc.model})
 
         done = errors = 0
+        tokens = {"prompt": 0, "completion": 0}  # AI spend, aggregated for the spending control
         CONCURRENCY = 6  # parallel page transcriptions per chunk (bounded for provider rate limits)
 
-        async def _transcribe(key: str) -> str:
+        async def _transcribe(key: str) -> tuple[str, dict]:
             img_data, _ = await storage.get_object(bucket, key)
             return await asyncio.to_thread(transcribe_image, img_data, rc, prompt=prompt, lang=lang, psm=psm)
 
@@ -167,6 +172,9 @@ async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=N
             for (page_id, page_no, _key), res in zip(chunk, results):
                 ok = not isinstance(res, Exception)
                 if ok:
+                    res, usage = res
+                    tokens["prompt"] += usage.get("prompt", 0)
+                    tokens["completion"] += usage.get("completion", 0)
                     done += 1
                 else:
                     errors += 1
@@ -203,6 +211,15 @@ async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=N
         await _set_job(
             session, tenant_id, job_id, status="completed",
             finished_at=datetime.now(timezone.utc),
-            result={"done": done, "total": total, "errors": errors},
+            result={"done": done, "total": total, "errors": errors, "tokens": tokens},
         )
+
+        # Log AI spend for the spending control (best-effort; local engines report 0 tokens).
+        from ..modules.providers.service import record_usage
+        await set_rls_context(session, tenant_id=tenant_id)
+        await record_usage(session, tenant_id=tenant_id, job_id=job_id, task_type="transcription",
+                           model=rc.model, prompt_tokens=tokens["prompt"],
+                           completion_tokens=tokens["completion"])
+        await session.commit()
+
         await pub({"kind": "all_done", "done": done, "total": total, "errors": errors})

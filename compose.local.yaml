@@ -1,5 +1,5 @@
 # Generic local stack — runs the whole suite on any machine (no homelab networks / fixed IP).
-#   cp .env.example .env   # fill SUITE_MASTER_KEY (openssl rand -base64 32) etc.
+#   cp config/.env.example .env   # fill SUITE_MASTER_KEY (openssl rand -base64 32) etc.
 #   docker compose -f compose.local.yaml up --build
 # Then open http://localhost:8080 (frontend → /api proxied to the backend).
 name: gen_suite_local
@@ -29,6 +29,8 @@ services:
       timeout: 3s
       retries: 12
 
+  # Local dev always bundles MinIO (no profile gating — external S3 is a production concern;
+  # compose.yaml gates it behind COMPOSE_PROFILES=bundled-storage).
   minio:
     image: minio/minio:latest
     command: ["server", "/data", "--console-address", ":9001"]
@@ -57,6 +59,8 @@ services:
       POSTGRES_HOST: db
       REDIS_URL: redis://redis:6379/0
       MINIO_ENDPOINT: minio:9000
+    volumes:
+      - ./config:/config:ro   # operator files, same path as compose.yaml (kraken models, certs…)
     depends_on:
       db: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -76,6 +80,8 @@ services:
       POSTGRES_HOST: db
       REDIS_URL: redis://redis:6379/0
       MINIO_ENDPOINT: minio:9000
+    volumes:
+      - ./config:/config:ro
     depends_on:
       redis: { condition: service_healthy }
       migrate: { condition: service_completed_successfully }
