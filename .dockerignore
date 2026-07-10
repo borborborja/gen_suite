@@ -15,3 +15,7 @@ dades
 libs/**/.git
 libs/**/venv
 libs/**/.venv
+
+# dev-only auto-login must never reach an image build
+frontend/.env.local
+frontend/.env.*.local
