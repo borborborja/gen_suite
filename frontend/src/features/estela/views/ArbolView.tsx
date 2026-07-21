@@ -6,8 +6,9 @@ import { fonts } from "../theme";
 import {
   getStats, getRoots, getSubtree, searchPersons, importGedcom, downloadGedcom, getPerson,
   listDuplicates, mergePersons, getHome, setHome, createPerson, listPersons,
+  downloadPersonsCsv, listPlaces,
   displayName, lifespan, type TreeStats, type SearchHit, type TreeGraph, type DuplicatePair,
-  type PersonDetail, type PersonPage,
+  type PersonDetail, type PersonPage, type PersonFilters, type PlaceRow,
 } from "../../../api/tree";
 import { AddRelativeDialog, RelationshipDialog } from "../TreeDialogs";
 import { computeLayout, NODE_W, NODE_H, type PositionedPerson } from "../../tree/layout";
@@ -436,14 +437,36 @@ function PeopleList() {
   const [order, setOrder] = useState<"asc" | "desc">("asc");
   const [page, setPage] = useState(1);
   const [data, setData] = useState<PersonPage | null>(null);
+  const [showFilters, setShowFilters] = useState(false);
+  const [sex, setSex] = useState("");
+  const [yearFrom, setYearFrom] = useState("");
+  const [yearTo, setYearTo] = useState("");
+  const [place, setPlace] = useState<PlaceRow | null>(null);
+  const [missing, setMissing] = useState<string[]>([]);
+
+  const filters: PersonFilters = {
+    q: q.trim() || undefined,
+    sex: sex || undefined,
+    year_from: yearFrom ? Number(yearFrom) : undefined,
+    year_to: yearTo ? Number(yearTo) : undefined,
+    place_id: place?.id,
+    missing: missing.length ? missing : undefined,
+  };
+  const filterKey = JSON.stringify(filters);
 
   useEffect(() => {
     const t = setTimeout(() => {
-      listPersons({ q: q.trim() || undefined, sort, order, page, page_size: PAGE_SIZE })
+      listPersons({ ...(JSON.parse(filterKey) as PersonFilters), sort, order, page, page_size: PAGE_SIZE })
         .then(setData).catch(() => setData({ total: 0, items: [] }));
     }, q ? 250 : 0);
     return () => clearTimeout(t);
-  }, [q, sort, order, page]);
+  }, [filterKey, sort, order, page, q]);
+
+  const toggleMissing = (k: string) => {
+    setPage(1);
+    setMissing((m) => (m.includes(k) ? m.filter((x) => x !== k) : [...m, k]));
+  };
+  const activeFilters = (sex ? 1 : 0) + (yearFrom || yearTo ? 1 : 0) + (place ? 1 : 0) + missing.length;
 
   const pages = Math.max(1, Math.ceil((data?.total ?? 0) / PAGE_SIZE));
   const toggleSort = (k: SortKey) => {
@@ -462,8 +485,41 @@ function PeopleList() {
           <svg width={17} height={17} viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth={1.8}><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
           <input value={q} onChange={(ev) => { setQ(ev.target.value); setPage(1); }} placeholder="Buscar por nombre o apellido…" style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "var(--fg)", fontFamily: "inherit", fontSize: 14 }} />
         </div>
+        <button onClick={() => setShowFilters((v) => !v)} style={{ ...ghostBtn, background: showFilters ? "var(--accent-faint)" : "transparent" }}>
+          Filtros{activeFilters > 0 ? ` · ${activeFilters}` : ""}
+        </button>
+        <button
+          onClick={() => downloadPersonsCsv(filters).catch(() => e.notify("No se pudo exportar el CSV", "var(--danger)"))}
+          title="Exporta las personas filtradas como CSV"
+          style={ghostBtn}
+        >⬇ CSV</button>
         {data && <span style={{ fontFamily: fonts.mono, fontSize: 12, color: "var(--muted)" }}>{data.total.toLocaleString()} personas</span>}
       </div>
+
+      {showFilters && (
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "flex-end", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 12, padding: 16, marginBottom: 16 }}>
+          <label style={filterLbl}>Sexo
+            <select value={sex} onChange={(ev) => { setSex(ev.target.value); setPage(1); }} style={filterFld}>
+              <option value="">Todos</option><option value="M">Hombres</option><option value="F">Mujeres</option><option value="U">Sin definir</option>
+            </select>
+          </label>
+          <label style={filterLbl}>Nacimiento desde
+            <input value={yearFrom} onChange={(ev) => { setYearFrom(ev.target.value.replace(/\D/g, "")); setPage(1); }} placeholder="1800" style={{ ...filterFld, width: 90 }} />
+          </label>
+          <label style={filterLbl}>hasta
+            <input value={yearTo} onChange={(ev) => { setYearTo(ev.target.value.replace(/\D/g, "")); setPage(1); }} placeholder="1900" style={{ ...filterFld, width: 90 }} />
+          </label>
+          <PlaceFilter value={place} onPick={(p) => { setPlace(p); setPage(1); }} />
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            {[["birth", "Sin nacimiento"], ["parents", "Sin padres"], ["sources", "Sin fuentes"]].map(([k, l]) => (
+              <span key={k} onClick={() => toggleMissing(k)} style={{ padding: "7px 12px", borderRadius: 999, cursor: "pointer", fontSize: 12.5, fontWeight: 600, border: `1px solid ${missing.includes(k) ? "var(--accent)" : "var(--line)"}`, color: missing.includes(k) ? "#fff" : "var(--muted)", background: missing.includes(k) ? "var(--accent)" : "transparent" }}>{l}</span>
+            ))}
+          </div>
+          {activeFilters > 0 && (
+            <button onClick={() => { setSex(""); setYearFrom(""); setYearTo(""); setPlace(null); setMissing([]); setPage(1); }} style={{ ...miniBtn, alignSelf: "center" }}>Limpiar</button>
+          )}
+        </div>
+      )}
 
       <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 13, overflow: "hidden" }}>
         <div style={{ overflowX: "auto" }}>
@@ -507,6 +563,39 @@ function PeopleList() {
         )}
       </div>
     </div>
+  );
+}
+
+const filterLbl: React.CSSProperties = { display: "flex", flexDirection: "column", gap: 4, fontSize: 11.5, color: "var(--muted)" };
+const filterFld: React.CSSProperties = { background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 8, padding: "8px 11px", color: "var(--fg)", fontFamily: "inherit", fontSize: 13 };
+
+function PlaceFilter({ value, onPick }: { value: PlaceRow | null; onPick: (p: PlaceRow | null) => void }) {
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+  const results = useDebouncedSearch(q, async (v) => (await listPlaces({ q: v, page_size: 12 })).items, { minLength: 1 });
+  return (
+    <label style={{ ...filterLbl, position: "relative" }}>Lugar
+      {value ? (
+        <span style={{ ...filterFld, display: "inline-flex", alignItems: "center", gap: 8 }}>
+          {value.name}
+          <span onClick={() => onPick(null)} style={{ cursor: "pointer", color: "var(--muted)" }}>✕</span>
+        </span>
+      ) : (
+        <>
+          <input value={q} onChange={(ev) => { setQ(ev.target.value); setOpen(true); }} onBlur={() => setTimeout(() => setOpen(false), 150)} placeholder="Cualquiera" style={{ ...filterFld, width: 150 }} />
+          {open && results.length > 0 && (
+            <div style={{ position: "absolute", top: "100%", left: 0, minWidth: 220, zIndex: 40, background: "var(--elevated)", border: "1px solid var(--line)", borderRadius: 9, marginTop: 4, boxShadow: "var(--shadow)", maxHeight: 220, overflowY: "auto" }}>
+              {results.map((r) => (
+                <div key={r.id} onMouseDown={() => { onPick(r); setQ(""); setOpen(false); }} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "8px 11px", cursor: "pointer", borderBottom: "1px solid var(--line2)" }}>
+                  <span style={{ fontSize: 12.5, fontWeight: 600 }}>{r.name}</span>
+                  <span style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>{r.event_count} ev.</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </label>
   );
 }
 

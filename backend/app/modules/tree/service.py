@@ -583,11 +583,57 @@ async def search_persons(
     ]
 
 
+def _person_filters(
+    *, q: str | None = None, surname: str | None = None, sex: str | None = None,
+    year_from: int | None = None, year_to: int | None = None,
+    place_id: uuid.UUID | None = None, missing: list[str] | None = None,
+) -> list:
+    """WHERE conditions for the person directory (shared by list, CSV export and count)."""
+    conds: list = []
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        conds.append(or_(Name.given.ilike(like), Name.surname.ilike(like)))
+    if surname and surname.strip():
+        conds.append(Name.surname.ilike(f"%{surname.strip()}%"))
+    if sex in ("M", "F", "U"):
+        conds.append(Person.sex == sex)
+    if year_from is not None or year_to is not None:
+        by = select(Event.subject_person_id).where(
+            Event.type == "birth", Event.date_year.is_not(None))
+        if year_from is not None:
+            by = by.where(Event.date_year >= year_from)
+        if year_to is not None:
+            by = by.where(Event.date_year <= year_to)
+        conds.append(Person.id.in_(by))
+    if place_id is not None:
+        conds.append(Person.id.in_(
+            select(Event.subject_person_id).where(
+                Event.place_id == place_id, Event.subject_person_id.is_not(None))))
+    for miss in missing or []:
+        if miss == "birth":
+            conds.append(Person.id.not_in(select(Event.subject_person_id).where(
+                Event.type == "birth", Event.subject_person_id.is_not(None))))
+        elif miss == "parents":
+            conds.append(Person.id.not_in(select(FamilyChild.person_id)))
+        elif miss == "sources":
+            cit_person = select(Citation.id).where(
+                Citation.target_type == "person", Citation.target_id == Person.id)
+            cit_event = (
+                select(Citation.id)
+                .join(Event, Event.id == Citation.target_id)
+                .where(Citation.target_type == "event", Event.subject_person_id == Person.id)
+            )
+            conds.append(~cit_person.exists() & ~cit_event.exists())
+    return conds
+
+
 async def list_persons(
     session: AsyncSession, *, q: str | None = None, surname: str | None = None,
     sort: str = "name", order: str = "asc", page: int = 1, page_size: int = 50,
+    sex: str | None = None, year_from: int | None = None, year_to: int | None = None,
+    place_id: uuid.UUID | None = None, missing: list[str] | None = None,
 ) -> PersonPage:
-    """Paginated, sortable person directory for the tree's list view."""
+    """Paginated, sortable, filterable person directory for the tree's list view."""
     birth_sq = (
         select(func.min(Event.date_year))
         .where(Event.subject_person_id == Person.id, Event.type == "birth")
@@ -607,12 +653,8 @@ async def list_persons(
         select(func.count()).select_from(Person)
         .outerjoin(Name, (Name.person_id == Person.id) & Name.is_primary.is_(True))
     )
-    if q and q.strip():
-        like = f"%{q.strip()}%"
-        cond = or_(Name.given.ilike(like), Name.surname.ilike(like))
-        stmt, count_stmt = stmt.where(cond), count_stmt.where(cond)
-    if surname and surname.strip():
-        cond = Name.surname.ilike(f"%{surname.strip()}%")
+    for cond in _person_filters(q=q, surname=surname, sex=sex, year_from=year_from,
+                                year_to=year_to, place_id=place_id, missing=missing):
         stmt, count_stmt = stmt.where(cond), count_stmt.where(cond)
 
     sub = stmt.subquery()
@@ -633,6 +675,143 @@ async def list_persons(
         total=total,
         items=[PersonRow(id=pid, given=g, surname=s, sex=sex, birth_year=by, death_year=dy)
                for pid, g, s, sex, by, dy in rows],
+    )
+
+
+async def export_persons_csv(
+    session: AsyncSession, *, q: str | None = None, surname: str | None = None,
+    sex: str | None = None, year_from: int | None = None, year_to: int | None = None,
+    place_id: uuid.UUID | None = None, missing: list[str] | None = None,
+) -> str:
+    """CSV of the filtered person directory. Batched queries so a whole-tree export of tens
+    of thousands of rows stays a handful of MB and a few dozen queries."""
+    import csv
+    import io
+
+    stmt = (
+        select(Person.id, Name.given, Name.surname, Person.sex)
+        .outerjoin(Name, (Name.person_id == Person.id) & Name.is_primary.is_(True))
+        .order_by(Name.surname.nulls_last(), Name.given.nulls_last())
+    )
+    for cond in _person_filters(q=q, surname=surname, sex=sex, year_from=year_from,
+                                year_to=year_to, place_id=place_id, missing=missing):
+        stmt = stmt.where(cond)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "nombre", "apellidos", "sexo", "año_nacimiento", "lugar_nacimiento",
+                "año_defuncion", "lugar_defuncion", "num_hijos", "num_fuentes"])
+
+    offset, batch_size = 0, 1000
+    while True:
+        batch = (await session.execute(stmt.limit(batch_size).offset(offset))).all()
+        if not batch:
+            break
+        offset += batch_size
+        ids = [r[0] for r in batch]
+
+        vitals: dict[tuple[uuid.UUID, str], tuple[int | None, str | None]] = {}
+        for pid, etype, year, place in (await session.execute(
+                select(Event.subject_person_id, Event.type, Event.date_year, Place.name)
+                .select_from(Event).outerjoin(Place, Place.id == Event.place_id)
+                .where(Event.subject_person_id.in_(ids), Event.type.in_(("birth", "death"))))).all():
+            vitals.setdefault((pid, etype), (year, place))
+
+        children: dict[uuid.UUID, int] = {}
+        fam_rows = (await session.execute(
+            select(Family.id, Family.husband_id, Family.wife_id).where(
+                or_(Family.husband_id.in_(ids), Family.wife_id.in_(ids))))).all()
+        fam_ids = [f[0] for f in fam_rows]
+        counts = dict((await session.execute(
+            select(FamilyChild.family_id, func.count()).where(FamilyChild.family_id.in_(fam_ids))
+            .group_by(FamilyChild.family_id))).all()) if fam_ids else {}
+        for fid, husb, wife in fam_rows:
+            for parent in (husb, wife):
+                if parent in ids:
+                    children[parent] = children.get(parent, 0) + counts.get(fid, 0)
+
+        sources: dict[uuid.UUID, int] = {}
+        for pid, n in (await session.execute(
+                select(Citation.target_id, func.count()).where(
+                    Citation.target_type == "person", Citation.target_id.in_(ids))
+                .group_by(Citation.target_id))).all():
+            sources[pid] = sources.get(pid, 0) + n
+        for pid, n in (await session.execute(
+                select(Event.subject_person_id, func.count())
+                .select_from(Citation).join(Event, Event.id == Citation.target_id)
+                .where(Citation.target_type == "event", Event.subject_person_id.in_(ids))
+                .group_by(Event.subject_person_id))).all():
+            sources[pid] = sources.get(pid, 0) + n
+
+        for pid, given, surname_, sex_ in batch:
+            by, bp = vitals.get((pid, "birth"), (None, None))
+            dy, dp = vitals.get((pid, "death"), (None, None))
+            w.writerow([str(pid), given or "", surname_ or "", sex_, by or "", bp or "",
+                        dy or "", dp or "", children.get(pid, 0), sources.get(pid, 0)])
+    return buf.getvalue()
+
+
+async def get_person_report(session: AsyncSession, person_id: uuid.UUID):
+    """Everything the printable report needs, in one payload."""
+    from .schemas import PersonReport
+    return PersonReport(
+        person=await get_person_detail(session, person_id),
+        families=await get_person_families(session, person_id),
+        citations=await get_person_citations(session, person_id),
+    )
+
+
+async def get_statistics(session: AsyncSession):
+    """Aggregates for the statistics view: surnames, decades, lifespan, places, sex, children."""
+    from sqlalchemy.orm import aliased
+
+    from .schemas import CountItem, LifespanItem, TreeStatistics
+
+    surnames = [
+        CountItem(label=s, count=n)
+        for s, n in (await session.execute(
+            select(Name.surname, func.count()).where(
+                Name.is_primary.is_(True), Name.surname.is_not(None))
+            .group_by(Name.surname).order_by(func.count().desc()).limit(15))).all()
+    ]
+    decades = [
+        CountItem(label=str(int(d)), count=n)
+        for d, n in (await session.execute(
+            select((Event.date_year // 10 * 10).label("dec"), func.count())
+            .where(Event.type == "birth", Event.date_year.is_not(None))
+            .group_by("dec").order_by("dec"))).all()
+    ]
+    b, d = aliased(Event), aliased(Event)
+    spans: dict[int, list[int]] = {}
+    for by, dy in (await session.execute(
+            select(b.date_year, d.date_year)
+            .join(d, d.subject_person_id == b.subject_person_id)
+            .where(b.type == "birth", d.type == "death",
+                   b.date_year.is_not(None), d.date_year.is_not(None)))).all():
+        span = dy - by
+        if 0 <= span <= 120:
+            spans.setdefault(by // 100 * 100, []).append(span)
+    lifespan = [
+        LifespanItem(century=c, avg_years=round(sum(v) / len(v), 1), count=len(v))
+        for c, v in sorted(spans.items())
+    ]
+    places = [
+        CountItem(label=n, count=c)
+        for n, c in (await session.execute(
+            select(Place.name, func.count(Event.id))
+            .join(Event, Event.place_id == Place.id)
+            .group_by(Place.id, Place.name).order_by(func.count(Event.id).desc()).limit(15))).all()
+    ]
+    sex = {s: n for s, n in (await session.execute(
+        select(Person.sex, func.count()).group_by(Person.sex))).all()}
+    total_children = await session.scalar(select(func.count()).select_from(FamilyChild)) or 0
+    fams_with_children = await session.scalar(
+        select(func.count(func.distinct(FamilyChild.family_id)))) or 0
+    return TreeStatistics(
+        totals=await get_stats(session),
+        surnames=surnames, birth_decades=decades, lifespan_by_century=lifespan, places=places,
+        sex=sex,
+        avg_children_per_family=round(total_children / fams_with_children, 2) if fams_with_children else 0.0,
     )
 
 

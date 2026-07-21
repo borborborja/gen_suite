@@ -13,6 +13,7 @@ import LifeMap, { type MapPoint } from "../LifeMap";
 import { listMedia, uploadMedia, updateMedia, deleteMedia, mediaObjectUrl, type MediaItem } from "../../../api/media";
 import { useConfirm } from "../ui";
 import { AddRelativeDialog, AddFamilyEventDialog, AddCitationDialog, PlaceField } from "../TreeDialogs";
+import PrintReport from "../PrintReport";
 
 function fsUrl(s: ResearchGap["search"]): string {
   const p = new URLSearchParams();
@@ -56,6 +57,7 @@ export default function PersonaView() {
   const [families, setFamilies] = useState<FamilyOut[]>([]);
   const [famEvtOpen, setFamEvtOpen] = useState(false);
   const [citTarget, setCitTarget] = useState<{ type: "person" | "event"; id: string; label: string } | null>(null);
+  const [printOpen, setPrintOpen] = useState(false);
   const { confirmDialog, ask } = useConfirm();
 
   // Blob object-URLs must be revoked when replaced (person change, reload) or on unmount,
@@ -182,6 +184,9 @@ export default function PersonaView() {
           </button>
           <button onClick={() => setEditOpen((v) => !v)} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8, background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 9, padding: "11px 20px", fontFamily: "inherit", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
             {editOpen ? "Cerrar edición" : "✎ Editar"}
+          </button>
+          <button onClick={() => setPrintOpen(true)} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8, background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 9, padding: "11px 20px", fontFamily: "inherit", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+            🖨 Imprimir ficha
           </button>
           {editOpen && (
             <button onClick={removePerson} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8, background: "transparent", color: "var(--danger)", border: "1px solid var(--danger)", borderRadius: 9, padding: "11px 20px", fontFamily: "inherit", fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}>
@@ -389,6 +394,7 @@ export default function PersonaView() {
         <AddCitationDialog targetType={citTarget.type} targetId={citTarget.id} targetLabel={citTarget.label}
           onClose={() => setCitTarget(null)} onDone={reload} />
       )}
+      {printOpen && <PrintReport personId={p.id} onClose={() => setPrintOpen(false)} />}
 
       {lightbox && (
         <div onClick={() => setLightbox(null)} style={{ position: "fixed", inset: 0, zIndex: 80, background: "rgba(15,11,6,.85)", display: "flex", alignItems: "center", justifyContent: "center", padding: 40, cursor: "zoom-out" }}>

@@ -190,6 +190,33 @@ class ChangeDetail(ChangeItem):
     rows: list[dict]  # [{table, pk, before, after}]
 
 
+class CountItem(BaseModel):
+    label: str
+    count: int
+
+
+class LifespanItem(BaseModel):
+    century: int  # start year (1800 = siglo XIX)
+    avg_years: float
+    count: int
+
+
+class TreeStatistics(BaseModel):
+    totals: TreeStats
+    surnames: list[CountItem]
+    birth_decades: list[CountItem]
+    lifespan_by_century: list[LifespanItem]
+    places: list[CountItem]
+    sex: dict[str, int]
+    avg_children_per_family: float
+
+
+class PersonReport(BaseModel):
+    person: PersonDetail
+    families: list[FamilyOut]
+    citations: list[CitationOut]
+
+
 class TreeStats(BaseModel):
     persons: int
     families: int

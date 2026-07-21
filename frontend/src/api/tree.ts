@@ -165,14 +165,36 @@ export interface PersonRow {
   death_year: number | null;
 }
 export interface PersonPage { total: number; items: PersonRow[] }
-export const listPersons = (opts: {
-  q?: string; surname?: string; sort?: "name" | "birth" | "death";
-  order?: "asc" | "desc"; page?: number; page_size?: number;
-} = {}) => {
+export interface PersonFilters {
+  q?: string; surname?: string; sex?: string; year_from?: number; year_to?: number;
+  place_id?: string; missing?: string[];
+}
+export interface PersonListOpts extends PersonFilters {
+  sort?: "name" | "birth" | "death"; order?: "asc" | "desc"; page?: number; page_size?: number;
+}
+function personQs(opts: PersonListOpts): URLSearchParams {
   const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(opts)) if (v !== undefined && v !== "") qs.set(k, String(v));
-  return api<PersonPage>(`/tree/persons?${qs.toString()}`);
-};
+  for (const [k, v] of Object.entries(opts)) {
+    if (v === undefined || v === "" || (Array.isArray(v) && v.length === 0)) continue;
+    if (Array.isArray(v)) v.forEach((x) => qs.append(k, String(x)));
+    else qs.set(k, String(v));
+  }
+  return qs;
+}
+export const listPersons = (opts: PersonListOpts = {}) =>
+  api<PersonPage>(`/tree/persons?${personQs(opts).toString()}`);
+
+export async function downloadPersonsCsv(filters: PersonFilters = {}): Promise<void> {
+  const res = await authFetch(`/tree/persons.csv?${personQs(filters).toString()}`);
+  if (!res.ok) throw new Error(`${res.status}`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "personas.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export interface KinshipStep { person: SearchHit; step: string | null }
 export interface RelationshipOut { related: boolean; label: string; path: KinshipStep[] }
@@ -237,6 +259,26 @@ export const listChanges = (page = 1, pageSize = 50) =>
 export const getChange = (id: string) => api<ChangeDetail>(`/tree/changes/${id}`);
 export const revertChange = (id: string) =>
   api<{ reverted: string }>(`/tree/changes/${id}/revert`, { method: "POST" });
+
+export interface CountItem { label: string; count: number }
+export interface LifespanItem { century: number; avg_years: number; count: number }
+export interface TreeStatistics {
+  totals: TreeStats;
+  surnames: CountItem[];
+  birth_decades: CountItem[];
+  lifespan_by_century: LifespanItem[];
+  places: CountItem[];
+  sex: Record<string, number>;
+  avg_children_per_family: number;
+}
+export const getStatistics = () => api<TreeStatistics>("/tree/statistics");
+
+export interface PersonReport {
+  person: PersonDetail;
+  families: FamilyOut[];
+  citations: CitationOut[];
+}
+export const getPersonReport = (id: string) => api<PersonReport>(`/tree/persons/${id}/report`);
 
 export const PLACE_TYPE_LABEL: Record<string, string> = {
   country: "País", region: "Región", province: "Provincia",

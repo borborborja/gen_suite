@@ -306,11 +306,44 @@ async def list_persons(
     order: str = Query("asc", pattern="^(asc|desc)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
+    sex: str | None = Query(None, pattern="^(M|F|U)$"),
+    year_from: int | None = Query(None),
+    year_to: int | None = Query(None),
+    place_id: uuid.UUID | None = Query(None),
+    missing: list[str] = Query([], description="birth|parents|sources (repetible)"),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> PersonPage:
     """Directorio de personas del árbol: paginado, ordenable y filtrable (vista Lista)."""
     return await service.list_persons(
-        db, q=q, surname=surname, sort=sort, order=order, page=page, page_size=page_size)
+        db, q=q, surname=surname, sort=sort, order=order, page=page, page_size=page_size,
+        sex=sex, year_from=year_from, year_to=year_to, place_id=place_id, missing=missing)
+
+
+@router.get("/persons.csv")
+async def export_persons_csv(
+    q: str | None = Query(None),
+    surname: str | None = Query(None),
+    sex: str | None = Query(None, pattern="^(M|F|U)$"),
+    year_from: int | None = Query(None),
+    year_to: int | None = Query(None),
+    place_id: uuid.UUID | None = Query(None),
+    missing: list[str] = Query([]),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> PlainTextResponse:
+    """Exporta el directorio filtrado como CSV."""
+    csv_text = await service.export_persons_csv(
+        db, q=q, surname=surname, sex=sex, year_from=year_from, year_to=year_to,
+        place_id=place_id, missing=missing)
+    return PlainTextResponse(
+        csv_text, media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="personas.csv"'},
+    )
+
+
+@router.get("/statistics")
+async def statistics(db: AsyncSession = Depends(get_tenant_db)):
+    """Agregados del árbol: apellidos, décadas de nacimiento, esperanza de vida, lugares…"""
+    return await service.get_statistics(db)
 
 
 @router.get("/relationship", response_model=RelationshipOut)
@@ -442,6 +475,14 @@ async def person_detail(
     person_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)
 ) -> PersonDetail:
     return await service.get_person_detail(db, person_id)
+
+
+@router.get("/persons/{person_id}/report")
+async def person_report(
+    person_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db),
+):
+    """Ficha completa (datos + familias + fuentes) en una sola llamada, para el informe imprimible."""
+    return await service.get_person_report(db, person_id)
 
 
 @router.get("/persons/{person_id}/gaps")
