@@ -29,6 +29,13 @@ FACT_TYPES: list[dict] = [
     {"key": "event", "label": "Otro hecho"},
 ]
 
+# Family-scoped fact types (GEDCOM FAM events): they belong to the couple, not to one person.
+FAMILY_FACT_TYPES: list[dict] = [
+    {"key": "marriage", "label": "Matrimonio"}, {"key": "engagement", "label": "Compromiso"},
+    {"key": "divorce", "label": "Divorcio"}, {"key": "census", "label": "Censo / Padrón"},
+    {"key": "residence", "label": "Residencia"}, {"key": "event", "label": "Otro hecho"},
+]
+
 
 async def _resolve_place(session, tenant_id, name: str | None, lat=None, lng=None):
     if not name or not name.strip():
@@ -90,6 +97,24 @@ async def add_event(session, tenant_id, person_id, *, type, date_raw=None, place
     ev = Event(
         tenant_id=tenant_id, type=type, date_raw=date_raw, date_year=extract_year(date_raw),
         value=value or None, is_inferred=False, subject_person_id=person_id,
+        place_id=await _resolve_place(session, tenant_id, place, place_lat, place_lng),
+    )
+    session.add(ev)
+    await session.flush()
+    return ev
+
+
+async def add_family_event(session, tenant_id, family_id, *, type, date_raw=None, place=None,
+                           place_lat=None, place_lng=None, value=None) -> Event:
+    """A fact of the couple (marriage, divorce…) — anchored on the Family, like GEDCOM FAM events."""
+    if not await session.get(Family, family_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "family not found")
+    if type not in TYPE2TAG:
+        type = "event"
+    from .mapping import extract_year
+    ev = Event(
+        tenant_id=tenant_id, type=type, date_raw=date_raw, date_year=extract_year(date_raw),
+        value=value or None, is_inferred=False, subject_family_id=family_id,
         place_id=await _resolve_place(session, tenant_id, place, place_lat, place_lng),
     )
     session.add(ev)

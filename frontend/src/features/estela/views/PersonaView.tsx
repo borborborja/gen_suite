@@ -5,13 +5,14 @@ import { ArrowLeft, SearchPlus } from "../icons";
 import {
   getPerson, displayName, lifespan, getFactTypes, updatePerson, addEvent, editEvent, deleteEvent,
   addRelative, unlinkRelative, deletePerson, getGaps, getCitations, geocodePlaces,
-  type PersonDetail, type EventOut, type Related, type FactType, type ResearchGap, type CitationOut,
+  getPersonFamilies, deleteCitation,
+  type PersonDetail, type EventOut, type Related, type FactType, type ResearchGap,
+  type CitationOut, type FamilyOut,
 } from "../../../api/tree";
 import LifeMap, { type MapPoint } from "../LifeMap";
-import { geoSearch } from "../../../api/geo";
 import { listMedia, uploadMedia, updateMedia, deleteMedia, mediaObjectUrl, type MediaItem } from "../../../api/media";
-import { useConfirm, useDebouncedSearch } from "../ui";
-import { AddRelativeDialog } from "../TreeDialogs";
+import { useConfirm } from "../ui";
+import { AddRelativeDialog, AddFamilyEventDialog, AddCitationDialog, PlaceField } from "../TreeDialogs";
 
 function fsUrl(s: ResearchGap["search"]): string {
   const p = new URLSearchParams();
@@ -26,6 +27,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const EVENT_LABEL: Record<string, string> = {
   birth: "Nacimiento", baptism: "Bautismo", marriage: "Matrimonio", death: "Defunción",
   burial: "Entierro", confirmation: "Confirmación", residence: "Residencia", census: "Censo",
+  divorce: "Divorcio", engagement: "Compromiso", occupation: "Oficio",
 };
 
 function chip(inferred: boolean): CSSProperties {
@@ -51,6 +53,9 @@ export default function PersonaView() {
   const [urls, setUrls] = useState<Record<string, string>>({});
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [addRel, setAddRel] = useState(false);
+  const [families, setFamilies] = useState<FamilyOut[]>([]);
+  const [famEvtOpen, setFamEvtOpen] = useState(false);
+  const [citTarget, setCitTarget] = useState<{ type: "person" | "event"; id: string; label: string } | null>(null);
   const { confirmDialog, ask } = useConfirm();
 
   // Blob object-URLs must be revoked when replaced (person change, reload) or on unmount,
@@ -77,14 +82,16 @@ export default function PersonaView() {
     getPerson(e.selPerson).then(setP).catch(() => setErr(true));
     getGaps(e.selPerson).then(setGaps).catch(() => setGaps([]));
     getCitations(e.selPerson).then(setCites).catch(() => setCites([]));
+    getPersonFamilies(e.selPerson).then(setFamilies).catch(() => setFamilies([]));
     loadMedia(e.selPerson);
   };
   useEffect(() => {
-    setP(null); setErr(false); setEditOpen(false); setGaps([]); setCites([]); setMedia([]); setUrlsRevoking({});
+    setP(null); setErr(false); setEditOpen(false); setGaps([]); setCites([]); setMedia([]); setFamilies([]); setUrlsRevoking({});
     if (!UUID_RE.test(e.selPerson)) { setErr(true); return; }
     getPerson(e.selPerson).then(setP).catch(() => setErr(true));
     getGaps(e.selPerson).then(setGaps).catch(() => setGaps([]));
     getCitations(e.selPerson).then(setCites).catch(() => setCites([]));
+    getPersonFamilies(e.selPerson).then(setFamilies).catch(() => setFamilies([]));
     loadMedia(e.selPerson);
   }, [e.selPerson]);
 
@@ -188,7 +195,17 @@ export default function PersonaView() {
 
       <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr", gap: 22 }}>
         <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 14, padding: 24 }}>
-          <h3 style={{ margin: "0 0 22px", fontSize: 16, fontWeight: 600 }}>Línea de vida</h3>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 22 }}>
+            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Línea de vida</h3>
+            {editOpen && (
+              <button
+                onClick={() => families.length === 0
+                  ? e.notify("Añade primero un cónyuge para registrar hechos de pareja", "var(--warn)")
+                  : setFamEvtOpen(true)}
+                style={{ background: "transparent", color: "var(--accent)", border: "1px solid var(--line)", borderRadius: 8, padding: "6px 12px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}
+              >⚭ Hecho de pareja</button>
+            )}
+          </div>
           {p.events.length === 0 && <p style={{ color: "var(--muted)", fontSize: 13.5 }}>Sin eventos registrados.</p>}
           <div style={{ position: "relative", paddingLeft: 28 }}>
             {p.events.length > 0 && <div style={{ position: "absolute", left: 7, top: 6, bottom: 6, width: 2, background: "var(--line)" }} />}
@@ -197,10 +214,18 @@ export default function PersonaView() {
                 <div key={ev.id || i} style={{ position: "relative" }}>
                   <div style={{ position: "absolute", left: -28, top: 3, width: 16, height: 16, borderRadius: "50%", border: "3px solid var(--surface)", background: ev.is_inferred ? "var(--warn)" : "var(--ok)" }} />
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "baseline" }}>
-                    <span style={{ fontWeight: 600, fontSize: 15 }}>{EVENT_LABEL[ev.type] ?? ev.type}</span>
+                    <span style={{ fontWeight: 600, fontSize: 15 }}>
+                      {EVENT_LABEL[ev.type] ?? ev.type}
+                      {ev.family_id && (
+                        <span title="Hecho de pareja" style={{ marginLeft: 8, fontFamily: fonts.mono, fontSize: 10, fontWeight: 500, color: "var(--accent)", background: "var(--accent-faint)", borderRadius: 5, padding: "2px 7px" }}>
+                          ⚭ {ev.spouse_name ?? "pareja"}
+                        </span>
+                      )}
+                    </span>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       {editOpen && (
                         <>
+                          <button title="Citar fuente" onClick={() => setCitTarget({ type: "event", id: ev.id, label: EVENT_LABEL[ev.type] ?? ev.type })} style={miniBtn}>❞</button>
                           <button title="Editar" onClick={() => setEditEvt(ev)} style={miniBtn}>✎</button>
                           <button title="Borrar" onClick={() => removeEvent(ev.id)} style={{ ...miniBtn, color: "var(--danger)" }}>✕</button>
                         </>
@@ -210,7 +235,7 @@ export default function PersonaView() {
                   </div>
                   <div style={{ fontSize: 13, color: "var(--muted)", margin: "4px 0 0" }}>{[ev.date_raw || ev.date_year, ev.place].filter(Boolean).join(" · ")}</div>
                   {editEvt?.id === ev.id && (
-                    <EventEditor event={ev} onClose={() => setEditEvt(null)} onSaved={() => { setEditEvt(null); reload(); }} />
+                    <EventEditor event={ev} scope={ev.family_id ? "family" : "person"} onClose={() => setEditEvt(null)} onSaved={() => { setEditEvt(null); reload(); }} />
                   )}
                 </div>
               ))}
@@ -299,29 +324,38 @@ export default function PersonaView() {
         </div>
       )}
 
-      {cites.length > 0 && (
-        <div style={{ marginTop: 22, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 14, padding: 24 }}>
-          <h3 style={{ margin: "0 0 4px", fontSize: 16, fontWeight: 600 }}>Fuentes</h3>
-          <p style={{ color: "var(--muted)", fontSize: 13, margin: "0 0 16px" }}>La evidencia que respalda los datos de esta persona. Cada cita abre el documento original.</p>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {cites.map((c) => (
-              <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 14, background: "var(--bg)", border: "1px solid var(--line2)", borderRadius: 10, padding: "12px 14px", flexWrap: "wrap" }}>
-                <div style={{ flex: 1, minWidth: 200 }}>
-                  <div style={{ fontSize: 13.5, fontWeight: 600 }}>
-                    {[EVENT_LABEL[c.record_type ?? ""] ?? c.record_type, c.date_raw].filter(Boolean).join(" · ") || "Registro"}
-                  </div>
-                  <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>{c.summary || c.note || c.document_title || "—"}</div>
-                </div>
-                {c.document_id
-                  ? <button onClick={() => e.openDoc(c.document_id!, c.page_no ?? undefined)} style={{ flex: "none", background: "var(--accent)", color: "#fff", border: "none", borderRadius: 8, padding: "8px 14px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
-                      Ver fuente{c.page_no ? ` · pág. ${c.page_no}` : ""}
-                    </button>
-                  : <span style={{ flex: "none", fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>sin imagen</span>}
-              </div>
-            ))}
-          </div>
+      <div style={{ marginTop: 22, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 14, padding: 24 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Fuentes</h3>
+          <button onClick={() => setCitTarget({ type: "person", id: p.id, label: name })} style={{ background: "transparent", color: "var(--accent)", border: "1px solid var(--line)", borderRadius: 8, padding: "6px 12px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>＋ Añadir fuente</button>
         </div>
-      )}
+        <p style={{ color: "var(--muted)", fontSize: 13, margin: "0 0 16px" }}>La evidencia que respalda los datos de esta persona. Cada cita abre el documento original.</p>
+        {cites.length === 0 && <p style={{ color: "var(--muted)", fontSize: 13.5, margin: 0 }}>Sin fuentes todavía. Añade de dónde sale cada dato: libro, página y nota.</p>}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {cites.map((c) => (
+            <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 14, background: "var(--bg)", border: "1px solid var(--line2)", borderRadius: 10, padding: "12px 14px", flexWrap: "wrap" }}>
+              <div style={{ flex: 1, minWidth: 200 }}>
+                <div style={{ fontSize: 13.5, fontWeight: 600 }}>
+                  {[EVENT_LABEL[c.record_type ?? ""] ?? c.record_type, c.date_raw].filter(Boolean).join(" · ")
+                    || c.document_title || "Nota"}
+                </div>
+                <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>{c.summary || c.note || c.document_title || "—"}</div>
+              </div>
+              {c.document_id
+                ? <button onClick={() => e.openDoc(c.document_id!, c.page_no ?? undefined)} style={{ flex: "none", background: "var(--accent)", color: "#fff", border: "none", borderRadius: 8, padding: "8px 14px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
+                    Ver fuente{c.page_no ? ` · pág. ${c.page_no}` : ""}
+                  </button>
+                : <span style={{ flex: "none", fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>sin imagen</span>}
+              {editOpen && (
+                <button title="Borrar cita" style={{ ...miniBtn, color: "var(--danger)" }} onClick={async () => {
+                  if (!(await ask({ title: "¿Borrar esta cita?", confirmLabel: "Borrar", danger: true }))) return;
+                  try { await deleteCitation(c.id); reload(); } catch (err) { e.notify((err as Error).message, "var(--danger)"); }
+                }}>✕</button>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
 
       {gaps.length > 0 && (
         <div style={{ marginTop: 22, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 14, padding: 24 }}>
@@ -347,6 +381,13 @@ export default function PersonaView() {
 
       {addRel && (
         <AddRelativeDialog personId={p.id} personName={name} onClose={() => setAddRel(false)} onDone={reload} />
+      )}
+      {famEvtOpen && (
+        <AddFamilyEventDialog families={families} personName={name} onClose={() => setFamEvtOpen(false)} onDone={reload} />
+      )}
+      {citTarget && (
+        <AddCitationDialog targetType={citTarget.type} targetId={citTarget.id} targetLabel={citTarget.label}
+          onClose={() => setCitTarget(null)} onDone={reload} />
       )}
 
       {lightbox && (
@@ -390,7 +431,9 @@ function EditPanel({ person, onChange }: { person: PersonDetail; onChange: () =>
   const [rsex, setRsex] = useState("U");
   const [msg, setMsg] = useState("");
 
-  useEffect(() => { getFactTypes().then(setFactTypes).catch(() => setFactTypes([])); }, []);
+  useEffect(() => {
+    getFactTypes().then((ts) => setFactTypes(ts.filter((t) => t.scope === "person"))).catch(() => setFactTypes([]));
+  }, []);
   const flash = (m: string) => { setMsg(m); setTimeout(() => setMsg(""), 2500); };
 
   async function saveIdentity() {
@@ -447,7 +490,7 @@ function EditPanel({ person, onChange }: { person: PersonDetail; onChange: () =>
   );
 }
 
-function EventEditor({ event, onClose, onSaved }: { event: EventOut; onClose: () => void; onSaved: () => void }) {
+function EventEditor({ event, scope = "person", onClose, onSaved }: { event: EventOut; scope?: "person" | "family"; onClose: () => void; onSaved: () => void }) {
   const [factTypes, setFactTypes] = useState<FactType[]>([]);
   const [type, setType] = useState(event.type);
   const [date, setDate] = useState(event.date_raw ?? (event.date_year ? String(event.date_year) : ""));
@@ -456,7 +499,9 @@ function EventEditor({ event, onClose, onSaved }: { event: EventOut; onClose: ()
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(
     event.place_lat != null && event.place_lng != null ? { lat: event.place_lat, lng: event.place_lng } : null);
   const [busy, setBusy] = useState(false);
-  useEffect(() => { getFactTypes().then(setFactTypes).catch(() => setFactTypes([])); }, []);
+  useEffect(() => {
+    getFactTypes().then((ts) => setFactTypes(ts.filter((t) => t.scope === scope))).catch(() => setFactTypes([]));
+  }, [scope]);
   async function save() {
     setBusy(true);
     try {
@@ -476,27 +521,6 @@ function EventEditor({ event, onClose, onSaved }: { event: EventOut; onClose: ()
         <button onClick={onClose} style={{ ...saveBtn, background: "transparent", color: "var(--fg)", border: "1px solid var(--line)" }}>Cancelar</button>
       </div>
     </div>
-  );
-}
-
-function PlaceField({ value, onPick }: { value: string; onPick: (name: string, coords: { lat: number; lng: number } | null) => void }) {
-  const [q, setQ] = useState(value);
-  const [open, setOpen] = useState(false);
-  const results = useDebouncedSearch(q, (v) => geoSearch(v), { delay: 350 });
-  return (
-    <label style={{ ...lbl, position: "relative" }}>Lugar
-      <input style={fld} value={q} onChange={(e) => { setQ(e.target.value); onPick(e.target.value, null); setOpen(true); }} onBlur={() => setTimeout(() => setOpen(false), 150)} placeholder="Escribe y elige…" />
-      {open && results.length > 0 && (
-        <div style={{ position: "absolute", top: "100%", left: 0, right: 0, zIndex: 30, background: "var(--elevated)", border: "1px solid var(--line)", borderRadius: 8, marginTop: 4, boxShadow: "var(--shadow)", maxHeight: 180, overflowY: "auto" }}>
-          {results.map((r, i) => (
-            <div key={i} onMouseDown={() => { setQ(r.name); onPick(r.name, { lat: r.lat, lng: r.lng }); setOpen(false); }} style={{ padding: "7px 11px", cursor: "pointer", borderBottom: i < results.length - 1 ? "1px solid var(--line2)" : "none" }}>
-              <div style={{ fontWeight: 600, fontSize: 12.5, color: "var(--fg)" }}>{r.name}</div>
-              <div style={{ fontSize: 10.5, color: "var(--muted)" }}>{r.display_name}</div>
-            </div>
-          ))}
-        </div>
-      )}
-    </label>
   );
 }
 

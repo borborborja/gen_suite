@@ -11,10 +11,10 @@ from pydantic import BaseModel
 from ...core.deps import get_current_principal, get_tenant_db, require_roles
 from ...core.security import Principal
 from ...models.membership import MembershipRole
-from . import editing, exporter, kinship, research, service
+from . import citations, editing, exporter, kinship, research, service
 from .schemas import (
-    CitationOut, DuplicatePair, ImportResult, PersonDetail, PersonPage, RelationshipOut,
-    SearchHit, TreeGraph, TreeStats,
+    CitationIn, CitationOut, CitationPatch, DuplicatePair, FamilyOut, ImportResult,
+    PersonDetail, PersonPage, RelationshipOut, SearchHit, TreeGraph, TreeStats,
 )
 
 router = APIRouter(prefix="/tree", tags=["tree"])
@@ -56,8 +56,9 @@ class RelativeIn(BaseModel):
 
 @router.get("/fact-types")
 async def fact_types() -> list[dict]:
-    """GEDCOM-standard fact/event types for the edit UI's dropdown."""
-    return editing.FACT_TYPES
+    """GEDCOM-standard fact/event types for the edit UI's dropdowns, tagged by scope."""
+    return ([{**t, "scope": "person"} for t in editing.FACT_TYPES]
+            + [{**t, "scope": "family"} for t in editing.FAMILY_FACT_TYPES])
 
 
 @router.post("/persons", dependencies=[Depends(require_roles(*_WRITE))])
@@ -118,6 +119,54 @@ async def add_relative(
     rel = await editing.add_relative(db, principal.tenant_id, person_id, relation=body.relation,
                                      given=body.given, surname=body.surname, sex=body.sex)
     return {"id": str(rel.id)}
+
+
+@router.get("/persons/{person_id}/families", response_model=list[FamilyOut])
+async def person_families(
+    person_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db),
+) -> list[FamilyOut]:
+    """Las familias (parejas) de una persona, con sus hechos compartidos."""
+    return await service.get_person_families(db, person_id)
+
+
+@router.post("/families/{family_id}/events", dependencies=[Depends(require_roles(*_WRITE))])
+async def add_family_event(
+    family_id: uuid.UUID, body: EventIn,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
+) -> dict:
+    """Añade un hecho de pareja (matrimonio, divorcio…) sobre la familia, como en GEDCOM."""
+    ev = await editing.add_family_event(db, principal.tenant_id, family_id, type=body.type,
+                                        date_raw=body.date_raw, place=body.place,
+                                        place_lat=body.place_lat, place_lng=body.place_lng,
+                                        value=body.value)
+    return {"id": str(ev.id)}
+
+
+@router.post("/citations", dependencies=[Depends(require_roles(*_WRITE))])
+async def create_citation(
+    body: CitationIn,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
+) -> dict:
+    """Cita manual: vincula una persona o un hecho con un documento/página de la biblioteca."""
+    cit = await citations.create_citation(
+        db, principal.tenant_id, target_type=body.target_type, target_id=body.target_id,
+        document_id=body.document_id, page_no=body.page_no, note=body.note)
+    return {"id": str(cit.id)}
+
+
+@router.patch("/citations/{citation_id}", dependencies=[Depends(require_roles(*_WRITE))])
+async def update_citation(
+    citation_id: uuid.UUID, body: CitationPatch, db: AsyncSession = Depends(get_tenant_db),
+) -> dict:
+    cit = await citations.update_citation(db, citation_id, document_id=body.document_id,
+                                          page_no=body.page_no, note=body.note)
+    return {"id": str(cit.id)}
+
+
+@router.delete("/citations/{citation_id}", dependencies=[Depends(require_roles(*_WRITE))])
+async def delete_citation(citation_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)) -> dict:
+    await citations.delete_citation(db, citation_id)
+    return {"deleted": str(citation_id)}
 
 
 @router.delete("/persons/{person_id}/relatives/{relative_id}", dependencies=[Depends(require_roles(*_WRITE))])

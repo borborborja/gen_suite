@@ -58,6 +58,10 @@ class EventOut(BaseModel):
     place_lng: float | None = None
     value: str | None
     is_inferred: bool
+    # set only for family (couple) events, so the UI can badge them and edit per-family
+    family_id: uuid.UUID | None = None
+    spouse_id: uuid.UUID | None = None
+    spouse_name: str | None = None
 
 
 class RelatedPerson(BaseModel):
@@ -88,6 +92,28 @@ class SearchHit(BaseModel):
     surname: str | None
     birth_year: int | None
     death_year: int | None
+
+
+class FamilyOut(BaseModel):
+    """One couple/family a person belongs to as spouse, with its shared events."""
+    id: uuid.UUID
+    spouse: RelatedPerson | None = None
+    children_count: int
+    events: list[EventOut]
+
+
+class CitationIn(BaseModel):
+    target_type: str  # person | event
+    target_id: uuid.UUID
+    document_id: uuid.UUID | None = None
+    page_no: int | None = None
+    note: str | None = None
+
+
+class CitationPatch(BaseModel):
+    document_id: uuid.UUID | None = None
+    page_no: int | None = None
+    note: str | None = None
 
 
 class TreeStats(BaseModel):

@@ -23,6 +23,7 @@ from .schemas import (
     CitationOut,
     DuplicatePair,
     EventOut,
+    FamilyOut,
     ImportResult,
     NameOut,
     PersonDetail,
@@ -35,6 +36,10 @@ from .schemas import (
     TreePerson,
     TreeStats,
 )
+
+
+def _display(s: TreePerson | None) -> str | None:
+    return " ".join(x for x in ((s.given, s.surname) if s else ()) if x) or None
 
 
 async def import_gedcom_file(
@@ -264,6 +269,27 @@ async def get_person_detail(session: AsyncSession, person_id: uuid.UUID) -> Pers
 
     summaries = await _summaries(session, parent_ids | spouse_ids | set(child_ids) | sibling_ids)
 
+    # Couple events (marriage, divorce…) of the families where this person is a spouse — shown
+    # in the life line of both spouses, tagged with family_id so the UI can badge/edit them.
+    if fam_ids:
+        spouse_by_fam = {fid: (wife if husb == person_id else husb) for fid, husb, wife in fams}
+        for eid, t, dr, dy, v, inf, fid, pl, plat, plng in (
+            await session.execute(
+                select(Event.id, Event.type, Event.date_raw, Event.date_year, Event.value,
+                       Event.is_inferred, Event.subject_family_id, Place.name, Place.lat, Place.lng)
+                .select_from(Event)
+                .outerjoin(Place, Place.id == Event.place_id)
+                .where(Event.subject_family_id.in_(fam_ids))
+            )
+        ).all():
+            sp = spouse_by_fam.get(fid)
+            events.append(EventOut(
+                id=eid, type=t, date_raw=dr, date_year=dy, place=pl, place_lat=plat,
+                place_lng=plng, value=v, is_inferred=inf, family_id=fid, spouse_id=sp,
+                spouse_name=_display(summaries.get(sp)) if sp else None,
+            ))
+        events.sort(key=lambda e: (e.date_year is None, e.date_year or 0))
+
     def related(pid: uuid.UUID, relation: str) -> RelatedPerson:
         s = summaries.get(pid)
         return RelatedPerson(
@@ -293,6 +319,63 @@ async def get_person_detail(session: AsyncSession, person_id: uuid.UUID) -> Pers
         children=[related(c, "child") for c in child_ids],
         siblings=[related(s, "sibling") for s in sibling_ids],
     )
+
+
+async def get_person_families(session: AsyncSession, person_id: uuid.UUID) -> list[FamilyOut]:
+    """Families where the person is a spouse: the other spouse, children count and couple events."""
+    if not await session.get(Person, person_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "person not found")
+    fams = (
+        await session.execute(
+            select(Family.id, Family.husband_id, Family.wife_id).where(
+                or_(Family.husband_id == person_id, Family.wife_id == person_id)
+            )
+        )
+    ).all()
+    if not fams:
+        return []
+    fam_ids = [f[0] for f in fams]
+    spouse_by_fam = {fid: (wife if husb == person_id else husb) for fid, husb, wife in fams}
+    child_counts: dict[uuid.UUID, int] = dict(
+        (await session.execute(
+            select(FamilyChild.family_id, func.count())
+            .where(FamilyChild.family_id.in_(fam_ids))
+            .group_by(FamilyChild.family_id)
+        )).all()
+    )
+    summaries = await _summaries(session, {s for s in spouse_by_fam.values() if s})
+
+    events_by_fam: dict[uuid.UUID, list[EventOut]] = {}
+    for eid, t, dr, dy, v, inf, fid, pl, plat, plng in (
+        await session.execute(
+            select(Event.id, Event.type, Event.date_raw, Event.date_year, Event.value,
+                   Event.is_inferred, Event.subject_family_id, Place.name, Place.lat, Place.lng)
+            .select_from(Event)
+            .outerjoin(Place, Place.id == Event.place_id)
+            .where(Event.subject_family_id.in_(fam_ids))
+            .order_by(Event.date_year)
+        )
+    ).all():
+        events_by_fam.setdefault(fid, []).append(EventOut(
+            id=eid, type=t, date_raw=dr, date_year=dy, place=pl, place_lat=plat,
+            place_lng=plng, value=v, is_inferred=inf, family_id=fid,
+        ))
+
+    out: list[FamilyOut] = []
+    for fid, _, _ in fams:
+        sp = spouse_by_fam.get(fid)
+        s = summaries.get(sp) if sp else None
+        out.append(FamilyOut(
+            id=fid,
+            spouse=RelatedPerson(
+                id=sp, given=s.given if s else None, surname=s.surname if s else None,
+                sex=s.sex if s else "U", birth_year=s.birth_year if s else None,
+                death_year=s.death_year if s else None, relation="spouse",
+            ) if sp else None,
+            children_count=child_counts.get(fid, 0),
+            events=events_by_fam.get(fid, []),
+        ))
+    return out
 
 
 async def find_duplicates(session: AsyncSession, limit: int = 50) -> list[DuplicatePair]:
@@ -439,6 +522,7 @@ async def get_person_citations(session: AsyncSession, person_id: uuid.UUID) -> l
         t = trans.get(c.transcription_id) if c.transcription_id else None
         if t:
             doc_ids.add(t.document_id)
+    doc_ids |= {p.document_id for p in pages.values()}  # manual citas: only a page attached
     docs = {d.id: d for d in (await session.scalars(
         select(Document).where(Document.id.in_(doc_ids)))).all()} if doc_ids else {}
 
@@ -446,8 +530,9 @@ async def get_person_citations(session: AsyncSession, person_id: uuid.UUID) -> l
     for c in cits:
         r = records.get(c.record_id) if c.record_id else None
         t = trans.get(c.transcription_id) if c.transcription_id else None
-        document_id = (r.document_id if r else None) or (t.document_id if t else None)
         page = pages.get(c.page_id) or (pages.get(r.page_id) if r and r.page_id else None)
+        document_id = ((r.document_id if r else None) or (t.document_id if t else None)
+                       or (page.document_id if page else None))
         page_no = page.page_no if page else (t.page_no if t else None)
         doc = docs.get(document_id) if document_id else None
         out.append(CitationOut(

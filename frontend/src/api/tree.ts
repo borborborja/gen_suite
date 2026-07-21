@@ -62,6 +62,9 @@ export interface EventOut {
   place_lng: number | null;
   value: string | null;
   is_inferred: boolean;
+  family_id?: string | null;
+  spouse_id?: string | null;
+  spouse_name?: string | null;
 }
 export interface PersonDetail {
   id: string;
@@ -75,8 +78,26 @@ export interface PersonDetail {
   siblings: Related[];
 }
 
-export interface FactType { key: string; label: string }
+export interface FactType { key: string; label: string; scope: "person" | "family" }
 export const getFactTypes = () => api<FactType[]>("/tree/fact-types");
+
+export interface FamilyOut {
+  id: string;
+  spouse: Related | null;
+  children_count: number;
+  events: EventOut[];
+}
+export const getPersonFamilies = (id: string) => api<FamilyOut[]>(`/tree/persons/${id}/families`);
+export const addFamilyEvent = (familyId: string, body: EventBody) =>
+  api<{ id: string }>(`/tree/families/${familyId}/events`, { method: "POST", body: JSON.stringify(body) });
+
+export type CitationBody = { document_id?: string; page_no?: number; note?: string };
+export const createCitation = (target_type: "person" | "event", target_id: string, body: CitationBody) =>
+  api<{ id: string }>("/tree/citations", { method: "POST", body: JSON.stringify({ target_type, target_id, ...body }) });
+export const updateCitation = (id: string, body: CitationBody) =>
+  api<{ id: string }>(`/tree/citations/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+export const deleteCitation = (id: string) =>
+  api<{ deleted: string }>(`/tree/citations/${id}`, { method: "DELETE" });
 
 export interface ResearchGap {
   kind: string;
