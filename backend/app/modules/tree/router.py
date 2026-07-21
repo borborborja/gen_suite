@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from ...core.deps import get_current_principal, get_tenant_db, require_roles
 from ...core.security import Principal
 from ...models.membership import MembershipRole
-from . import audit, citations, editing, exporter, kinship, places, research, service
+from . import audit, citations, consistency, editing, exporter, kinship, places, research, service
 from .audit import audited
 from .schemas import (
     ChangeDetail, ChangePage, CitationIn, CitationOut, CitationPatch, DuplicatePair,
@@ -344,6 +344,12 @@ async def export_persons_csv(
 async def statistics(db: AsyncSession = Depends(get_tenant_db)):
     """Agregados del árbol: apellidos, décadas de nacimiento, esperanza de vida, lugares…"""
     return await service.get_statistics(db)
+
+
+@router.get("/consistency")
+async def consistency_check(db: AsyncSession = Depends(get_tenant_db)) -> dict:
+    """Verificador de consistencia: fechas imposibles o sospechosas en todo el árbol."""
+    return await consistency.get_consistency(db)
 
 
 @router.get("/relationship", response_model=RelationshipOut)

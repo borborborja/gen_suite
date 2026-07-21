@@ -280,6 +280,23 @@ export interface PersonReport {
 }
 export const getPersonReport = (id: string) => api<PersonReport>(`/tree/persons/${id}/report`);
 
+export interface ConsistencyIssue {
+  code: string;
+  severity: "error" | "warning";
+  message: string;
+  person_id: string;
+  person_name: string;
+  related_person_id: string | null;
+  related_person_name: string | null;
+  family_id: string | null;
+}
+export interface ConsistencyReport {
+  issues: ConsistencyIssue[];
+  counts: Record<string, number>;
+  checked_at_year: number;
+}
+export const getConsistency = () => api<ConsistencyReport>("/tree/consistency");
+
 export const PLACE_TYPE_LABEL: Record<string, string> = {
   country: "País", region: "Región", province: "Provincia",
   municipality: "Municipio", parish: "Parroquia", other: "Otro",

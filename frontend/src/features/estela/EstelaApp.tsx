@@ -15,6 +15,7 @@ import AjustesView from "./views/AjustesView";
 import LugaresView from "./views/LugaresView";
 import HistorialView from "./views/HistorialView";
 import EstadisticasView from "./views/EstadisticasView";
+import ConsistenciaView from "./views/ConsistenciaView";
 
 const KEYFRAMES = `
 @keyframes estIn{from{transform:translateY(9px)}to{transform:none}}
@@ -50,6 +51,7 @@ function Shell({ account }: { account?: Account }) {
         {e.nav === "lugares" && <LugaresView />}
         {e.nav === "historial" && <HistorialView />}
         {e.nav === "estadisticas" && <EstadisticasView />}
+        {e.nav === "consistencia" && <ConsistenciaView />}
       </main>
       <Toast />
       <ZoomModal />

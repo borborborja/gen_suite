@@ -4,7 +4,7 @@ import { fonts } from "./theme";
 import type { Account } from "./EstelaApp";
 import {
   HomeIcon, TreeIcon, SparkIcon, BookIcon, SearchIcon, GearIcon, SunIcon, MoonIcon, PinIcon,
-  ClockIcon, ChartIcon,
+  ClockIcon, ChartIcon, ShieldIcon,
 } from "./icons";
 import ActivityIndicator from "./ActivityIndicator";
 
@@ -31,6 +31,7 @@ export default function Sidebar({ account }: { account?: Account }) {
     { key: "lugares", label: "Lugares", icon: <PinIcon /> },
     { key: "historial", label: "Historial", icon: <ClockIcon /> },
     { key: "estadisticas", label: "Estadísticas", icon: <ChartIcon /> },
+    { key: "consistencia", label: "Consistencia", icon: <ShieldIcon /> },
     { key: "buscar", label: "Buscar", icon: <SearchIcon /> },
     { key: "super", label: "Superdescubrimiento", icon: <SparkIcon /> },
     { key: "familysearch", label: "FamilySearch", icon: <BookIcon /> },

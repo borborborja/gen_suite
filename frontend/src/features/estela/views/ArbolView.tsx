@@ -14,12 +14,14 @@ import { AddRelativeDialog, RelationshipDialog } from "../TreeDialogs";
 import { computeLayout, NODE_W, NODE_H, type PositionedPerson } from "../../tree/layout";
 import { computePedigree } from "../../tree/pedigree";
 import { computeFan, arcPath } from "../../tree/fan";
+import { computeDescendants } from "../../tree/descendants";
 import { useConfirm, useDebouncedSearch } from "../ui";
 
 const tabs: { key: TreeView; label: string }[] = [
   { key: "genograma", label: "Genograma" },
   { key: "pedigree", label: "Pedigrí" },
   { key: "abanico", label: "Abanico" },
+  { key: "descendientes", label: "Descendientes" },
   { key: "lista", label: "Lista" },
 ];
 
@@ -121,6 +123,7 @@ export default function ArbolView() {
               {graph ? (
                 e.treeView === "pedigree" ? <PedigreeCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} />
                 : e.treeView === "abanico" ? <FanCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} />
+                : e.treeView === "descendientes" ? <DescendantsCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} />
                 : <GraphCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} onAddRelative={openAddRelative} />
               ) : <div style={{ color: "var(--muted)", padding: 40 }}>Cargando árbol…</div>}
             </div>
@@ -391,6 +394,39 @@ function PedigreeCanvas({ graph, depth, setDepth, onRecenter }: { graph: TreeGra
               <div style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{displayName(n)}</div>
               <div style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>{lifespan(n)}</div>
             </div>
+          </div>
+        );
+      })}
+    </PanZoom>
+  );
+}
+
+function DescendantsCanvas({ graph, depth, setDepth, onRecenter }: { graph: TreeGraph; depth: number; setDepth: (d: number) => void; onRecenter: (id: string) => void }) {
+  const e = useEstela();
+  const desc = computeDescendants(graph, graph.focus, depth);
+  return (
+    <PanZoom width={desc.width} height={desc.height} depth={depth} setDepth={setDepth}>
+      <svg width={desc.width} height={desc.height} style={{ position: "absolute", inset: 0, overflow: "visible" }}>
+        {desc.links.map((l, i) => <path key={i} d={`M${l.x1} ${l.y1} C${(l.x1 + l.x2) / 2} ${l.y1} ${(l.x1 + l.x2) / 2} ${l.y2} ${l.x2} ${l.y2}`} fill="none" stroke="var(--line)" strokeWidth={2} />)}
+      </svg>
+      {desc.nodes.map((n) => {
+        const inferred = (n.deduction_count ?? 0) > 0;
+        const av = avatar(inferred ? "inferred" : "confirmed");
+        const sel = n.id === graph.focus;
+        return (
+          <div key={n.id} style={{ position: "absolute", left: n.x, top: n.y, width: NODE_W }}>
+            <div onClick={() => (sel ? e.openPerson(n.id) : onRecenter(n.id))} title={sel ? "Abrir ficha" : "Centrar aquí"} style={{ height: NODE_H, display: "flex", alignItems: "center", gap: 10, background: "var(--bg)", border: `1.5px ${inferred ? "dashed var(--warn)" : sel ? "solid var(--accent)" : "solid var(--line)"}`, borderRadius: 11, padding: "8px 10px", boxSizing: "border-box", boxShadow: "var(--shadow)", cursor: "pointer" }}>
+              <div style={{ width: 34, height: 34, borderRadius: 8, flex: "none", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: fonts.serif, fontWeight: 600, fontSize: 14, background: av.bg, color: av.fg }}>{initials(n.given, n.surname)}</div>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{displayName(n)}</div>
+                <div style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>{lifespan(n)}</div>
+              </div>
+            </div>
+            {n.spouses.length > 0 && (
+              <div style={{ fontSize: 10.5, color: "var(--muted)", marginTop: 3, paddingLeft: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={n.spouses.join(" · ")}>
+                ⚭ {n.spouses.join(" · ")}
+              </div>
+            )}
           </div>
         );
       })}
