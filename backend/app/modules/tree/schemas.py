@@ -116,6 +116,57 @@ class CitationPatch(BaseModel):
     note: str | None = None
 
 
+class PlaceRef(BaseModel):
+    id: uuid.UUID
+    name: str
+    place_type: str | None = None
+
+
+class PlaceRow(BaseModel):
+    id: uuid.UUID
+    name: str
+    place_type: str | None
+    parent_id: uuid.UUID | None
+    parent_name: str | None
+    lat: float | None
+    lng: float | None
+    event_count: int
+    children_count: int
+
+
+class PlacePage(BaseModel):
+    total: int
+    items: list[PlaceRow]
+
+
+class PlaceDetail(PlaceRow):
+    breadcrumb: list[PlaceRef]  # from root ancestor down to the direct parent
+    children: list[PlaceRef]
+
+
+class PlacePatch(BaseModel):
+    name: str | None = None
+    place_type: str | None = None
+    parent_id: uuid.UUID | None = None
+    clear_parent: bool = False  # explicit: parent_id=None in a PATCH means "no change"
+    lat: float | None = None
+    lng: float | None = None
+
+
+class PlaceEventRow(BaseModel):
+    id: uuid.UUID
+    type: str
+    date_raw: str | None
+    date_year: int | None
+    person_id: uuid.UUID | None
+    person_name: str | None
+
+
+class PlaceEventsPage(BaseModel):
+    total: int
+    items: list[PlaceEventRow]
+
+
 class TreeStats(BaseModel):
     persons: int
     families: int

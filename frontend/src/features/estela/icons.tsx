@@ -26,3 +26,7 @@ export const Cross = (p: IconProps) => svg(<path d="M18 6 6 18M6 6l12 12" />, { 
 export const Plus = (p: IconProps) => svg(<path d="M12 5v14M5 12h14" />, { sw: 2, ...p });
 export const ZoomIn = (p: IconProps) => svg(<><circle cx="11" cy="11" r="7" /><path d="m20 20-3-3M11 8v6M8 11h6" /></>, { sw: 2, ...p });
 export const SearchPlus = (p: IconProps) => svg(<><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>, { sw: 1.8, ...p });
+export const PinIcon = (p: IconProps) => svg(<><path d="M12 21s-6.5-5.7-6.5-10.5a6.5 6.5 0 0 1 13 0C18.5 15.3 12 21 12 21z" /><circle cx="12" cy="10.3" r="2.3" /></>, p);
+export const ClockIcon = (p: IconProps) => svg(<><circle cx="12" cy="12" r="8.5" /><path d="M12 7.5V12l3 2" /></>, p);
+export const ChartIcon = (p: IconProps) => svg(<><path d="M4 20V10M10 20V4M16 20v-7M20 20H4" /></>, p);
+export const ShieldIcon = (p: IconProps) => svg(<><path d="M12 3.5 5 6v5.5c0 4.4 3 7.6 7 9 4-1.4 7-4.6 7-9V6z" /><path d="m9.2 12 2 2 3.6-3.8" /></>, p);

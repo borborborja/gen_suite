@@ -13,8 +13,9 @@ import type { ThemeMode } from "./theme";
 
 export type Nav =
   | "inicio" | "descubrimientos" | "arbol" | "persona"
-  | "biblioteca" | "visor" | "buscar" | "super" | "familysearch" | "ajustes";
-export type TreeView = "genograma" | "pedigree" | "abanico" | "lista";
+  | "biblioteca" | "visor" | "buscar" | "super" | "familysearch" | "ajustes"
+  | "lugares" | "historial" | "estadisticas" | "consistencia";
+export type TreeView = "genograma" | "pedigree" | "abanico" | "descendientes" | "lista";
 export type Decision = "yes" | "no" | "skip";
 export type ToastKind = "confirm" | "reject" | "skip" | "addrel" | null;
 export type DiscSource = "sample" | "live";

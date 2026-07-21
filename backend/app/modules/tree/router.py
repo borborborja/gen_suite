@@ -11,10 +11,11 @@ from pydantic import BaseModel
 from ...core.deps import get_current_principal, get_tenant_db, require_roles
 from ...core.security import Principal
 from ...models.membership import MembershipRole
-from . import citations, editing, exporter, kinship, research, service
+from . import citations, editing, exporter, kinship, places, research, service
 from .schemas import (
     CitationIn, CitationOut, CitationPatch, DuplicatePair, FamilyOut, ImportResult,
-    PersonDetail, PersonPage, RelationshipOut, SearchHit, TreeGraph, TreeStats,
+    PersonDetail, PersonPage, PlaceDetail, PlaceEventsPage, PlacePage, PlacePatch,
+    RelationshipOut, SearchHit, TreeGraph, TreeStats,
 )
 
 router = APIRouter(prefix="/tree", tags=["tree"])
@@ -283,6 +284,63 @@ async def relationship(
 ) -> RelationshipOut:
     """Parentesco entre dos personas: etiqueta en español + cadena de pasos (calculadora)."""
     return await kinship.get_relationship(db, a, b)
+
+
+class MergePlaceIn(BaseModel):
+    into_id: uuid.UUID
+
+
+@router.get("/places", response_model=PlacePage)
+async def list_places(
+    q: str | None = Query(None),
+    sort: str = Query("name", pattern="^(name|events)$"),
+    order: str = Query("asc", pattern="^(asc|desc)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> PlacePage:
+    """Directorio de lugares del árbol con nº de eventos, padre y nº de hijos."""
+    return await places.list_places(db, q=q, sort=sort, order=order, page=page, page_size=page_size)
+
+
+@router.get("/places/{place_id}", response_model=PlaceDetail)
+async def place_detail(place_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)) -> PlaceDetail:
+    return await places.get_place(db, place_id)
+
+
+@router.get("/places/{place_id}/events", response_model=PlaceEventsPage)
+async def place_events(
+    place_id: uuid.UUID, page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> PlaceEventsPage:
+    return await places.list_place_events(db, place_id, page=page, page_size=page_size)
+
+
+@router.patch("/places/{place_id}", dependencies=[Depends(require_roles(*_WRITE))])
+async def update_place(
+    place_id: uuid.UUID, body: PlacePatch, db: AsyncSession = Depends(get_tenant_db),
+) -> dict:
+    """Renombrar, tipar, mover en la jerarquía o fijar coordenadas de un lugar."""
+    pl = await places.update_place(db, place_id, name=body.name, place_type=body.place_type,
+                                   parent_id=body.parent_id, clear_parent=body.clear_parent,
+                                   lat=body.lat, lng=body.lng)
+    return {"id": str(pl.id)}
+
+
+@router.post("/places/{place_id}/merge", dependencies=[Depends(require_roles(*_WRITE))])
+async def merge_place(
+    place_id: uuid.UUID, body: MergePlaceIn, db: AsyncSession = Depends(get_tenant_db),
+) -> dict:
+    """Fusiona un lugar duplicado dentro de otro (los eventos e hijos se repuntan)."""
+    pl = await places.merge_place(db, place_id, body.into_id)
+    return {"id": str(pl.id)}
+
+
+@router.post("/places/{place_id}/geocode", dependencies=[Depends(require_roles(*_WRITE))])
+async def geocode_place(place_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)) -> dict:
+    """Geocodifica el lugar usando su jerarquía como contexto (name, padre, país)."""
+    pl = await places.geocode_place(db, place_id)
+    return {"id": str(pl.id), "lat": pl.lat, "lng": pl.lng}
 
 
 @router.get("/persons/search", response_model=list[SearchHit])

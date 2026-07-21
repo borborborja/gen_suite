@@ -179,6 +179,49 @@ export interface RelationshipOut { related: boolean; label: string; path: Kinshi
 export const getRelationship = (a: string, b: string) =>
   api<RelationshipOut>(`/tree/relationship?a=${a}&b=${b}`);
 
+export interface PlaceRef { id: string; name: string; place_type: string | null }
+export interface PlaceRow {
+  id: string;
+  name: string;
+  place_type: string | null;
+  parent_id: string | null;
+  parent_name: string | null;
+  lat: number | null;
+  lng: number | null;
+  event_count: number;
+  children_count: number;
+}
+export interface PlacePage { total: number; items: PlaceRow[] }
+export interface PlaceDetail extends PlaceRow { breadcrumb: PlaceRef[]; children: PlaceRef[] }
+export interface PlaceEventRow {
+  id: string; type: string; date_raw: string | null; date_year: number | null;
+  person_id: string | null; person_name: string | null;
+}
+
+export const listPlaces = (opts: {
+  q?: string; sort?: "name" | "events"; order?: "asc" | "desc"; page?: number; page_size?: number;
+} = {}) => {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(opts)) if (v !== undefined && v !== "") qs.set(k, String(v));
+  return api<PlacePage>(`/tree/places?${qs.toString()}`);
+};
+export const getPlace = (id: string) => api<PlaceDetail>(`/tree/places/${id}`);
+export const listPlaceEvents = (id: string, page = 1) =>
+  api<{ total: number; items: PlaceEventRow[] }>(`/tree/places/${id}/events?page=${page}`);
+export const patchPlace = (id: string, body: {
+  name?: string; place_type?: string; parent_id?: string; clear_parent?: boolean;
+  lat?: number; lng?: number;
+}) => api<{ id: string }>(`/tree/places/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+export const mergePlace = (id: string, intoId: string) =>
+  api<{ id: string }>(`/tree/places/${id}/merge`, { method: "POST", body: JSON.stringify({ into_id: intoId }) });
+export const geocodePlace = (id: string) =>
+  api<{ id: string; lat: number; lng: number }>(`/tree/places/${id}/geocode`, { method: "POST" });
+
+export const PLACE_TYPE_LABEL: Record<string, string> = {
+  country: "País", region: "Región", province: "Provincia",
+  municipality: "Municipio", parish: "Parroquia", other: "Otro",
+};
+
 export const getStats = () => api<TreeStats>("/tree/stats");
 export const getRoots = () => api<SearchHit[]>("/tree/roots?limit=200");
 export const searchPersons = (

@@ -22,6 +22,12 @@ class Place(Base, TimestampMixin):
     normalized_key: Mapped[str] = mapped_column(String(512), nullable=False)
     lat: Mapped[float | None] = mapped_column(Float)
     lng: Mapped[float | None] = mapped_column(Float)
+    # Optional hierarchy (pueblo → provincia → país). Internal to the app: GEDCOM PLAC
+    # keeps exporting the flat name so the round-trip stays stable.
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("places.id", ondelete="SET NULL"), index=True
+    )
+    place_type: Mapped[str | None] = mapped_column(String(24))  # country|region|province|municipality|parish|other
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "normalized_key", name="uq_places_tenant_norm"),

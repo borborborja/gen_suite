@@ -3,7 +3,7 @@ import { useEstela, type Nav } from "./store";
 import { fonts } from "./theme";
 import type { Account } from "./EstelaApp";
 import {
-  HomeIcon, TreeIcon, SparkIcon, BookIcon, SearchIcon, GearIcon, SunIcon, MoonIcon,
+  HomeIcon, TreeIcon, SparkIcon, BookIcon, SearchIcon, GearIcon, SunIcon, MoonIcon, PinIcon,
 } from "./icons";
 import ActivityIndicator from "./ActivityIndicator";
 
@@ -27,6 +27,7 @@ export default function Sidebar({ account }: { account?: Account }) {
     { key: "arbol", label: "Mi árbol", icon: <TreeIcon /> },
     { key: "descubrimientos", label: "Descubrimientos", icon: <SparkIcon /> },
     { key: "biblioteca", label: "Biblioteca", icon: <BookIcon /> },
+    { key: "lugares", label: "Lugares", icon: <PinIcon /> },
     { key: "buscar", label: "Buscar", icon: <SearchIcon /> },
     { key: "super", label: "Superdescubrimiento", icon: <SparkIcon /> },
     { key: "familysearch", label: "FamilySearch", icon: <BookIcon /> },
