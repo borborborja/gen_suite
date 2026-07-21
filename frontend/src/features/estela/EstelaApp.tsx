@@ -13,6 +13,7 @@ import SuperView from "./views/SuperView";
 import FsView from "./views/FsView";
 import AjustesView from "./views/AjustesView";
 import LugaresView from "./views/LugaresView";
+import HistorialView from "./views/HistorialView";
 
 const KEYFRAMES = `
 @keyframes estIn{from{transform:translateY(9px)}to{transform:none}}
@@ -46,6 +47,7 @@ function Shell({ account }: { account?: Account }) {
         {e.nav === "familysearch" && <FsView />}
         {e.nav === "ajustes" && <AjustesView />}
         {e.nav === "lugares" && <LugaresView />}
+        {e.nav === "historial" && <HistorialView />}
       </main>
       <Toast />
       <ZoomModal />

@@ -1,6 +1,7 @@
 """ORM models. Importing this package registers every table on ``Base.metadata``."""
 from ..db.base import Base
 from .api_key import ApiKey
+from .change_log import ChangeLog
 from .citation import Citation
 from .connector import ConnectorCredential
 from .document import Document, Page
@@ -49,4 +50,5 @@ __all__ = [
     "Media",
     "ApiKey",
     "Reconstruction",
+    "ChangeLog",
 ]

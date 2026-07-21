@@ -6,7 +6,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_, select, update
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...models.event import Event
@@ -279,7 +279,7 @@ async def merge_persons(session, tenant_id, keep_id, dup_id) -> Person:
     for ev in (await session.scalars(select(Event).where(Event.subject_person_id == dup_id))).all():
         ev.subject_person_id = keep_id
     for fc in (await session.scalars(select(FamilyChild).where(FamilyChild.person_id == dup_id))).all():
-        exists = await session.scalar(select(FamilyChild.id).where(
+        exists = await session.scalar(select(FamilyChild.family_id).where(
             FamilyChild.family_id == fc.family_id, FamilyChild.person_id == keep_id))
         if exists:
             await session.delete(fc)
@@ -291,11 +291,10 @@ async def merge_persons(session, tenant_id, keep_id, dup_id) -> Person:
             fam.husband_id = keep_id
         if fam.wife_id == dup_id:
             fam.wife_id = keep_id
-    await session.execute(
-        update(Citation).where(
-            Citation.target_type == "person", Citation.target_id == dup_id
-        ).values(target_id=keep_id)
-    )
+    # ORM loop (not a bulk update) so the change-log capture sees every repointed citation
+    for cit in (await session.scalars(select(Citation).where(
+            Citation.target_type == "person", Citation.target_id == dup_id))).all():
+        cit.target_id = keep_id
     if dup.notes:
         keep.notes = ((keep.notes + "\n\n") if keep.notes else "") + dup.notes
     if keep.sex == "U" and dup.sex in ("M", "F"):

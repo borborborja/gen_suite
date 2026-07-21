@@ -11,11 +11,12 @@ from pydantic import BaseModel
 from ...core.deps import get_current_principal, get_tenant_db, require_roles
 from ...core.security import Principal
 from ...models.membership import MembershipRole
-from . import citations, editing, exporter, kinship, places, research, service
+from . import audit, citations, editing, exporter, kinship, places, research, service
+from .audit import audited
 from .schemas import (
-    CitationIn, CitationOut, CitationPatch, DuplicatePair, FamilyOut, ImportResult,
-    PersonDetail, PersonPage, PlaceDetail, PlaceEventsPage, PlacePage, PlacePatch,
-    RelationshipOut, SearchHit, TreeGraph, TreeStats,
+    ChangeDetail, ChangePage, CitationIn, CitationOut, CitationPatch, DuplicatePair,
+    FamilyOut, ImportResult, PersonDetail, PersonPage, PlaceDetail, PlaceEventsPage,
+    PlacePage, PlacePatch, RelationshipOut, SearchHit, TreeGraph, TreeStats,
 )
 
 router = APIRouter(prefix="/tree", tags=["tree"])
@@ -67,7 +68,11 @@ async def create_person(
     body: PersonIn, principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
-    p = await editing.create_person(db, principal.tenant_id, given=body.given, surname=body.surname, sex=body.sex)
+    label = " ".join(x for x in (body.given, body.surname) if x) or "(sin nombre)"
+    async with audited(db, principal, action="person_create", entity_type="person",
+                       summary=f"Creó a {label}"):
+        p = await editing.create_person(db, principal.tenant_id, given=body.given,
+                                        surname=body.surname, sex=body.sex)
     return {"id": str(p.id)}
 
 
@@ -76,9 +81,11 @@ async def update_person(
     person_id: uuid.UUID, body: PersonPatch,
     principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> PersonDetail:
-    await editing.update_person(db, principal.tenant_id, person_id, sex=body.sex, given=body.given,
-                                surname=body.surname, surname_prefix=body.surname_prefix,
-                                nickname=body.nickname, notes=body.notes)
+    async with audited(db, principal, action="person_update", entity_type="person",
+                       entity_id=person_id, summary="Editó la identidad de una persona"):
+        await editing.update_person(db, principal.tenant_id, person_id, sex=body.sex, given=body.given,
+                                    surname=body.surname, surname_prefix=body.surname_prefix,
+                                    nickname=body.nickname, notes=body.notes)
     return await service.get_person_detail(db, person_id)
 
 
@@ -87,8 +94,10 @@ async def add_event(
     person_id: uuid.UUID, body: EventIn,
     principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
-    ev = await editing.add_event(db, principal.tenant_id, person_id, type=body.type, date_raw=body.date_raw,
-                                 place=body.place, place_lat=body.place_lat, place_lng=body.place_lng, value=body.value)
+    async with audited(db, principal, action="event_add", entity_type="person",
+                       entity_id=person_id, summary=f"Añadió un hecho ({body.type})"):
+        ev = await editing.add_event(db, principal.tenant_id, person_id, type=body.type, date_raw=body.date_raw,
+                                     place=body.place, place_lat=body.place_lat, place_lng=body.place_lng, value=body.value)
     return {"id": str(ev.id)}
 
 
@@ -97,15 +106,22 @@ async def edit_event(
     event_id: uuid.UUID, body: EventIn,
     principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
-    ev = await editing.edit_event(db, principal.tenant_id, event_id, type=body.type,
-                                  date_raw=body.date_raw, place=body.place, place_lat=body.place_lat,
-                                  place_lng=body.place_lng, value=body.value)
+    async with audited(db, principal, action="event_edit", entity_type="event",
+                       entity_id=event_id, summary=f"Editó un hecho ({body.type})"):
+        ev = await editing.edit_event(db, principal.tenant_id, event_id, type=body.type,
+                                      date_raw=body.date_raw, place=body.place, place_lat=body.place_lat,
+                                      place_lng=body.place_lng, value=body.value)
     return {"id": str(ev.id)}
 
 
 @router.delete("/events/{event_id}", dependencies=[Depends(require_roles(*_WRITE))])
-async def delete_event(event_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)) -> dict:
-    await editing.delete_event(db, event_id)
+async def delete_event(
+    event_id: uuid.UUID,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
+) -> dict:
+    async with audited(db, principal, action="event_delete", entity_type="event",
+                       entity_id=event_id, summary="Borró un hecho"):
+        await editing.delete_event(db, event_id)
     return {"deleted": str(event_id)}
 
 
@@ -114,11 +130,13 @@ async def add_relative(
     person_id: uuid.UUID, body: RelativeIn,
     principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
-    if body.relative_id:
-        await editing.link_relative(db, principal.tenant_id, person_id, body.relative_id, body.relation)
-        return {"id": str(body.relative_id)}
-    rel = await editing.add_relative(db, principal.tenant_id, person_id, relation=body.relation,
-                                     given=body.given, surname=body.surname, sex=body.sex)
+    async with audited(db, principal, action="relative_add", entity_type="person",
+                       entity_id=person_id, summary=f"Añadió un pariente ({body.relation})"):
+        if body.relative_id:
+            await editing.link_relative(db, principal.tenant_id, person_id, body.relative_id, body.relation)
+            return {"id": str(body.relative_id)}
+        rel = await editing.add_relative(db, principal.tenant_id, person_id, relation=body.relation,
+                                         given=body.given, surname=body.surname, sex=body.sex)
     return {"id": str(rel.id)}
 
 
@@ -136,10 +154,12 @@ async def add_family_event(
     principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
     """Añade un hecho de pareja (matrimonio, divorcio…) sobre la familia, como en GEDCOM."""
-    ev = await editing.add_family_event(db, principal.tenant_id, family_id, type=body.type,
-                                        date_raw=body.date_raw, place=body.place,
-                                        place_lat=body.place_lat, place_lng=body.place_lng,
-                                        value=body.value)
+    async with audited(db, principal, action="family_event_add", entity_type="family",
+                       entity_id=family_id, summary=f"Añadió un hecho de pareja ({body.type})"):
+        ev = await editing.add_family_event(db, principal.tenant_id, family_id, type=body.type,
+                                            date_raw=body.date_raw, place=body.place,
+                                            place_lat=body.place_lat, place_lng=body.place_lng,
+                                            value=body.value)
     return {"id": str(ev.id)}
 
 
@@ -149,24 +169,34 @@ async def create_citation(
     principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
     """Cita manual: vincula una persona o un hecho con un documento/página de la biblioteca."""
-    cit = await citations.create_citation(
-        db, principal.tenant_id, target_type=body.target_type, target_id=body.target_id,
-        document_id=body.document_id, page_no=body.page_no, note=body.note)
+    async with audited(db, principal, action="citation_add", entity_type="citation",
+                       summary="Añadió una fuente"):
+        cit = await citations.create_citation(
+            db, principal.tenant_id, target_type=body.target_type, target_id=body.target_id,
+            document_id=body.document_id, page_no=body.page_no, note=body.note)
     return {"id": str(cit.id)}
 
 
 @router.patch("/citations/{citation_id}", dependencies=[Depends(require_roles(*_WRITE))])
 async def update_citation(
-    citation_id: uuid.UUID, body: CitationPatch, db: AsyncSession = Depends(get_tenant_db),
+    citation_id: uuid.UUID, body: CitationPatch,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
-    cit = await citations.update_citation(db, citation_id, document_id=body.document_id,
-                                          page_no=body.page_no, note=body.note)
+    async with audited(db, principal, action="citation_update", entity_type="citation",
+                       entity_id=citation_id, summary="Editó una fuente"):
+        cit = await citations.update_citation(db, citation_id, document_id=body.document_id,
+                                              page_no=body.page_no, note=body.note)
     return {"id": str(cit.id)}
 
 
 @router.delete("/citations/{citation_id}", dependencies=[Depends(require_roles(*_WRITE))])
-async def delete_citation(citation_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)) -> dict:
-    await citations.delete_citation(db, citation_id)
+async def delete_citation(
+    citation_id: uuid.UUID,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
+) -> dict:
+    async with audited(db, principal, action="citation_delete", entity_type="citation",
+                       entity_id=citation_id, summary="Borró una fuente"):
+        await citations.delete_citation(db, citation_id)
     return {"deleted": str(citation_id)}
 
 
@@ -175,7 +205,9 @@ async def unlink_relative(
     person_id: uuid.UUID, relative_id: uuid.UUID, relation: str = Query(...),
     principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
-    await editing.unlink_relative(db, principal.tenant_id, person_id, relative_id, relation)
+    async with audited(db, principal, action="relative_unlink", entity_type="person",
+                       entity_id=person_id, summary=f"Desvinculó un pariente ({relation})"):
+        await editing.unlink_relative(db, principal.tenant_id, person_id, relative_id, relation)
     return {"unlinked": str(relative_id)}
 
 
@@ -184,7 +216,9 @@ async def delete_person(
     person_id: uuid.UUID,
     principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
-    await editing.delete_person(db, principal.tenant_id, person_id)
+    async with audited(db, principal, action="person_delete", entity_type="person",
+                       entity_id=person_id, summary="Eliminó una persona (con sus nombres, hechos y parentescos)"):
+        await editing.delete_person(db, principal.tenant_id, person_id)
     return {"deleted": str(person_id)}
 
 
@@ -205,7 +239,9 @@ async def merge_persons(
     keep_id: uuid.UUID, body: MergeIn,
     principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> PersonDetail:
-    await editing.merge_persons(db, principal.tenant_id, keep_id, body.dup_id)
+    async with audited(db, principal, action="person_merge", entity_type="person",
+                       entity_id=keep_id, summary="Fusionó dos personas duplicadas"):
+        await editing.merge_persons(db, principal.tenant_id, keep_id, body.dup_id)
     return await service.get_person_detail(db, keep_id)
 
 
@@ -290,6 +326,31 @@ class MergePlaceIn(BaseModel):
     into_id: uuid.UUID
 
 
+@router.get("/changes", response_model=ChangePage)
+async def list_changes(
+    page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> ChangePage:
+    """Historial de cambios del árbol (quién, qué, cuándo)."""
+    return await audit.list_changes(db, page=page, page_size=page_size)
+
+
+@router.get("/changes/{change_id}", response_model=ChangeDetail)
+async def change_detail(change_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)) -> ChangeDetail:
+    """Detalle de un cambio con sus filas antes/después (para pintar el diff)."""
+    return await audit.get_change(db, change_id)
+
+
+@router.post("/changes/{change_id}/revert", dependencies=[Depends(require_roles(*_WRITE))])
+async def revert_change(
+    change_id: uuid.UUID,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
+) -> dict:
+    """Deshace un cambio aplicando su inversa (todo o nada; 409 si los datos ya cambiaron)."""
+    change = await audit.revert_change(db, principal, change_id)
+    return {"reverted": str(change.id)}
+
+
 @router.get("/places", response_model=PlacePage)
 async def list_places(
     q: str | None = Query(None),
@@ -318,28 +379,39 @@ async def place_events(
 
 @router.patch("/places/{place_id}", dependencies=[Depends(require_roles(*_WRITE))])
 async def update_place(
-    place_id: uuid.UUID, body: PlacePatch, db: AsyncSession = Depends(get_tenant_db),
+    place_id: uuid.UUID, body: PlacePatch,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
     """Renombrar, tipar, mover en la jerarquía o fijar coordenadas de un lugar."""
-    pl = await places.update_place(db, place_id, name=body.name, place_type=body.place_type,
-                                   parent_id=body.parent_id, clear_parent=body.clear_parent,
-                                   lat=body.lat, lng=body.lng)
+    async with audited(db, principal, action="place_update", entity_type="place",
+                       entity_id=place_id, summary="Editó un lugar"):
+        pl = await places.update_place(db, place_id, name=body.name, place_type=body.place_type,
+                                       parent_id=body.parent_id, clear_parent=body.clear_parent,
+                                       lat=body.lat, lng=body.lng)
     return {"id": str(pl.id)}
 
 
 @router.post("/places/{place_id}/merge", dependencies=[Depends(require_roles(*_WRITE))])
 async def merge_place(
-    place_id: uuid.UUID, body: MergePlaceIn, db: AsyncSession = Depends(get_tenant_db),
+    place_id: uuid.UUID, body: MergePlaceIn,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
     """Fusiona un lugar duplicado dentro de otro (los eventos e hijos se repuntan)."""
-    pl = await places.merge_place(db, place_id, body.into_id)
+    async with audited(db, principal, action="place_merge", entity_type="place",
+                       entity_id=body.into_id, summary="Fusionó dos lugares"):
+        pl = await places.merge_place(db, place_id, body.into_id)
     return {"id": str(pl.id)}
 
 
 @router.post("/places/{place_id}/geocode", dependencies=[Depends(require_roles(*_WRITE))])
-async def geocode_place(place_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)) -> dict:
+async def geocode_place(
+    place_id: uuid.UUID,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
+) -> dict:
     """Geocodifica el lugar usando su jerarquía como contexto (name, padre, país)."""
-    pl = await places.geocode_place(db, place_id)
+    async with audited(db, principal, action="place_geocode", entity_type="place",
+                       entity_id=place_id, summary="Geocodificó un lugar"):
+        pl = await places.geocode_place(db, place_id)
     return {"id": str(pl.id), "lat": pl.lat, "lng": pl.lng}
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import uuid
 
 from pydantic import BaseModel
@@ -165,6 +166,28 @@ class PlaceEventRow(BaseModel):
 class PlaceEventsPage(BaseModel):
     total: int
     items: list[PlaceEventRow]
+
+
+class ChangeItem(BaseModel):
+    id: uuid.UUID
+    action: str
+    entity_type: str | None
+    entity_id: uuid.UUID | None
+    summary: str | None
+    actor_email: str | None
+    created_at: datetime.datetime
+    reverted_at: datetime.datetime | None
+    revert_of: uuid.UUID | None
+    rows_count: int
+
+
+class ChangePage(BaseModel):
+    total: int
+    items: list[ChangeItem]
+
+
+class ChangeDetail(ChangeItem):
+    rows: list[dict]  # [{table, pk, before, after}]
 
 
 class TreeStats(BaseModel):

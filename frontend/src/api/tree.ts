@@ -217,6 +217,27 @@ export const mergePlace = (id: string, intoId: string) =>
 export const geocodePlace = (id: string) =>
   api<{ id: string; lat: number; lng: number }>(`/tree/places/${id}/geocode`, { method: "POST" });
 
+export interface ChangeItem {
+  id: string;
+  action: string;
+  entity_type: string | null;
+  entity_id: string | null;
+  summary: string | null;
+  actor_email: string | null;
+  created_at: string;
+  reverted_at: string | null;
+  revert_of: string | null;
+  rows_count: number;
+}
+export interface ChangeRowImage { table: string; pk: Record<string, unknown>; before: Record<string, unknown> | null; after: Record<string, unknown> | null }
+export interface ChangeDetail extends ChangeItem { rows: ChangeRowImage[] }
+
+export const listChanges = (page = 1, pageSize = 50) =>
+  api<{ total: number; items: ChangeItem[] }>(`/tree/changes?page=${page}&page_size=${pageSize}`);
+export const getChange = (id: string) => api<ChangeDetail>(`/tree/changes/${id}`);
+export const revertChange = (id: string) =>
+  api<{ reverted: string }>(`/tree/changes/${id}/revert`, { method: "POST" });
+
 export const PLACE_TYPE_LABEL: Record<string, string> = {
   country: "País", region: "Región", province: "Provincia",
   municipality: "Municipio", parish: "Parroquia", other: "Otro",
