@@ -5,10 +5,11 @@ import { useEstela, avatar, type TreeView } from "../store";
 import { fonts } from "../theme";
 import {
   getStats, getRoots, getSubtree, searchPersons, importGedcom, downloadGedcom, getPerson,
-  listDuplicates, mergePersons, getHome, setHome,
+  listDuplicates, mergePersons, getHome, setHome, createPerson, listPersons,
   displayName, lifespan, type TreeStats, type SearchHit, type TreeGraph, type DuplicatePair,
-  type PersonDetail,
+  type PersonDetail, type PersonPage,
 } from "../../../api/tree";
+import { AddRelativeDialog, RelationshipDialog } from "../TreeDialogs";
 import { computeLayout, NODE_W, NODE_H, type PositionedPerson } from "../../tree/layout";
 import { computePedigree } from "../../tree/pedigree";
 import { computeFan, arcPath } from "../../tree/fan";
@@ -33,6 +34,9 @@ export default function ArbolView() {
   const [graph, setGraph] = useState<TreeGraph | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [showDupes, setShowDupes] = useState(false);
+  const [showKinship, setShowKinship] = useState(false);
+  const [addRel, setAddRel] = useState<{ id: string; name: string } | null>(null);
+  const [refresh, setRefresh] = useState(0);
 
   const load = useCallback(async () => {
     try {
@@ -54,7 +58,14 @@ export default function ArbolView() {
   useEffect(() => {
     if (!focus) return;
     void getSubtree(focus, depth).then(setGraph).catch(() => setGraph(null));
-  }, [focus, depth]);
+  }, [focus, depth, refresh]);
+
+  const focusHit: SearchHit | null = (() => {
+    const p = graph?.persons.find((x) => x.id === graph.focus);
+    return p ? { id: p.id, given: p.given, surname: p.surname, birth_year: p.birth_year, death_year: p.death_year } : null;
+  })();
+  const openAddRelative = (p: { id: string; given: string | null; surname: string | null }) =>
+    setAddRel({ id: p.id, name: displayName(p) });
 
   const empty = loaded && (stats?.persons ?? 0) === 0;
 
@@ -76,6 +87,7 @@ export default function ArbolView() {
               ))}
             </div>
             {home && home !== focus && <button onClick={() => setFocus(home)} title="Volver a la persona principal" style={ghostBtn}>⌂ Inicio</button>}
+            <button onClick={() => setShowKinship(true)} title="¿Qué parentesco tienen dos personas?" style={ghostBtn}>Parentesco</button>
             <button onClick={() => setShowDupes(true)} style={ghostBtn}>Fusionar duplicados</button>
             <button
               onClick={() => downloadGedcom().catch((err) => e.notify(`No se pudo exportar: ${(err as Error).message}`, "var(--danger)"))}
@@ -87,8 +99,15 @@ export default function ArbolView() {
       </div>
 
       {showDupes && <DuplicatesPanel onClose={() => setShowDupes(false)} onMerged={load} />}
+      {showKinship && <RelationshipDialog initialA={focusHit} onClose={() => setShowKinship(false)} />}
+      {addRel && (
+        <AddRelativeDialog
+          personId={addRel.id} personName={addRel.name}
+          onClose={() => setAddRel(null)} onDone={() => setRefresh((n) => n + 1)}
+        />
+      )}
 
-      {empty ? <EmptyTree onImported={load} onSuper={() => e.go("super")} /> : (
+      {empty ? <EmptyTree onImported={load} onCreated={(id) => { setFocus(id); void load(); }} onSuper={() => e.go("super")} /> : (
         <>
           <div style={{ display: "flex", gap: 18, alignItems: "center", marginBottom: 14, fontSize: 12.5, color: "var(--muted)" }}>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 7 }}><span style={{ width: 12, height: 12, borderRadius: 3, background: "var(--ok)" }} />Confirmado</span>
@@ -97,11 +116,11 @@ export default function ArbolView() {
 
           {e.treeView === "lista" ? <PeopleList /> : (
             <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 18, alignItems: "start" }}>
-              {focus && <FocusCard personId={focus} isHome={home === focus} onHome={() => makeHome(focus)} />}
+              {focus && <FocusCard personId={focus} isHome={home === focus} onHome={() => makeHome(focus)} onAddRelative={(name) => setAddRel({ id: focus, name })} />}
               {graph ? (
                 e.treeView === "pedigree" ? <PedigreeCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} />
                 : e.treeView === "abanico" ? <FanCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} />
-                : <GraphCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} />
+                : <GraphCanvas graph={graph} depth={depth} setDepth={setDepth} onRecenter={setFocus} onAddRelative={openAddRelative} />
               ) : <div style={{ color: "var(--muted)", padding: 40 }}>Cargando árbol…</div>}
             </div>
           )}
@@ -173,7 +192,7 @@ function DuplicatesPanel({ onClose, onMerged }: { onClose: () => void; onMerged:
 
 const dupBtn: React.CSSProperties = { background: "var(--accent)", color: "#fff", border: "none", borderRadius: 8, padding: "8px 13px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" };
 
-function GraphCanvas({ graph, depth, setDepth, onRecenter }: { graph: TreeGraph; depth: number; setDepth: (d: number) => void; onRecenter: (id: string) => void }) {
+function GraphCanvas({ graph, depth, setDepth, onRecenter, onAddRelative }: { graph: TreeGraph; depth: number; setDepth: (d: number) => void; onRecenter: (id: string) => void; onAddRelative: (p: PositionedPerson) => void }) {
   const e = useEstela();
   const layout = computeLayout(graph);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -225,6 +244,7 @@ function GraphCanvas({ graph, depth, setDepth, onRecenter }: { graph: TreeGraph;
                   <div style={{ fontSize: 13, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{displayName(n)}</div>
                   <div style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>{lifespan(n)}</div>
                 </div>
+                <span onClick={(ev) => { ev.stopPropagation(); onAddRelative(n); }} title="Añadir familiar" style={{ flex: "none", color: "var(--muted)", fontSize: 14, lineHeight: 1, padding: "0 2px" }}>＋</span>
                 {sel && <span onClick={(ev) => { ev.stopPropagation(); e.openPerson(n.id); }} title="Abrir ficha" style={{ flex: "none", color: "var(--accent)", fontSize: 13, padding: "0 2px" }}>↗</span>}
               </div>
             );
@@ -283,7 +303,7 @@ function TreeSearch({ onPick }: { onPick: (id: string) => void }) {
 }
 
 // ── focus person card (left panel) ──
-function FocusCard({ personId, isHome, onHome }: { personId: string; isHome: boolean; onHome: () => void }) {
+function FocusCard({ personId, isHome, onHome, onAddRelative }: { personId: string; isHome: boolean; onHome: () => void; onAddRelative: (name: string) => void }) {
   const e = useEstela();
   const [p, setP] = useState<PersonDetail | null>(null);
   useEffect(() => { setP(null); getPerson(personId).then(setP).catch(() => setP(null)); }, [personId]);
@@ -303,6 +323,7 @@ function FocusCard({ personId, isHome, onHome }: { personId: string; isHome: boo
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 7, marginTop: 16 }}>
         <button onClick={() => e.openPerson(personId)} style={{ ...ghostBtn, width: "100%", textAlign: "center", background: "var(--accent)", color: "#fff", border: "none" }}>Abrir ficha</button>
+        <button onClick={() => onAddRelative(name)} style={{ ...ghostBtn, width: "100%" }}>＋ Añadir familiar</button>
         {!isHome && <button onClick={onHome} style={{ ...ghostBtn, width: "100%" }}>★ Fijar como principal</button>}
         <button onClick={() => { import("../../../api/linkage").then(({ discover }) => discover(personId).catch(() => undefined)); e.notify("Buscando registros…"); e.go("descubrimientos"); }} style={{ ...ghostBtn, width: "100%" }}>Buscar registros</button>
         <button onClick={() => { import("../../../api/linkage").then(({ discoverFamily }) => discoverFamily(personId).catch(() => undefined)); e.notify("Buscando hermanos y padres…"); e.go("descubrimientos"); }} style={{ ...ghostBtn, width: "100%" }} title="Busca otras partidas con los mismos padres → hermanos y confirma a los padres">Descubrir familia (hermanos)</button>
@@ -405,41 +426,97 @@ function FanCanvas({ graph, depth, setDepth, onRecenter }: { graph: TreeGraph; d
   );
 }
 
+const PAGE_SIZE = 50;
+type SortKey = "name" | "birth" | "death";
+
 function PeopleList() {
   const e = useEstela();
   const [q, setQ] = useState("");
-  const people = useDebouncedSearch(
-    q, (v) => (v.trim() ? searchPersons(v) : getRoots()), { delay: 250, minLength: 0 });
+  const [sort, setSort] = useState<SortKey>("name");
+  const [order, setOrder] = useState<"asc" | "desc">("asc");
+  const [page, setPage] = useState(1);
+  const [data, setData] = useState<PersonPage | null>(null);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      listPersons({ q: q.trim() || undefined, sort, order, page, page_size: PAGE_SIZE })
+        .then(setData).catch(() => setData({ total: 0, items: [] }));
+    }, q ? 250 : 0);
+    return () => clearTimeout(t);
+  }, [q, sort, order, page]);
+
+  const pages = Math.max(1, Math.ceil((data?.total ?? 0) / PAGE_SIZE));
+  const toggleSort = (k: SortKey) => {
+    setPage(1);
+    if (sort === k) setOrder((o) => (o === "asc" ? "desc" : "asc"));
+    else { setSort(k); setOrder("asc"); }
+  };
+  const arrow = (k: SortKey) => (sort === k ? (order === "asc" ? " ↑" : " ↓") : "");
+  const th: React.CSSProperties = { textAlign: "left", padding: "11px 14px", fontSize: 11.5, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: ".05em", cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" };
+  const td: React.CSSProperties = { padding: "11px 14px", fontSize: 13.5, borderTop: "1px solid var(--line2)" };
+
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "11px 16px", marginBottom: 18, maxWidth: 420 }}>
-        <svg width={17} height={17} viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth={1.8}><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
-        <input value={q} onChange={(ev) => setQ(ev.target.value)} placeholder="Buscar por nombre o apellido…" style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "var(--fg)", fontFamily: "inherit", fontSize: 14 }} />
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "11px 16px", flex: "1 1 280px", maxWidth: 420 }}>
+          <svg width={17} height={17} viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth={1.8}><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
+          <input value={q} onChange={(ev) => { setQ(ev.target.value); setPage(1); }} placeholder="Buscar por nombre o apellido…" style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "var(--fg)", fontFamily: "inherit", fontSize: 14 }} />
+        </div>
+        {data && <span style={{ fontFamily: fonts.mono, fontSize: 12, color: "var(--muted)" }}>{data.total.toLocaleString()} personas</span>}
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(248px,1fr))", gap: 14 }}>
-        {people.map((p) => {
-          const av = avatar("confirmed");
-          return (
-            <div key={p.id} onClick={() => e.openPerson(p.id)} style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 13, padding: 16, cursor: "pointer" }}>
-              <div style={{ display: "flex", gap: 13, alignItems: "center" }}>
-                <div style={{ width: 44, height: 44, borderRadius: 11, flex: "none", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: fonts.serif, fontWeight: 600, fontSize: 18, background: av.bg, color: av.fg }}>{initials(p.given, p.surname)}</div>
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ fontWeight: 600, fontSize: 14.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{displayName(p)}</div>
-                  <div style={{ fontFamily: fonts.mono, fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{lifespan(p)}</div>
-                </div>
-              </div>
-            </div>
-          );
-        })}
-        {people.length === 0 && <div style={{ color: "var(--muted)", fontSize: 13.5 }}>Sin resultados.</div>}
+
+      <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 13, overflow: "hidden" }}>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr>
+                <th style={th} onClick={() => toggleSort("name")}>Nombre{arrow("name")}</th>
+                <th style={th} onClick={() => toggleSort("birth")}>Nacimiento{arrow("birth")}</th>
+                <th style={th} onClick={() => toggleSort("death")}>Defunción{arrow("death")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data?.items.map((p) => {
+                const av = avatar("confirmed");
+                return (
+                  <tr key={p.id} onClick={() => e.openPerson(p.id)} style={{ cursor: "pointer" }}>
+                    <td style={td}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 11 }}>
+                        <div style={{ width: 32, height: 32, borderRadius: 8, flex: "none", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: fonts.serif, fontWeight: 600, fontSize: 13, background: av.bg, color: av.fg }}>{initials(p.given, p.surname)}</div>
+                        <span style={{ fontWeight: 600 }}>{displayName(p)}</span>
+                        {p.sex !== "U" && <span style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>{p.sex === "M" ? "♂" : "♀"}</span>}
+                      </div>
+                    </td>
+                    <td style={{ ...td, fontFamily: fonts.mono, fontSize: 12.5, color: "var(--muted)" }}>{p.birth_year ?? "—"}</td>
+                    <td style={{ ...td, fontFamily: fonts.mono, fontSize: 12.5, color: "var(--muted)" }}>{p.death_year ?? "—"}</td>
+                  </tr>
+                );
+              })}
+              {data && data.items.length === 0 && (
+                <tr><td style={{ ...td, color: "var(--muted)" }} colSpan={3}>Sin resultados.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        {pages > 1 && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 10, padding: "10px 14px", borderTop: "1px solid var(--line2)" }}>
+            <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1} style={{ ...miniBtn, opacity: page <= 1 ? 0.4 : 1 }}>‹</button>
+            <span style={{ fontFamily: fonts.mono, fontSize: 12, color: "var(--muted)" }}>{page} / {pages}</span>
+            <button onClick={() => setPage((p) => Math.min(pages, p + 1))} disabled={page >= pages} style={{ ...miniBtn, opacity: page >= pages ? 0.4 : 1 }}>›</button>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-function EmptyTree({ onImported, onSuper }: { onImported: () => void; onSuper?: () => void }) {
+function EmptyTree({ onImported, onCreated, onSuper }: { onImported: () => void; onCreated: (id: string) => void; onSuper?: () => void }) {
   const est = useEstela();
   const [busy, setBusy] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [given, setGiven] = useState("");
+  const [surname, setSurname] = useState("");
+  const [sex, setSex] = useState("U");
   const ref = useRef<HTMLInputElement>(null);
   async function onFile(ev: React.ChangeEvent<HTMLInputElement>) {
     const f = ev.target.files?.[0];
@@ -448,21 +525,52 @@ function EmptyTree({ onImported, onSuper }: { onImported: () => void; onSuper?: 
     try { await importGedcom(f); onImported(); } catch (e) { est.notify((e as Error).message, "var(--danger)"); }
     setBusy(false);
   }
+  async function createFirst() {
+    if (!given.trim() && !surname.trim()) return;
+    setBusy(true);
+    try {
+      const { id } = await createPerson({ given: given.trim() || undefined, surname: surname.trim() || undefined, sex });
+      await setHome(id).catch(() => undefined);
+      est.notify("Primera persona creada — ve añadiendo familiares desde el árbol", "var(--ok)");
+      onCreated(id);
+    } catch (e) { est.notify((e as Error).message, "var(--danger)"); }
+    setBusy(false);
+  }
+  const fld: React.CSSProperties = { background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 8, padding: "10px 12px", color: "var(--fg)", fontFamily: "inherit", fontSize: 14, boxSizing: "border-box" };
   return (
     <div style={{ textAlign: "center", padding: "60px 20px", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16 }}>
       <h2 style={{ fontFamily: fonts.serif, fontSize: 26, fontWeight: 600, margin: "0 0 10px" }}>Tu árbol está vacío</h2>
-      <p style={{ color: "var(--muted)", fontSize: 14.5, margin: "0 0 22px" }}>Importa un GEDCOM para empezar — Estela buscará parientes en tus libros.</p>
+      <p style={{ color: "var(--muted)", fontSize: 14.5, margin: "0 0 22px" }}>Importa un GEDCOM, o empieza de cero creando a la primera persona (tú, o el antepasado que investigas).</p>
       <input ref={ref} type="file" accept=".ged,.gedcom" onChange={onFile} style={{ display: "none" }} />
-      <div style={{ display: "inline-flex", gap: 10, flexWrap: "wrap", justifyContent: "center" }}>
-        <button onClick={() => ref.current?.click()} disabled={busy} style={{ background: "var(--accent)", color: "#fff", border: "none", borderRadius: 9, padding: "13px 22px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1 }}>
-          {busy ? "Importando…" : "Importar árbol (GEDCOM)"}
-        </button>
-        {onSuper && (
-          <button onClick={onSuper} style={{ background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 9, padding: "13px 22px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>
-            Reconstruir desde mis libros
+      {creating ? (
+        <div style={{ display: "inline-flex", flexDirection: "column", gap: 10, width: "100%", maxWidth: 340, textAlign: "left" }}>
+          <input style={fld} value={given} onChange={(ev) => setGiven(ev.target.value)} placeholder="Nombre" autoFocus />
+          <input style={fld} value={surname} onChange={(ev) => setSurname(ev.target.value)} placeholder="Apellidos" />
+          <select style={fld} value={sex} onChange={(ev) => setSex(ev.target.value)}>
+            <option value="U">Sexo —</option><option value="M">Hombre</option><option value="F">Mujer</option>
+          </select>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={createFirst} disabled={busy || (!given.trim() && !surname.trim())} style={{ flex: 1, background: "var(--accent)", color: "#fff", border: "none", borderRadius: 9, padding: "12px 18px", fontFamily: "inherit", fontSize: 14.5, fontWeight: 600, cursor: "pointer", opacity: busy || (!given.trim() && !surname.trim()) ? 0.55 : 1 }}>
+              {busy ? "Creando…" : "Crear y empezar el árbol"}
+            </button>
+            <button onClick={() => setCreating(false)} style={{ background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 9, padding: "12px 16px", fontFamily: "inherit", fontSize: 14, cursor: "pointer" }}>Cancelar</button>
+          </div>
+        </div>
+      ) : (
+        <div style={{ display: "inline-flex", gap: 10, flexWrap: "wrap", justifyContent: "center" }}>
+          <button onClick={() => setCreating(true)} style={{ background: "var(--accent)", color: "#fff", border: "none", borderRadius: 9, padding: "13px 22px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>
+            Crear la primera persona
           </button>
-        )}
-      </div>
+          <button onClick={() => ref.current?.click()} disabled={busy} style={{ background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 9, padding: "13px 22px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1 }}>
+            {busy ? "Importando…" : "Importar árbol (GEDCOM)"}
+          </button>
+          {onSuper && (
+            <button onClick={onSuper} style={{ background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 9, padding: "13px 22px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>
+              Reconstruir desde mis libros
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

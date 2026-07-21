@@ -26,6 +26,8 @@ from .schemas import (
     ImportResult,
     NameOut,
     PersonDetail,
+    PersonPage,
+    PersonRow,
     RelatedPerson,
     SearchHit,
     TreeFamily,
@@ -494,6 +496,59 @@ async def search_persons(
         )
         for pid, given, surname in rows
     ]
+
+
+async def list_persons(
+    session: AsyncSession, *, q: str | None = None, surname: str | None = None,
+    sort: str = "name", order: str = "asc", page: int = 1, page_size: int = 50,
+) -> PersonPage:
+    """Paginated, sortable person directory for the tree's list view."""
+    birth_sq = (
+        select(func.min(Event.date_year))
+        .where(Event.subject_person_id == Person.id, Event.type == "birth")
+        .correlate(Person).scalar_subquery()
+    )
+    death_sq = (
+        select(func.min(Event.date_year))
+        .where(Event.subject_person_id == Person.id, Event.type == "death")
+        .correlate(Person).scalar_subquery()
+    )
+    stmt = (
+        select(Person.id, Name.given, Name.surname, Person.sex,
+               birth_sq.label("birth_year"), death_sq.label("death_year"))
+        .outerjoin(Name, (Name.person_id == Person.id) & Name.is_primary.is_(True))
+    )
+    count_stmt = (
+        select(func.count()).select_from(Person)
+        .outerjoin(Name, (Name.person_id == Person.id) & Name.is_primary.is_(True))
+    )
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        cond = or_(Name.given.ilike(like), Name.surname.ilike(like))
+        stmt, count_stmt = stmt.where(cond), count_stmt.where(cond)
+    if surname and surname.strip():
+        cond = Name.surname.ilike(f"%{surname.strip()}%")
+        stmt, count_stmt = stmt.where(cond), count_stmt.where(cond)
+
+    sub = stmt.subquery()
+    sort_cols = {
+        "name": (sub.c.surname, sub.c.given),
+        "birth": (sub.c.birth_year,),
+        "death": (sub.c.death_year,),
+    }.get(sort, (sub.c.surname, sub.c.given))
+    ordered = [c.desc().nulls_last() if order == "desc" else c.asc().nulls_last()
+               for c in sort_cols]
+    rows = (
+        await session.execute(
+            select(sub).order_by(*ordered).limit(page_size).offset((page - 1) * page_size)
+        )
+    ).all()
+    total = await session.scalar(count_stmt) or 0
+    return PersonPage(
+        total=total,
+        items=[PersonRow(id=pid, given=g, surname=s, sex=sex, birth_year=by, death_year=dy)
+               for pid, g, s, sex, by, dy in rows],
+    )
 
 
 async def get_roots(session: AsyncSession, limit: int = 100) -> list[SearchHit]:

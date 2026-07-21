@@ -97,6 +97,31 @@ class TreeStats(BaseModel):
     places: int
 
 
+class PersonRow(BaseModel):
+    id: uuid.UUID
+    given: str | None
+    surname: str | None
+    sex: str
+    birth_year: int | None
+    death_year: int | None
+
+
+class PersonPage(BaseModel):
+    total: int
+    items: list[PersonRow]
+
+
+class KinshipStep(BaseModel):
+    person: SearchHit
+    step: str | None = None  # e.g. "madre", "hijo", "esposa" — None on the first node
+
+
+class RelationshipOut(BaseModel):
+    related: bool
+    label: str  # what B is of A, in Spanish ("prima segunda", "suegro"…)
+    path: list[KinshipStep]
+
+
 class DuplicatePair(BaseModel):
     a: SearchHit
     b: SearchHit

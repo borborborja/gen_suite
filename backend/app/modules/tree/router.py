@@ -11,9 +11,10 @@ from pydantic import BaseModel
 from ...core.deps import get_current_principal, get_tenant_db, require_roles
 from ...core.security import Principal
 from ...models.membership import MembershipRole
-from . import editing, exporter, research, service
+from . import editing, exporter, kinship, research, service
 from .schemas import (
-    CitationOut, DuplicatePair, ImportResult, PersonDetail, SearchHit, TreeGraph, TreeStats,
+    CitationOut, DuplicatePair, ImportResult, PersonDetail, PersonPage, RelationshipOut,
+    SearchHit, TreeGraph, TreeStats,
 )
 
 router = APIRouter(prefix="/tree", tags=["tree"])
@@ -209,6 +210,30 @@ async def set_home(
 @router.get("/stats", response_model=TreeStats)
 async def stats(db: AsyncSession = Depends(get_tenant_db)) -> TreeStats:
     return await service.get_stats(db)
+
+
+@router.get("/persons", response_model=PersonPage)
+async def list_persons(
+    q: str | None = Query(None),
+    surname: str | None = Query(None),
+    sort: str = Query("name", pattern="^(name|birth|death)$"),
+    order: str = Query("asc", pattern="^(asc|desc)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> PersonPage:
+    """Directorio de personas del árbol: paginado, ordenable y filtrable (vista Lista)."""
+    return await service.list_persons(
+        db, q=q, surname=surname, sort=sort, order=order, page=page, page_size=page_size)
+
+
+@router.get("/relationship", response_model=RelationshipOut)
+async def relationship(
+    a: uuid.UUID = Query(...), b: uuid.UUID = Query(...),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> RelationshipOut:
+    """Parentesco entre dos personas: etiqueta en español + cadena de pasos (calculadora)."""
+    return await kinship.get_relationship(db, a, b)
 
 
 @router.get("/persons/search", response_model=list[SearchHit])

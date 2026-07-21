@@ -132,6 +132,32 @@ export const getHome = () => api<{ person_id: string | null }>("/tree/home");
 export const setHome = (person_id: string) =>
   api<{ person_id: string | null }>("/tree/home", { method: "PUT", body: JSON.stringify({ person_id }) });
 
+export const createPerson = (body: { given?: string; surname?: string; sex?: string }) =>
+  api<{ id: string }>("/tree/persons", { method: "POST", body: JSON.stringify(body) });
+
+export interface PersonRow {
+  id: string;
+  given: string | null;
+  surname: string | null;
+  sex: string;
+  birth_year: number | null;
+  death_year: number | null;
+}
+export interface PersonPage { total: number; items: PersonRow[] }
+export const listPersons = (opts: {
+  q?: string; surname?: string; sort?: "name" | "birth" | "death";
+  order?: "asc" | "desc"; page?: number; page_size?: number;
+} = {}) => {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(opts)) if (v !== undefined && v !== "") qs.set(k, String(v));
+  return api<PersonPage>(`/tree/persons?${qs.toString()}`);
+};
+
+export interface KinshipStep { person: SearchHit; step: string | null }
+export interface RelationshipOut { related: boolean; label: string; path: KinshipStep[] }
+export const getRelationship = (a: string, b: string) =>
+  api<RelationshipOut>(`/tree/relationship?a=${a}&b=${b}`);
+
 export const getStats = () => api<TreeStats>("/tree/stats");
 export const getRoots = () => api<SearchHit[]>("/tree/roots?limit=200");
 export const searchPersons = (

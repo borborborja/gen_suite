@@ -11,6 +11,7 @@ import LifeMap, { type MapPoint } from "../LifeMap";
 import { geoSearch } from "../../../api/geo";
 import { listMedia, uploadMedia, updateMedia, deleteMedia, mediaObjectUrl, type MediaItem } from "../../../api/media";
 import { useConfirm, useDebouncedSearch } from "../ui";
+import { AddRelativeDialog } from "../TreeDialogs";
 
 function fsUrl(s: ResearchGap["search"]): string {
   const p = new URLSearchParams();
@@ -49,6 +50,7 @@ export default function PersonaView() {
   const [media, setMedia] = useState<MediaItem[]>([]);
   const [urls, setUrls] = useState<Record<string, string>>({});
   const [lightbox, setLightbox] = useState<string | null>(null);
+  const [addRel, setAddRel] = useState(false);
   const { confirmDialog, ask } = useConfirm();
 
   // Blob object-URLs must be revoked when replaced (person change, reload) or on unmount,
@@ -216,7 +218,10 @@ export default function PersonaView() {
           </div>
         </div>
         <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 14, padding: 24 }}>
-          <h3 style={{ margin: "0 0 16px", fontSize: 16, fontWeight: 600 }}>Familia</h3>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Familia</h3>
+            <button onClick={() => setAddRel(true)} style={{ background: "transparent", color: "var(--accent)", border: "1px solid var(--line)", borderRadius: 8, padding: "6px 12px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>＋ Añadir</button>
+          </div>
           {family.length === 0 && <p style={{ color: "var(--muted)", fontSize: 13.5 }}>Sin familiares registrados.</p>}
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {family.map((fm) => (
@@ -338,6 +343,10 @@ export default function PersonaView() {
             ))}
           </div>
         </div>
+      )}
+
+      {addRel && (
+        <AddRelativeDialog personId={p.id} personName={name} onClose={() => setAddRel(false)} onDone={reload} />
       )}
 
       {lightbox && (
