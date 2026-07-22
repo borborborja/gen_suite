@@ -1,0 +1,115 @@
+name: gen_suite
+
+# Despliegue desde las imágenes publicadas en GHCR (sin build, no necesita el repo):
+#   1) copia este fichero + config/.env (desde config/.env.example) al servidor
+#   2) docker compose -f compose.release.yaml --env-file config/.env up -d
+# Versión: fija GEN_SUITE_VERSION en config/.env (p.ej. 0.1.0); por defecto latest.
+# El resto de convenciones es idéntico a compose.yaml (datos en ./data, MinIO bundled
+# con COMPOSE_PROFILES=bundled-storage, frontend en :8080).
+#
+# OJO con YAML: "yes"/"no" y valores como el puerto van SIEMPRE entre comillas —
+# sin ellas YAML los convierte a booleanos y compose rechaza el fichero.
+
+services:
+  gen-suite-db:
+    image: pgvector/pgvector:pg16
+    container_name: gen-suite-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  gen-suite-redis:
+    image: redis:7-alpine
+    container_name: gen-suite-redis
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    volumes:
+      - ${DATA_DIR:-./data}/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  gen-suite-minio:
+    image: minio/minio:latest
+    container_name: gen-suite-minio
+    profiles: ["bundled-storage"]
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${DATA_DIR:-./data}/minio:/data
+    ports:
+      - "127.0.0.1:9001:9001"
+    restart: unless-stopped
+
+  gen-suite-migrate:
+    image: ghcr.io/borborborja/gen-suite-backend:${GEN_SUITE_VERSION:-latest}
+    container_name: gen-suite-migrate
+    command: ["alembic", "upgrade", "head"]
+    env_file: [config/.env]
+    environment:
+      POSTGRES_HOST: gen-suite-db
+    depends_on:
+      gen-suite-db: { condition: service_healthy }
+    restart: "no"
+
+  gen-suite-backend:
+    image: ghcr.io/borborborja/gen-suite-backend:${GEN_SUITE_VERSION:-latest}
+    container_name: gen-suite-backend
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: [config/.env]
+    environment:
+      POSTGRES_HOST: gen-suite-db
+      REDIS_URL: redis://:${REDIS_PASSWORD}@gen-suite-redis:6379/0
+    volumes:
+      - ${CONFIG_DIR:-./config}:/config:ro
+    depends_on:
+      gen-suite-db: { condition: service_healthy }
+      gen-suite-redis: { condition: service_healthy }
+      gen-suite-migrate: { condition: service_completed_successfully }
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  gen-suite-worker:
+    image: ghcr.io/borborborja/gen-suite-backend:${GEN_SUITE_VERSION:-latest}
+    container_name: gen-suite-worker
+    command: ["arq", "app.tasks.worker.WorkerSettings"]
+    env_file: [config/.env]
+    environment:
+      POSTGRES_HOST: gen-suite-db
+      REDIS_URL: redis://:${REDIS_PASSWORD}@gen-suite-redis:6379/0
+    volumes:
+      - ${CONFIG_DIR:-./config}:/config:ro
+    depends_on:
+      gen-suite-redis: { condition: service_healthy }
+      gen-suite-migrate: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  gen-suite-frontend:
+    image: ghcr.io/borborborja/gen-suite-frontend:${GEN_SUITE_VERSION:-latest}
+    container_name: gen-suite-frontend
+    depends_on:
+      gen-suite-backend: { condition: service_healthy }
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    restart: unless-stopped

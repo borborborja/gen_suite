@@ -29,7 +29,10 @@ docker compose --env-file config/.env up -d --build
 - API + Swagger: `http://localhost:8000/docs`  (solo localhost)
 - MinIO consola: `http://localhost:9001`  (solo localhost; no la publiques)
 
-`compose.yaml` es **portable** y multi-arquitectura (amd64/arm64 — ver `DEPLOY.md`). **Toda la config vive
+`compose.yaml` es **portable** y multi-arquitectura (amd64/arm64 — ver `DEPLOY.md`). Para desplegar
+**sin construir**, usando las imágenes publicadas en GHCR por cada release:
+`docker compose -f compose.release.yaml --env-file config/.env up -d` (fija la versión con
+`GEN_SUITE_VERSION` en `config/.env`; por defecto `latest`). **Toda la config vive
 en `./config`** (`config/.env`) y **todos los datos en `./data`** (Postgres/Redis/MinIO; cambia con
 `DATA_DIR`) — host-mapeados, visibles y respaldables. El servicio `gen-suite-migrate` aplica
 `alembic upgrade head` antes de arrancar. El **primer usuario registrado** queda como `server-admin`
