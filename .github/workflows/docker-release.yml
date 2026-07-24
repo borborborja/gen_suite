@@ -5,6 +5,11 @@ name: docker-release
 on:
   release:
     types: [published]
+  workflow_dispatch:  # relanzar un build sin publicar una release nueva
+    inputs:
+      tag:
+        description: "Tag de imagen a publicar (p.ej. 0.1.2)"
+        required: true
 
 permissions:
   contents: read
@@ -39,6 +44,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
             type=raw,value=latest
 
       - uses: docker/build-push-action@v6
