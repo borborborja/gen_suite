@@ -89,7 +89,7 @@ async def _summaries(session: AsyncSession, ids: set[uuid.UUID]) -> dict[uuid.UU
                 Event.subject_person_id.in_(ids),
                 Event.type.in_(("birth", "death")),
                 Event.date_year.is_not(None),
-            )
+            ).order_by(Event.date_year)  # con eventos duplicados gana siempre el año menor
         )
     ).all():
         (birth if etype == "birth" else death).setdefault(pid, year)
@@ -550,9 +550,10 @@ async def search_persons(
     year_from: int | None = None, year_to: int | None = None,
 ) -> list[SearchHit]:
     stmt = (
+        # outerjoin: una persona sin Name primario (GEDCOM sin tag NAME) debe seguir
+        # siendo visible cuando no se filtra por nombre
         select(Person.id, Name.given, Name.surname)
-        .join(Name, Name.person_id == Person.id)
-        .where(Name.is_primary.is_(True))
+        .outerjoin(Name, (Name.person_id == Person.id) & Name.is_primary.is_(True))
     )
     if q and q.strip():
         like = f"%{q.strip()}%"
@@ -664,7 +665,7 @@ async def list_persons(
         "death": (sub.c.death_year,),
     }.get(sort, (sub.c.surname, sub.c.given))
     ordered = [c.desc().nulls_last() if order == "desc" else c.asc().nulls_last()
-               for c in sort_cols]
+               for c in sort_cols] + [sub.c.id]  # desempate estable entre páginas
     rows = (
         await session.execute(
             select(sub).order_by(*ordered).limit(page_size).offset((page - 1) * page_size)
@@ -691,7 +692,7 @@ async def export_persons_csv(
     stmt = (
         select(Person.id, Name.given, Name.surname, Person.sex)
         .outerjoin(Name, (Name.person_id == Person.id) & Name.is_primary.is_(True))
-        .order_by(Name.surname.nulls_last(), Name.given.nulls_last())
+        .order_by(Name.surname.nulls_last(), Name.given.nulls_last(), Person.id)
     )
     for cond in _person_filters(q=q, surname=surname, sex=sex, year_from=year_from,
                                 year_to=year_to, place_id=place_id, missing=missing):

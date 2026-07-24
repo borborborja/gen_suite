@@ -51,7 +51,8 @@ async def list_places(
     ordered = col.desc().nulls_last() if order == "desc" else col.asc().nulls_last()
     rows = (
         await session.execute(
-            select(sub).order_by(ordered, sub.c.name).limit(page_size).offset((page - 1) * page_size)
+            select(sub).order_by(ordered, sub.c.name, sub.c.id)  # id = desempate estable
+            .limit(page_size).offset((page - 1) * page_size)
         )
     ).all()
     total = await session.scalar(count_stmt) or 0
@@ -105,7 +106,7 @@ async def list_place_events(
     total = await session.scalar(select(func.count()).where(Event.place_id == place_id)) or 0
     events = (await session.scalars(
         select(Event).where(Event.place_id == place_id)
-        .order_by(Event.date_year.nulls_last())
+        .order_by(Event.date_year.nulls_last(), Event.id)
         .limit(page_size).offset((page - 1) * page_size)
     )).all()
 
@@ -133,15 +134,17 @@ async def list_place_events(
 
 
 async def _is_descendant(session: AsyncSession, candidate: uuid.UUID, of: uuid.UUID) -> bool:
-    """True if ``candidate`` is ``of`` itself or sits below it in the hierarchy."""
-    cur = candidate
-    for _ in range(_MAX_DEPTH):
+    """True if ``candidate`` is ``of`` itself or sits below it in the hierarchy.
+    Walks the full chain (seen-set, not a depth cap): a truncated walk would green-light
+    cycles in hierarchies deeper than the cap."""
+    cur: uuid.UUID | None = candidate
+    seen: set[uuid.UUID] = set()
+    while cur is not None and cur not in seen:
         if cur == of:
             return True
+        seen.add(cur)
         place = await session.get(Place, cur)
-        if not place or not place.parent_id:
-            return False
-        cur = place.parent_id
+        cur = place.parent_id if place else None
     return False
 
 
@@ -195,10 +198,13 @@ async def merge_place(session: AsyncSession, place_id: uuid.UUID, into_id: uuid.
     # ORM loops on purpose: the change-log capture (audit) only sees ORM mutations
     for ev in (await session.scalars(select(Event).where(Event.place_id == place_id))).all():
         ev.place_id = into_id
+    # If dst sits anywhere below src, repointing src's children to dst would close a cycle
+    # (src → X → dst with X.parent = dst). Lift dst to src's spot in the hierarchy first.
+    if await _is_descendant(session, into_id, place_id):
+        dst.parent_id = src.parent_id
     for child in (await session.scalars(select(Place).where(Place.parent_id == place_id))).all():
-        child.parent_id = into_id if child.id != into_id else None
-    if dst.parent_id == place_id:
-        dst.parent_id = None
+        if child.id != into_id:
+            child.parent_id = into_id
     if dst.lat is None and src.lat is not None:
         dst.lat, dst.lng = src.lat, src.lng
     await session.delete(src)

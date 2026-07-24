@@ -52,8 +52,13 @@ async def _resolve_place(session, tenant_id, name: str | None, lat=None, lng=Non
     return place.id
 
 
+def _norm_sex(sex: str | None) -> str:
+    s = (sex or "").strip().upper()[:1]
+    return s if s in ("M", "F") else "U"
+
+
 async def create_person(session, tenant_id, *, given, surname, sex="U", inferred=False) -> Person:
-    p = Person(tenant_id=tenant_id, sex=(sex or "U")[:1].upper() if sex in ("M", "F") else "U")
+    p = Person(tenant_id=tenant_id, sex=_norm_sex(sex))
     session.add(p)
     await session.flush()
     session.add(Name(tenant_id=tenant_id, person_id=p.id, type="birth", given=given,
@@ -67,8 +72,8 @@ async def update_person(session, tenant_id, person_id, *, sex=None, given=None, 
     p = await session.get(Person, person_id)
     if not p:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "person not found")
-    if sex in ("M", "F", "U"):
-        p.sex = sex
+    if sex is not None:
+        p.sex = _norm_sex(sex)
     if notes is not None:
         p.notes = notes or None
     name = await session.scalar(
@@ -160,45 +165,68 @@ async def _parent_family(session, tenant_id, child_id) -> Family:
     return fam
 
 
-async def _spouse_family(session, tenant_id, person_id) -> Family:
-    fam = await session.scalar(select(Family).where(or_(Family.husband_id == person_id, Family.wife_id == person_id)).limit(1))
-    if fam:
-        return fam
-    fam = Family(tenant_id=tenant_id)
-    session.add(fam)
-    await session.flush()
-    return fam
+def _slot_for(person: Person) -> str:
+    """Which FAM slot a person naturally occupies (GEDCOM husband/wife; U defaults to husband)."""
+    return "wife_id" if person.sex == "F" else "husband_id"
 
 
 async def link_relative(session, tenant_id, person_id, relative_id, relation: str) -> None:
-    """relation ∈ father|mother|parent|spouse|child — build the right FAM links (GEDCOM)."""
+    """relation ∈ father|mother|parent|spouse|child — build the right FAM links (GEDCOM).
+
+    Slot rules: father→husband, mother→wife, parent→by sex. An occupied slot raises 409
+    instead of silently doing nothing or spilling into the wrong slot (a father must never
+    be stored as the mother — the consistency checker reads slots as roles)."""
     rel = await session.get(Person, relative_id)
     if not rel:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "relative not found")
+    if person_id == relative_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "una persona no puede ser pariente de sí misma")
     if relation in ("father", "mother", "parent"):
         fam = await _parent_family(session, tenant_id, person_id)
         if relative_id in (fam.husband_id, fam.wife_id):
-            return
-        if relation == "mother" or (relation == "parent" and rel.sex == "F"):
-            fam.wife_id = relative_id if fam.wife_id is None else fam.wife_id
-        elif fam.husband_id is None:
-            fam.husband_id = relative_id
-        elif fam.wife_id is None:
-            fam.wife_id = relative_id
-    elif relation == "spouse":
-        fam = await _spouse_family(session, tenant_id, person_id)
-        if relative_id in (fam.husband_id, fam.wife_id):
-            return
-        if fam.husband_id in (None, person_id) and rel.sex != "M":
-            fam.husband_id = fam.husband_id or person_id
-            fam.wife_id = relative_id if fam.wife_id is None else fam.wife_id
+            return  # ya enlazado, no-op idempotente
+        if relation == "father":
+            slot = "husband_id"
+        elif relation == "mother":
+            slot = "wife_id"
         else:
-            fam.wife_id = fam.wife_id or person_id
-            fam.husband_id = relative_id if fam.husband_id is None else fam.husband_id
+            slot = _slot_for(rel)
+            if getattr(fam, slot) is not None:  # parent genérico: usa el hueco libre
+                slot = "wife_id" if slot == "husband_id" else "husband_id"
+        if getattr(fam, slot) is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                "esa plaza de progenitor ya está ocupada; desvincula primero")
+        setattr(fam, slot, relative_id)
+    elif relation == "spouse":
+        fams = (await session.scalars(select(Family).where(
+            or_(Family.husband_id == person_id, Family.wife_id == person_id)))).all()
+        target = None
+        for fam in fams:
+            if relative_id in (fam.husband_id, fam.wife_id):
+                return  # ya casados, no-op
+            other = "wife_id" if fam.husband_id == person_id else "husband_id"
+            if target is None and getattr(fam, other) is None:
+                target = (fam, other)
+        if target:  # familia existente con el otro hueco libre → completa la pareja
+            fam, other = target
+            setattr(fam, other, relative_id)
+        else:  # todas ocupadas (o ninguna): segundo matrimonio → familia nueva
+            fam = Family(tenant_id=tenant_id)
+            slot = _slot_for(await session.get(Person, person_id))
+            other = "wife_id" if slot == "husband_id" else "husband_id"
+            setattr(fam, slot, person_id)
+            setattr(fam, other, relative_id)
+            session.add(fam)
     elif relation == "child":
-        fam = await _spouse_family(session, tenant_id, person_id)
-        if fam.husband_id is None and fam.wife_id is None:
-            fam.husband_id = person_id
+        fam = await session.scalar(select(Family).where(
+            or_(Family.husband_id == person_id, Family.wife_id == person_id)).limit(1))
+        if fam is None:
+            fam = Family(tenant_id=tenant_id)
+            # el progenitor entra en el slot de su sexo (una madre soltera no es un "husband")
+            setattr(fam, _slot_for(await session.get(Person, person_id)), person_id)
+            session.add(fam)
+            await session.flush()
         exists = await session.scalar(select(FamilyChild.person_id).where(
             FamilyChild.family_id == fam.id, FamilyChild.person_id == relative_id))
         if not exists:
@@ -221,15 +249,15 @@ async def unlink_relative(session, tenant_id, person_id, relative_id, relation: 
     - child: relative is a child of person's spouse-family → drop the FamilyChild row.
     Empty Family rows are left in place (harmless, no orphan parents)."""
     if relation in ("father", "mother", "parent"):
-        fam_id = await session.scalar(
-            select(FamilyChild.family_id).where(FamilyChild.person_id == person_id))
-        if not fam_id:
-            return
-        fam = await session.get(Family, fam_id)
-        if fam and fam.husband_id == relative_id:
-            fam.husband_id = None
-        elif fam and fam.wife_id == relative_id:
-            fam.wife_id = None
+        # el hijo puede pertenecer a varias familias (FAMC doble) — busca al pariente en todas
+        fam_ids = (await session.scalars(
+            select(FamilyChild.family_id).where(FamilyChild.person_id == person_id))).all()
+        for fid in fam_ids:
+            fam = await session.get(Family, fid)
+            if fam and fam.husband_id == relative_id:
+                fam.husband_id = None
+            elif fam and fam.wife_id == relative_id:
+                fam.wife_id = None
     elif relation == "spouse":
         fam = await session.scalar(select(Family).where(or_(
             (Family.husband_id == person_id) & (Family.wife_id == relative_id),
@@ -295,6 +323,23 @@ async def merge_persons(session, tenant_id, keep_id, dup_id) -> Person:
     for cit in (await session.scalars(select(Citation).where(
             Citation.target_type == "person", Citation.target_id == dup_id))).all():
         cit.target_id = keep_id
+    # Linkage state follows the surviving person too; without this, deleting dup would
+    # SET NULL the resolved mentions and CASCADE-delete its match candidates at the DB
+    # level — invisible to the change-log capture and lost on revert.
+    from ...models.match_candidate import MatchCandidate
+    from ...models.mention import PersonMention
+    for m in (await session.scalars(select(PersonMention).where(
+            PersonMention.resolved_person_id == dup_id))).all():
+        m.resolved_person_id = keep_id
+    for mc in (await session.scalars(select(MatchCandidate).where(
+            MatchCandidate.tree_person_id == dup_id))).all():
+        existing = await session.scalar(select(MatchCandidate.id).where(
+            MatchCandidate.tree_person_id == keep_id,
+            MatchCandidate.person_mention_id == mc.person_mention_id))
+        if existing:
+            await session.delete(mc)  # el conservado ya tiene candidato para esa mención
+        else:
+            mc.tree_person_id = keep_id
     if dup.notes:
         keep.notes = ((keep.notes + "\n\n") if keep.notes else "") + dup.notes
     if keep.sex == "U" and dup.sex in ("M", "F"):

@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { useEstela, avatar } from "../store";
 import { fonts } from "../theme";
 import { ArrowLeft, SearchPlus } from "../icons";
@@ -61,40 +61,48 @@ export default function PersonaView() {
   const { confirmDialog, ask } = useConfirm();
 
   // Blob object-URLs must be revoked when replaced (person change, reload) or on unmount,
-  // or every photo ever viewed stays pinned in memory for the session.
+  // or every photo ever viewed stays pinned in memory for the session. The unmount cleanup
+  // reads a ref — a setState updater would be dropped by React on an unmounted component.
+  const urlsRef = useRef<Record<string, string>>({});
+  // Response-order guard: switching persons fast must never let a slow response for the
+  // previous person overwrite the current one (or revoke its fresh object-URLs).
+  const seq = useRef(0);
   const revokeAll = (u: Record<string, string>) => Object.values(u).forEach((x) => URL.revokeObjectURL(x));
   const setUrlsRevoking = (next: Record<string, string>) => {
+    urlsRef.current = next;
     setUrls((prev) => { revokeAll(prev); return next; });
   };
-  useEffect(() => () => { setUrls((prev) => { revokeAll(prev); return {}; }); }, []);
+  useEffect(() => () => revokeAll(urlsRef.current), []);
 
-  const loadMedia = (id: string) => {
+  const loadMedia = (id: string, mine: number) => {
     listMedia(id).then(async (items) => {
+      if (seq.current !== mine) return;
       setMedia(items);
       const next: Record<string, string> = {};
       await Promise.all(items.map(async (m) => {
         try { next[m.id] = await mediaObjectUrl(m.id); } catch { /* skip */ }
       }));
+      if (seq.current !== mine) { revokeAll(next); return; }
       setUrlsRevoking(next);
-    }).catch(() => { setMedia([]); setUrlsRevoking({}); });
+    }).catch(() => { if (seq.current === mine) { setMedia([]); setUrlsRevoking({}); } });
   };
 
-  const reload = () => {
-    if (!UUID_RE.test(e.selPerson)) return;
-    getPerson(e.selPerson).then(setP).catch(() => setErr(true));
-    getGaps(e.selPerson).then(setGaps).catch(() => setGaps([]));
-    getCitations(e.selPerson).then(setCites).catch(() => setCites([]));
-    getPersonFamilies(e.selPerson).then(setFamilies).catch(() => setFamilies([]));
-    loadMedia(e.selPerson);
+  const fetchAll = (id: string) => {
+    const mine = ++seq.current;
+    const guard = <T,>(set: (v: T) => void) => (v: T) => { if (seq.current === mine) set(v); };
+    getPerson(id).then(guard(setP)).catch(() => { if (seq.current === mine) setErr(true); });
+    getGaps(id).then(guard(setGaps)).catch(() => guard(setGaps)([]));
+    getCitations(id).then(guard(setCites)).catch(() => guard(setCites)([]));
+    getPersonFamilies(id).then(guard(setFamilies)).catch(() => guard(setFamilies)([]));
+    loadMedia(id, mine);
   };
+  const reload = () => { if (UUID_RE.test(e.selPerson)) fetchAll(e.selPerson); };
   useEffect(() => {
+    seq.current++;
     setP(null); setErr(false); setEditOpen(false); setGaps([]); setCites([]); setMedia([]); setFamilies([]); setUrlsRevoking({});
     if (!UUID_RE.test(e.selPerson)) { setErr(true); return; }
-    getPerson(e.selPerson).then(setP).catch(() => setErr(true));
-    getGaps(e.selPerson).then(setGaps).catch(() => setGaps([]));
-    getCitations(e.selPerson).then(setCites).catch(() => setCites([]));
-    getPersonFamilies(e.selPerson).then(setFamilies).catch(() => setFamilies([]));
-    loadMedia(e.selPerson);
+    fetchAll(e.selPerson);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fetchAll is stable-by-construction (seq guard)
   }, [e.selPerson]);
 
   if (err) return (
@@ -122,25 +130,28 @@ export default function PersonaView() {
     ...p.children.map((r) => famItem(r, r.sex === "F" ? "Hija" : "Hijo", "child")),
   ];
 
+  const failed = (err: unknown) => e.notify((err as Error).message || "No se pudo guardar", "var(--danger)");
   async function removeRelative(relativeId: string, relation: string) {
     if (!(await ask({ title: "¿Desvincular este familiar?", body: "La persona no se borra, solo el parentesco.", confirmLabel: "Desvincular" }))) return;
-    await unlinkRelative(p!.id, relativeId, relation); reload();
+    try { await unlinkRelative(p!.id, relativeId, relation); reload(); } catch (err) { failed(err); }
   }
   async function removeEvent(eventId: string) {
     if (!(await ask({ title: "¿Borrar este hecho?", danger: true, confirmLabel: "Borrar" }))) return;
-    await deleteEvent(eventId); reload();
+    try { await deleteEvent(eventId); reload(); } catch (err) { failed(err); }
   }
   async function removePerson() {
     if (!(await ask({ title: `¿Eliminar a ${name}?`, body: "Se borran sus nombres, hechos y parentescos. No se puede deshacer.", danger: true, confirmLabel: "Eliminar" }))) return;
-    await deletePerson(p!.id); e.go("arbol");
+    try { await deletePerson(p!.id); e.go("arbol"); } catch (err) { failed(err); }
   }
   async function onUploadPhoto(file: File) {
-    try { await uploadMedia(p!.id, file); loadMedia(p!.id); } catch { e.notify("No se pudo subir la foto"); }
+    try { await uploadMedia(p!.id, file); reload(); } catch { e.notify("No se pudo subir la foto"); }
   }
-  async function onSetPrimary(id: string) { await updateMedia(id, { make_primary: true }); loadMedia(p!.id); }
+  async function onSetPrimary(id: string) {
+    try { await updateMedia(id, { make_primary: true }); reload(); } catch (err) { failed(err); }
+  }
   async function onDeletePhoto(id: string) {
     if (!(await ask({ title: "¿Borrar esta foto?", danger: true, confirmLabel: "Borrar" }))) return;
-    await deleteMedia(id); loadMedia(p!.id);
+    try { await deleteMedia(id); reload(); } catch (err) { failed(err); }
   }
   async function onGeocode() {
     e.notify("Geocodificando lugares… (1/seg, puede tardar)");
@@ -420,6 +431,7 @@ const RELATIONS = [
 ];
 
 function EditPanel({ person, onChange }: { person: PersonDetail; onChange: () => void }) {
+  const est = useEstela();
   const primary = person.names.find((n) => n.is_primary) ?? person.names[0];
   const [given, setGiven] = useState(primary?.given ?? "");
   const [surname, setSurname] = useState(primary?.surname ?? "");
@@ -442,18 +454,25 @@ function EditPanel({ person, onChange }: { person: PersonDetail; onChange: () =>
   }, []);
   const flash = (m: string) => { setMsg(m); setTimeout(() => setMsg(""), 2500); };
 
+  const failed = (err: unknown) => est.notify((err as Error).message || "No se pudo guardar", "var(--danger)");
   async function saveIdentity() {
-    await updatePerson(person.id, { given, surname, sex, notes }); flash("Identidad guardada"); onChange();
+    try {
+      await updatePerson(person.id, { given, surname, sex, notes }); flash("Identidad guardada"); onChange();
+    } catch (err) { failed(err); }
   }
   async function saveFact() {
     if (!ft) return;
-    await addEvent(person.id, { type: ft, date_raw: fdate || undefined, place: place || undefined, place_lat: coords?.lat, place_lng: coords?.lng, value: fvalue || undefined });
-    setFdate(""); setFvalue(""); setPlace(""); setCoords(null); flash("Hecho añadido"); onChange();
+    try {
+      await addEvent(person.id, { type: ft, date_raw: fdate || undefined, place: place || undefined, place_lat: coords?.lat, place_lng: coords?.lng, value: fvalue || undefined });
+      setFdate(""); setFvalue(""); setPlace(""); setCoords(null); flash("Hecho añadido"); onChange();
+    } catch (err) { failed(err); }
   }
   async function saveRel() {
     if (!rgiven && !rsurname) return;
-    await addRelative(person.id, { relation: rel, given: rgiven || undefined, surname: rsurname || undefined, sex: rsex });
-    setRgiven(""); setRsurname(""); flash("Pariente añadido"); onChange();
+    try {
+      await addRelative(person.id, { relation: rel, given: rgiven || undefined, surname: rsurname || undefined, sex: rsex });
+      setRgiven(""); setRsurname(""); flash("Pariente añadido"); onChange();
+    } catch (err) { failed(err); }
   }
 
   const card: CSSProperties = { background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 14, padding: 20 };
@@ -497,6 +516,7 @@ function EditPanel({ person, onChange }: { person: PersonDetail; onChange: () =>
 }
 
 function EventEditor({ event, scope = "person", onClose, onSaved }: { event: EventOut; scope?: "person" | "family"; onClose: () => void; onSaved: () => void }) {
+  const est = useEstela();
   const [factTypes, setFactTypes] = useState<FactType[]>([]);
   const [type, setType] = useState(event.type);
   const [date, setDate] = useState(event.date_raw ?? (event.date_year ? String(event.date_year) : ""));
@@ -514,6 +534,8 @@ function EventEditor({ event, scope = "person", onClose, onSaved }: { event: Eve
       await editEvent(event.id, { type, date_raw: date || undefined, place: place || undefined,
         place_lat: coords?.lat, place_lng: coords?.lng, value: value || undefined });
       onSaved();
+    } catch (err) {
+      est.notify((err as Error).message || "No se pudo guardar el hecho", "var(--danger)");
     } finally { setBusy(false); }
   }
   return (

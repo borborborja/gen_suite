@@ -105,6 +105,36 @@ async def test_merge_shared_family_regression_and_revert(client: AsyncClient):
     assert len(padre_detail["children"]) == 2
 
 
+async def test_revert_blocked_by_later_uncaptured_dependents(client: AsyncClient):
+    """Revertir una creación cuyo objeto ganó dependientes después (cascade de BD) debe dar
+    409, no destruirlos en silencio."""
+    h = _auth(await _tenant_token(client))
+    ana = await _person(client, h, "Ana", "Vega", "F")
+    # cambio A: crea cónyuge (persona nueva + familia)
+    beto = await _relative(client, h, ana, "spouse", given="Beto", surname="Sol", sex="M")
+    change_a = (await _changes(client, h))[0]
+    assert change_a["action"] == "relative_add"
+    # cambio B: matrimonio sobre esa familia (dependiente NO capturado en A)
+    fam = (await client.get(f"/api/tree/persons/{ana}/families", headers=h)).json()[0]
+    r = await client.post(f"/api/tree/families/{fam['id']}/events",
+                          json={"type": "marriage", "date_raw": "1900"}, headers=h)
+    assert r.status_code == 200
+
+    # revertir A borraría la familia y el cascade destruiría el matrimonio de B → 409
+    assert (await _revert(client, h, change_a["id"])).status_code == 409
+    # nada se ha tocado: Beto y el matrimonio siguen
+    assert (await client.get(f"/api/tree/persons/{beto}", headers=h)).status_code == 200
+    fams = (await client.get(f"/api/tree/persons/{ana}/families", headers=h)).json()
+    assert fams[0]["events"][0]["type"] == "marriage"
+
+    # si primero se deshace B (el matrimonio), entonces A ya es revertible
+    change_b = (await _changes(client, h))[0]
+    assert change_b["action"] == "family_event_add"
+    assert (await _revert(client, h, change_b["id"])).status_code == 200
+    assert (await _revert(client, h, change_a["id"])).status_code == 200
+    assert (await client.get(f"/api/tree/persons/{beto}", headers=h)).status_code == 404
+
+
 async def test_revert_conflict_and_isolation(client: AsyncClient):
     h = _auth(await _tenant_token(client))
     juan = await _person(client, h, "Juan", "Vega", "M")

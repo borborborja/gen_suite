@@ -91,3 +91,22 @@ async def test_place_merge_and_geocode(client: AsyncClient, monkeypatch):
 
     monkeypatch.setattr(geo_router, "geocode_one", fake_miss)
     assert (await client.post(f"/api/tree/places/{ids['Cordoba']}/geocode", headers=h)).status_code == 422
+
+
+async def test_place_merge_into_descendant_keeps_hierarchy_acyclic(client: AsyncClient):
+    """Fusionar un lugar dentro de un descendiente no directo no debe crear ciclos:
+    España → Córdoba → Belmez; fusionar España dentro de Belmez."""
+    h = _auth(await _tenant_token(client))
+    ids = await _seed(client, h)
+    assert (await client.patch(f"/api/tree/places/{ids['Belmez']}", json={"parent_id": ids["Cordoba"]}, headers=h)).status_code == 200
+    assert (await client.patch(f"/api/tree/places/{ids['Cordoba']}", json={"parent_id": ids['España']}, headers=h)).status_code == 200
+
+    r = await client.post(f"/api/tree/places/{ids['España']}/merge", json={"into_id": ids["Belmez"]}, headers=h)
+    assert r.status_code == 200
+
+    # Belmez ocupa el sitio de España (raíz) y Córdoba cuelga de Belmez — sin ciclos
+    belmez = (await client.get(f"/api/tree/places/{ids['Belmez']}", headers=h)).json()
+    assert belmez["parent_id"] is None
+    cordoba = (await client.get(f"/api/tree/places/{ids['Cordoba']}", headers=h)).json()
+    assert cordoba["parent_id"] == ids["Belmez"]
+    assert [b["name"] for b in cordoba["breadcrumb"]] == ["Belmez"]

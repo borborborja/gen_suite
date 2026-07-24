@@ -22,12 +22,15 @@ export default function PrintReport({ personId, onClose }: { personId: string; o
   const td: CSSProperties = { padding: "4px 10px 4px 0", verticalAlign: "top", fontSize: 12.5 };
 
   return (
-    <div style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,.5)", overflowY: "auto", padding: "30px 16px" }} onClick={onClose}>
+    <div className="print-overlay" style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,.5)", overflowY: "auto", padding: "30px 16px" }} onClick={onClose}>
       <style>{`
         @media print {
           body * { visibility: hidden !important; }
           .print-report, .print-report * { visibility: visible !important; }
-          .print-report { position: absolute !important; inset: 0 !important; margin: 0 !important; border-radius: 0 !important; box-shadow: none !important; }
+          /* el overlay fixed+scroll recortaría el informe a una página: en papel ambos
+             pasan a flujo normal para que el contenido pagine completo */
+          .print-overlay { position: static !important; overflow: visible !important; padding: 0 !important; background: none !important; }
+          .print-report { position: static !important; margin: 0 !important; max-width: none !important; border-radius: 0 !important; box-shadow: none !important; }
           .print-hide { display: none !important; }
         }
       `}</style>

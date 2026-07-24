@@ -105,6 +105,7 @@ function PlacePanel({ placeId, onClose, onChanged, onOpenPerson }: {
   const { confirmDialog, ask } = useConfirm();
   const [p, setP] = useState<PlaceDetail | null>(null);
   const [events, setEvents] = useState<PlaceEventRow[]>([]);
+  const [eventsTotal, setEventsTotal] = useState(0);
   const [name, setName] = useState("");
   const [ptype, setPtype] = useState("");
   const [busy, setBusy] = useState(false);
@@ -112,9 +113,14 @@ function PlacePanel({ placeId, onClose, onChanged, onOpenPerson }: {
   const [parentPick, setParentPick] = useState(false);
 
   const reload = useCallback(() => {
-    getPlace(placeId).then((d) => { setP(d); setName(d.name); setPtype(d.place_type ?? ""); }).catch(onClose);
-    listPlaceEvents(placeId).then((r) => setEvents(r.items)).catch(() => setEvents([]));
-  }, [placeId, onClose]);
+    getPlace(placeId)
+      .then((d) => { setP(d); setName(d.name); setPtype(d.place_type ?? ""); })
+      .catch(() => e.notify("No se pudo cargar el lugar", "var(--danger)"));
+    listPlaceEvents(placeId)
+      .then((r) => { setEvents(r.items); setEventsTotal(r.total); })
+      .catch(() => setEvents([]));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- e (contexto) es estable a efectos prácticos
+  }, [placeId]);
   useEffect(() => { reload(); }, [reload]);
 
   async function run(fn: () => Promise<unknown>, okMsg: string) {
@@ -127,8 +133,8 @@ function PlacePanel({ placeId, onClose, onChanged, onOpenPerson }: {
   if (!p) return null;
   return (
     <div onClick={onClose} style={{ ...overlay, alignItems: "flex-start", overflowY: "auto", padding: "50px 20px" }}>
-      {confirmDialog}
       <div onClick={(ev) => ev.stopPropagation()} style={{ ...modalCard, maxWidth: 640 }}>
+        {confirmDialog}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 2 }}>
           <h2 style={{ fontFamily: fonts.serif, fontSize: 22, fontWeight: 600, margin: 0 }}>{p.name}</h2>
           <button onClick={onClose} style={{ background: "transparent", border: "none", color: "var(--muted)", fontSize: 20, cursor: "pointer" }}>✕</button>
@@ -179,6 +185,11 @@ function PlacePanel({ placeId, onClose, onChanged, onOpenPerson }: {
             </div>
           ))}
           {events.length === 0 && <div style={{ fontSize: 12.5, color: "var(--muted)" }}>Sin eventos.</div>}
+          {eventsTotal > events.length && (
+            <div style={{ fontSize: 11.5, color: "var(--muted)", fontFamily: fonts.mono }}>
+              … y {eventsTotal - events.length} eventos más
+            </div>
+          )}
         </div>
 
         {parentPick && (

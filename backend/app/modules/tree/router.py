@@ -263,10 +263,13 @@ async def import_gedcom(
 
 @router.post("/geocode-places", dependencies=[Depends(require_roles(*_WRITE))])
 async def geocode_places(
-    limit: int = Query(40, ge=1, le=200), db: AsyncSession = Depends(get_tenant_db),
+    limit: int = Query(40, ge=1, le=200),
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
 ) -> dict:
     """Resolve coordinates for tree places that lack them (for the life map). Rate-limited."""
-    return await service.geocode_places(db, limit)
+    async with audited(db, principal, action="place_geocode", entity_type="place",
+                       summary=f"Geocodificó lugares en lote (hasta {limit})"):
+        return await service.geocode_places(db, limit)
 
 
 class HomeOut(BaseModel):

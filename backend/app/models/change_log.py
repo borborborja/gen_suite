@@ -21,8 +21,9 @@ class ChangeLog(Base):
     __tablename__ = "change_log"
 
     id: Mapped[uuid.UUID] = uuid_pk()
+    # no single-column index: covered by the (tenant_id, created_at DESC) index of migration 0028
     tenant_id: Mapped[uuid.UUID] = mapped_column(
-        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")

@@ -76,3 +76,39 @@ async def test_rls_policy_blocks_cross_tenant_rows():
 
     assert t2 not in visible
     assert set(visible) == {t1}
+
+
+async def test_rls_policy_covers_change_log():
+    """change_log (historial del árbol) queda confinado por tenant: ni SELECT cruzado ni
+    INSERT con tenant ajeno (WITH CHECK)."""
+    from app.models.change_log import ChangeLog
+
+    t1, t2 = uuid.uuid4(), uuid.uuid4()
+    admin = create_async_engine(settings.admin_database_url)
+    async with admin.begin() as conn:
+        for tid, name, slug in [(t1, "T1", f"t1-{t1.hex[:6]}"), (t2, "T2", f"t2-{t2.hex[:6]}")]:
+            await conn.execute(
+                text("INSERT INTO tenants (id, name, slug) VALUES (:id, :n, :s)"),
+                {"id": tid, "n": name, "s": slug},
+            )
+        for tid in (t1, t2):
+            await conn.execute(
+                text("INSERT INTO change_log (tenant_id, action, rows) "
+                     "VALUES (:t, 'person_create', '[]'::jsonb)"),
+                {"t": tid},
+            )
+    await admin.dispose()
+
+    async with SessionLocal() as session:
+        await set_rls_context(session, user_id=uuid.uuid4(), tenant_id=t1, role="tenant_admin")
+        visible = (await session.scalars(select(ChangeLog.tenant_id))).all()
+        assert set(visible) == {t1}
+
+        session.add(ChangeLog(tenant_id=t2, action="person_create", rows=[]))
+        try:
+            await session.flush()
+            raised = False
+        except Exception:
+            raised = True
+        await session.rollback()
+        assert raised, "WITH CHECK debería impedir insertar change_log de otro tenant"

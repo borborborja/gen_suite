@@ -8,10 +8,15 @@ it can itself be reverted.
 
 Only ORM mutations are visible to the listeners — tree editing code must not use bulk
 ``update()/delete()`` statements for audited tables.
+
+Scope: the audit covers the MANUAL tree-editing endpoints. Worker/linkage flows
+(confirm candidate, reconstruction, extraction) mutate the tree without writing here —
+by design: they have their own provenance (citations, match decisions, jobs).
 """
 from __future__ import annotations
 
 import datetime
+import json
 import uuid
 from contextlib import asynccontextmanager
 
@@ -27,22 +32,48 @@ from ...core.errors import AppError
 from ...core.security import Principal
 from ...models.change_log import ChangeLog
 from ...models.citation import Citation
+from ...models.document import Page
 from ...models.event import Event
 from ...models.family import Family, FamilyChild
+from ...models.match_candidate import MatchCandidate
+from ...models.mention import PersonMention
 from ...models.person import Name, Person
 from ...models.place import Place
+from ...models.record import Record
+from ...models.transcription import Transcription
 from ...models.user import User
 from .schemas import ChangeDetail, ChangeItem, ChangePage
 
 TABLE_MODELS = {
     "persons": Person, "names": Name, "events": Event, "families": Family,
     "family_children": FamilyChild, "citations": Citation, "places": Place,
+    "person_mentions": PersonMention, "match_candidates": MatchCandidate,
 }
 _MODEL_TABLES = {m: t for t, m in TABLE_MODELS.items()}
 # FK-safe re-insert order (parents before dependents); deletes run in reverse.
-TABLE_ORDER = ["persons", "families", "places", "names", "events", "family_children", "citations"]
+TABLE_ORDER = ["persons", "families", "places", "names", "events", "family_children",
+               "person_mentions", "match_candidates", "citations"]
 _SKIP_COMPARE = {"created_at", "updated_at"}
 MAX_ROWS = 20_000
+
+# Soft/SET NULL FK fields of citations: their targets may legitimately disappear later
+# (e.g. re-extraction deletes Records). When resurrecting a citation, a dead reference is
+# nulled — same end state the DB would have produced — instead of failing the whole revert.
+_CITATION_REFS = {"record_id": Record, "transcription_id": Transcription, "page_id": Page,
+                  "person_mention_id": PersonMention, "match_candidate_id": MatchCandidate}
+
+# DB-level dependents of a deletable row (CASCADE or SET NULL): reverting a creation may
+# only delete the row if every dependent is captured in the same change — otherwise the
+# database would silently destroy later work and the revert would not be all-or-nothing.
+_DELETE_DEPENDENTS: dict[str, list] = {
+    "persons": [(Name, "person_id"), (Event, "subject_person_id"),
+                (FamilyChild, "person_id"), (Family, "husband_id"), (Family, "wife_id"),
+                (PersonMention, "resolved_person_id"), (MatchCandidate, "tree_person_id"),
+                (Citation, "target_id")],
+    "families": [(Event, "subject_family_id"), (FamilyChild, "family_id"),
+                 (Citation, "target_id")],
+    "places": [(Event, "place_id"), (Place, "parent_id")],
+}
 
 
 def _ser(v):
@@ -60,6 +91,11 @@ def _row_image(obj) -> dict:
 def _pk_dict(obj) -> dict:
     mapper = sa_inspect(type(obj)).mapper
     return {c.name: _ser(getattr(obj, c.name)) for c in mapper.primary_key}
+
+
+def _pk_key(pk: dict) -> str:
+    """Stable hashable identity for a pk dict (supports composite keys)."""
+    return json.dumps(pk, sort_keys=True)
 
 
 def _deser(model, key: str, v):
@@ -159,7 +195,7 @@ async def list_changes(session: AsyncSession, *, page: int = 1, page_size: int =
         await session.execute(
             select(ChangeLog, User.email)
             .outerjoin(User, User.id == ChangeLog.actor_user_id)
-            .order_by(ChangeLog.created_at.desc())
+            .order_by(ChangeLog.created_at.desc(), ChangeLog.id.desc())
             .limit(page_size).offset((page - 1) * page_size)
         )
     ).all()
@@ -210,13 +246,43 @@ async def revert_change(session: AsyncSession, principal: Principal, change_id: 
         # IntegrityError can surface at any autoflush (session.get flushes pending work),
         # e.g. re-inserting a row whose FK target no longer exists → conflict, not a 500.
         try:
+            # 0. validate deletions BEFORE touching anything: the row must still match its
+            #    captured image, and no uncaptured dependent may exist (DB CASCADE/SET NULL
+            #    would silently destroy later work the change never recorded).
+            captured = {(r["table"], _pk_key(r["pk"])) for r in change.rows}
+            for r in deletes:
+                model = TABLE_MODELS[r["table"]]
+                obj = await session.get(model, _pk_tuple(model, r["pk"]))
+                if obj is None:
+                    conflicts += 1
+                    continue
+                current = _row_image(obj)
+                if any(current.get(k) != r["after"].get(k)
+                       for k in r["after"] if k not in _SKIP_COMPARE):
+                    conflicts += 1
+                    continue
+                row_id = r["pk"].get("id")
+                for dep_model, dep_col in _DELETE_DEPENDENTS.get(r["table"], []):
+                    dep_rows = (await session.scalars(select(dep_model).where(
+                        getattr(dep_model, dep_col) == _deser(model, "id", row_id)))).all()
+                    dep_table = dep_model.__tablename__
+                    if any((dep_table, _pk_key(_pk_dict(d))) not in captured for d in dep_rows):
+                        conflicts += 1
+                        break
+            if conflicts:
+                raise _conflict(conflicts)
             # 1. resurrect deleted rows, parents first
             for r in sorted(inserts, key=lambda r: TABLE_ORDER.index(r["table"])):
                 model = TABLE_MODELS[r["table"]]
                 if await session.get(model, _pk_tuple(model, r["pk"])):
                     conflicts += 1
                     continue
-                session.add(model(**{k: _deser(model, k, v) for k, v in r["before"].items()}))
+                values = {k: _deser(model, k, v) for k, v in r["before"].items()}
+                if r["table"] == "citations":  # null out references whose target died since
+                    for ref, ref_model in _CITATION_REFS.items():
+                        if values.get(ref) is not None and not await session.get(ref_model, values[ref]):
+                            values[ref] = None
+                session.add(model(**values))
             # 2. restore updated rows to their before-image
             for r in updates:
                 model = TABLE_MODELS[r["table"]]
@@ -232,14 +298,12 @@ async def revert_change(session: AsyncSession, principal: Principal, change_id: 
                 for k, v in r["before"].items():
                     if k not in _SKIP_COMPARE:
                         setattr(obj, k, _deser(model, k, v))
-            # 3. remove created rows, dependents first
+            # 3. remove created rows (already validated in step 0), dependents first
             for r in sorted(deletes, key=lambda r: -TABLE_ORDER.index(r["table"])):
                 model = TABLE_MODELS[r["table"]]
                 obj = await session.get(model, _pk_tuple(model, r["pk"]))
-                if obj is None:
-                    conflicts += 1
-                    continue
-                await session.delete(obj)
+                if obj is not None:
+                    await session.delete(obj)
             if conflicts:
                 raise _conflict(conflicts)
             await session.flush()

@@ -64,9 +64,20 @@ async def test_manual_citation_crud(client: AsyncClient):
     byid = {c["id"]: c for c in cites}
     assert byid[cit_id]["page_no"] == 1 and byid[cit_id]["note"] == "folio 1r"
 
+    # patch que dejaría la cita sin documento NI nota → 400 (invariante de creación)
+    note_only = (await client.post("/api/tree/citations", headers=h, json={
+        "target_type": "person", "target_id": juan, "note": "solo nota"})).json()["id"]
+    assert (await client.patch(f"/api/tree/citations/{note_only}", headers=h,
+                               json={"note": ""})).status_code == 400
+
+    # la cita manual (solo página) también sale en el GEDCOM como SOUR con PAGE
+    ged = (await client.get("/api/tree/export/gedcom", headers=h)).text
+    assert "SOUR" in ged and "Bautismos 1850-1900" in ged
+    assert "PAGE pág. 1" in ged  # la cita de Juan quedó en la pág. 1 tras el patch
+
     # delete
     assert (await client.delete(f"/api/tree/citations/{cit_id}", headers=h)).status_code == 200
-    assert len((await client.get(f"/api/tree/persons/{juan}/citations", headers=h)).json()) == 1
+    assert len((await client.get(f"/api/tree/persons/{juan}/citations", headers=h)).json()) == 2
 
 
 async def test_citation_validation_and_isolation(client: AsyncClient):

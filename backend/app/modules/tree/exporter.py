@@ -101,7 +101,9 @@ async def _collect_sources(session: AsyncSession, tenant_id: uuid.UUID,
     page_ids |= {r.page_id for r in records.values() if r.page_id}
     pages = {p.id: p for p in (await session.scalars(
         select(Page).where(Page.id.in_(page_ids)))).all()} if page_ids else {}
-    doc_ids = {r.document_id for r in records.values()} | {t.document_id for t in trans.values()}
+    doc_ids = ({r.document_id for r in records.values()} | {t.document_id for t in trans.values()}
+               # manual citations carry only a page — resolve their document through it
+               | {p.document_id for p in pages.values()})
     doc_title = {d.id: d.title for d in (await session.scalars(
         select(Document).where(Document.id.in_(doc_ids)))).all()} if doc_ids else {}
 
@@ -117,11 +119,12 @@ async def _collect_sources(session: AsyncSession, tenant_id: uuid.UUID,
     for c in cits:
         r = records.get(c.record_id) if c.record_id else None
         t = trans.get(c.transcription_id) if c.transcription_id else None
-        doc_id = (r.document_id if r else None) or (t.document_id if t else None)
-        if not doc_id or doc_id not in doc_order:
-            continue
-        sxref = doc_order[doc_id]
         page = pages.get(c.page_id) or (pages.get(r.page_id) if r and r.page_id else None)
+        doc_id = ((r.document_id if r else None) or (t.document_id if t else None)
+                  or (page.document_id if page else None))
+        if not doc_id or doc_id not in doc_order:
+            continue  # note-only citation: no source document to point at
+        sxref = doc_order[doc_id]
         page_no = page.page_no if page else (t.page_no if t else None)
         ref = (sxref, page_no)
         if c.target_type == "person":

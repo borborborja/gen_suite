@@ -60,8 +60,14 @@ export default function ArbolView() {
   const [depth, setDepth] = useState(4);
   useEffect(() => {
     if (!focus) return;
-    void getSubtree(focus, depth).then(setGraph).catch(() => setGraph(null));
-  }, [focus, depth, refresh]);
+    void getSubtree(focus, depth).then(setGraph).catch(() => {
+      // focus borrado (p.ej. tras fusionar duplicados) → volver al inicio en vez de
+      // quedarse en "Cargando…" para siempre
+      setGraph(null);
+      setFocus(null);
+      void load();
+    });
+  }, [focus, depth, refresh, load]);
 
   const focusHit: SearchHit | null = (() => {
     const p = graph?.persons.find((x) => x.id === graph.focus);
@@ -101,7 +107,7 @@ export default function ArbolView() {
         )}
       </div>
 
-      {showDupes && <DuplicatesPanel onClose={() => setShowDupes(false)} onMerged={load} />}
+      {showDupes && <DuplicatesPanel onClose={() => setShowDupes(false)} onMerged={() => { void load(); setRefresh((n) => n + 1); }} />}
       {showKinship && <RelationshipDialog initialA={focusHit} onClose={() => setShowKinship(false)} />}
       {addRel && (
         <AddRelativeDialog
@@ -645,6 +651,7 @@ function EmptyTree({ onImported, onCreated, onSuper }: { onImported: () => void;
   const ref = useRef<HTMLInputElement>(null);
   async function onFile(ev: React.ChangeEvent<HTMLInputElement>) {
     const f = ev.target.files?.[0];
+    ev.target.value = ""; // permite re-seleccionar el mismo fichero tras un fallo
     if (!f) return;
     setBusy(true);
     try { await importGedcom(f); onImported(); } catch (e) { est.notify((e as Error).message, "var(--danger)"); }

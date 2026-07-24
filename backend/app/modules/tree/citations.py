@@ -59,6 +59,11 @@ async def update_citation(session: AsyncSession, citation_id: uuid.UUID, *,
         cit.page_id = await _resolve_page(session, document_id, page_no)
     if note is not None:
         cit.note = note.strip() or None
+    # keep the create-invariant: a citation must still point at something
+    if cit.page_id is None and not cit.note and not (
+            cit.record_id or cit.transcription_id or cit.person_mention_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "la cita quedaría vacía: necesita documento o nota")
     await session.flush()
     return cit
 

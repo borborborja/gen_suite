@@ -84,6 +84,43 @@ async def test_kinship_blood_and_affinity(client: AsyncClient):
     assert none["related"] is False and none["path"] == []
 
 
+async def test_link_relative_slots_and_second_marriage(client: AsyncClient):
+    """Slots de FAM correctos: sin auto-matrimonios, sin no-ops silenciosos, madre soltera
+    en el slot wife, segundo matrimonio en familia nueva, y sexo en minúscula normalizado."""
+    h = _auth(await _tenant_token(client))
+
+    # madre soltera (sexo en minúscula → normalizado a F) + hijo → ella ocupa el slot wife
+    madre = await _person(client, h, "Rosa", "Vega", "f")
+    detail = (await client.get(f"/api/tree/persons/{madre}", headers=h)).json()
+    assert detail["sex"] == "F"
+    hijo = await _relative(client, h, madre, "child", given="Luis", surname="Vega", sex="M")
+    sub = (await client.get(f"/api/tree/persons/{madre}/subtree", headers=h)).json()
+    fam = next(f for f in sub["families"] if hijo in f["child_ids"])
+    assert fam["wife_id"] == madre and fam["husband_id"] is None
+
+    # añadir cónyuge a la madre: completa el hueco husband (nada de casarse consigo misma)
+    esposo = await _relative(client, h, madre, "spouse", given="Blas", surname="Sol", sex="M")
+    fams = (await client.get(f"/api/tree/persons/{madre}/families", headers=h)).json()
+    assert len(fams) == 1 and fams[0]["spouse"]["id"] == esposo
+
+    # segundo cónyuge → familia NUEVA (antes: no-op silencioso con 200)
+    esposo2 = await _relative(client, h, madre, "spouse", given="Otto", surname="Dos", sex="M")
+    fams = (await client.get(f"/api/tree/persons/{madre}/families", headers=h)).json()
+    assert len(fams) == 2
+    assert {f["spouse"]["id"] for f in fams} == {esposo, esposo2}
+
+    # plaza de padre ya ocupada → 409 explícito (antes: padre acababa en el slot de madre)
+    r = await client.post(f"/api/tree/persons/{hijo}/relatives",
+                          json={"relation": "mother", "given": "Impostora", "surname": "X", "sex": "F"},
+                          headers=h)
+    assert r.status_code == 409
+
+    # una persona no puede ser pariente de sí misma
+    r = await client.post(f"/api/tree/persons/{madre}/relatives",
+                          json={"relation": "spouse", "relative_id": madre}, headers=h)
+    assert r.status_code == 400
+
+
 async def test_add_relative_links_existing_person(client: AsyncClient):
     """El diálogo «vincular existente» usa relative_id: no debe crear personas nuevas."""
     h = _auth(await _tenant_token(client))

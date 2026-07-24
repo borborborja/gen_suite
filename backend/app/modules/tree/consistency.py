@@ -28,14 +28,14 @@ async def get_consistency(session: AsyncSession) -> dict:
     for pid, etype, year in (await session.execute(
             select(Event.subject_person_id, Event.type, Event.date_year).where(
                 Event.type.in_(("birth", "death")), Event.date_year.is_not(None),
-                Event.subject_person_id.is_not(None)))).all():
+                Event.subject_person_id.is_not(None)).order_by(Event.date_year))).all():
         (births if etype == "birth" else deaths).setdefault(pid, year)
 
     marriages: dict[uuid.UUID, int] = {}
     for fid, year in (await session.execute(
             select(Event.subject_family_id, Event.date_year).where(
                 Event.type == "marriage", Event.date_year.is_not(None),
-                Event.subject_family_id.is_not(None)))).all():
+                Event.subject_family_id.is_not(None)).order_by(Event.date_year))).all():
         marriages.setdefault(fid, year)
 
     fams = (await session.execute(

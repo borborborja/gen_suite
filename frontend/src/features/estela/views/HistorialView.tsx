@@ -47,7 +47,10 @@ export default function HistorialView() {
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
     setDetail(null);
-    if (openId) getChange(openId).then(setDetail).catch(() => setDetail(null));
+    if (!openId) return;
+    let live = true; // ignora respuestas de un cambio ya cerrado/reemplazado
+    getChange(openId).then((d) => { if (live) setDetail(d); }).catch(() => { if (live) setDetail(null); });
+    return () => { live = false; };
   }, [openId]);
 
   async function doRevert(c: ChangeItem) {

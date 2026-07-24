@@ -18,11 +18,14 @@ const CODE_LABEL: Record<string, string> = {
 export default function ConsistenciaView() {
   const e = useEstela();
   const [report, setReport] = useState<ConsistencyReport | null>(null);
+  const [err, setErr] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(() => {
     setBusy(true);
-    getConsistency().then(setReport).catch(() => setReport({ issues: [], counts: {}, checked_at_year: 0 }))
+    setErr(false);
+    // an API failure must NEVER read as "todo en orden" — it's a data-quality checker
+    getConsistency().then(setReport).catch(() => { setReport(null); setErr(true); })
       .finally(() => setBusy(false));
   }, []);
   useEffect(() => { load(); }, [load]);
@@ -44,7 +47,8 @@ export default function ConsistenciaView() {
         <div>
           <h1 style={{ fontFamily: fonts.serif, fontWeight: 600, fontSize: 34, margin: 0, letterSpacing: "-.02em" }}>Consistencia</h1>
           <p style={{ color: "var(--muted)", fontSize: 14, margin: "6px 0 0" }}>
-            {report === null ? "Analizando el árbol…" :
+            {err ? "No se pudo analizar el árbol." :
+              report === null ? "Analizando el árbol…" :
               report.issues.length === 0 ? "Sin problemas detectados: las fechas y parentescos cuadran." :
               <>
                 <b style={{ color: "var(--danger)" }}>{errors} error{errors !== 1 ? "es" : ""}</b>
@@ -57,7 +61,12 @@ export default function ConsistenciaView() {
         <button onClick={load} disabled={busy} style={ghostBtn}>{busy ? "Analizando…" : "↻ Reanalizar"}</button>
       </div>
 
-      {report?.issues.length === 0 && report !== null && (
+      {err && (
+        <div style={{ background: "var(--warn-faint)", border: "1px solid var(--danger)", color: "var(--danger)", borderRadius: 12, padding: 20, fontSize: 14, fontWeight: 600 }}>
+          El análisis falló — no significa que el árbol esté bien. Prueba a reanalizar.
+        </div>
+      )}
+      {!err && report?.issues.length === 0 && report !== null && (
         <div style={{ background: "var(--ok-faint)", border: "1px solid var(--ok)", color: "var(--ok)", borderRadius: 12, padding: 20, fontSize: 14, fontWeight: 600 }}>
           ✓ Todo en orden
         </div>
