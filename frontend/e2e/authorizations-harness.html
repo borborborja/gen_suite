@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Renovación IA — prueba aislada</title></head>
+<body><div id="root"></div><script type="module">
+import React from "react";
+import { createRoot } from "react-dom/client";
+import BillingAuthorizationPanel from "../src/features/estela/views/BillingAuthorizationPanel.tsx";
+createRoot(document.getElementById("root")).render(React.createElement(BillingAuthorizationPanel, {
+  scope: "job", targetId: "00000000-0000-0000-0000-000000000001", task: "inference",
+}));
+</script></body></html>

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.deps import get_current_principal, get_tenant_db, require_roles
@@ -10,7 +11,9 @@ from ...core.security import Principal
 from ...models.membership import MembershipRole
 from ..jobs.schemas import JobOut
 from . import service
-from .schemas import ReconcileRequest, TranscribeRequest, TranscriptionOut, VersionPairOut
+from .schemas import ReconcileRequest, TranscribeRequest, TranscriptionOut, VersionPairOut, TranscriptionRevisionOut, CorrectionRequest
+from ...models.document import Document
+from ...models.transcription import Transcription
 
 router = APIRouter(prefix="/transcription", tags=["transcription"])
 
@@ -53,14 +56,14 @@ async def cancel_transcription(
 )
 async def correct_transcription(
     transcription_id: uuid.UUID,
-    body: dict,
+    body: CorrectionRequest,
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> TranscriptionOut:
     """Save a human-corrected transcription (eScriptorium-style). Body: {"text": "..."}.
     Re-indexes the page (FTS auto + re-embed)."""
     t = await service.correct_text(
-        db, transcription_id, str(body.get("text", "")),
+        db, transcription_id, body.text,
         tenant_id=principal.tenant_id, created_by=principal.user_id,
     )
     return TranscriptionOut(
@@ -98,6 +101,17 @@ async def document_versions(
     ]
 
 
+@router.get("/documents/{document_id}/history", response_model=list[TranscriptionRevisionOut])
+async def history(document_id: uuid.UUID, page_no: int = Query(..., ge=1),
+                  offset: int = Query(0, ge=0), principal=Depends(get_current_principal), db=Depends(get_tenant_db)):
+    if not await db.scalar(select(Document.id).where(Document.id == document_id, Document.tenant_id == principal.tenant_id)):
+        raise HTTPException(404, "Documento no encontrado")
+    revisions = (await db.scalars(select(Transcription).where(
+        Transcription.document_id == document_id, Transcription.page_no == page_no,
+    ).order_by(Transcription.created_at.desc(), Transcription.id).offset(offset).limit(100))).all()
+    return [TranscriptionRevisionOut.model_validate(row, from_attributes=True) for row in revisions]
+
+
 @router.post(
     "/documents/{document_id}/reconcile", dependencies=[Depends(require_roles(*_WRITE))]
 )
@@ -109,5 +123,6 @@ async def reconcile(
     n = await service.reconcile_versions(
         db, principal.tenant_id, document_id, mode=body.mode, criterion=body.criterion,
         keep_history=body.keep_history, choices=body.choices, created_by=principal.user_id,
+        expected_versions={page: value.model_dump(mode="json") for page, value in body.expected_versions.items()},
     )
     return {"pages": n}

@@ -44,6 +44,19 @@ async def test_login_and_refresh_rotation(client: AsyncClient):
     assert replay.status_code == 401
 
 
+async def test_browser_session_keeps_refresh_token_out_of_javascript_response(client: AsyncClient):
+    created = await client.post(
+        "/api/auth/session/register", json={"email": "browser@example.com", "password": "supersecret123"}
+    )
+    assert created.status_code == 201, created.text
+    assert "refresh_token" not in created.json()
+    cookie = created.headers.get("set-cookie", "")
+    assert "HttpOnly" in cookie and "gs_refresh=" in cookie
+    refreshed = await client.post("/api/auth/session/refresh")
+    assert refreshed.status_code == 200, refreshed.text
+    assert "refresh_token" not in refreshed.json()
+
+
 async def test_wrong_password_rejected(client: AsyncClient):
     await client.post(
         "/api/auth/register", json={"email": "x@example.com", "password": "supersecret123"}

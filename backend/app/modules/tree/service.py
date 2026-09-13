@@ -17,6 +17,7 @@ from ...models.family import Family, FamilyChild
 from ...models.person import Name, Person
 from ...models.place import Place
 from ...models.record import Record
+from ...models.research import Source
 from ...models.transcription import Transcription
 from . import gedcom, importer
 from .schemas import (
@@ -306,6 +307,7 @@ async def get_person_detail(session: AsyncSession, person_id: uuid.UUID) -> Pers
         id=person.id,
         sex=person.sex,
         notes=person.notes,
+        privacy_status=person.privacy_status,
         names=[
             NameOut(
                 type=n.type, given=n.given, surname=n.surname, surname_prefix=n.surname_prefix,
@@ -525,6 +527,9 @@ async def get_person_citations(session: AsyncSession, person_id: uuid.UUID) -> l
     doc_ids |= {p.document_id for p in pages.values()}  # manual citas: only a page attached
     docs = {d.id: d for d in (await session.scalars(
         select(Document).where(Document.id.in_(doc_ids)))).all()} if doc_ids else {}
+    source_ids = {c.source_id for c in cits if c.source_id}
+    sources = {s.id: s for s in (await session.scalars(
+        select(Source).where(Source.id.in_(source_ids)))).all()} if source_ids else {}
 
     out: list[CitationOut] = []
     for c in cits:
@@ -538,6 +543,8 @@ async def get_person_citations(session: AsyncSession, person_id: uuid.UUID) -> l
         out.append(CitationOut(
             id=c.id, note=c.note, target_type=c.target_type,
             document_id=document_id, document_title=doc.title if doc else None,
+            source_id=c.source_id, source_title=sources[c.source_id].title if c.source_id in sources else None,
+            assertion_id=c.assertion_id, locator=c.locator, quote=c.quote, quality=c.quality,
             page_no=page_no, record_type=r.record_type if r else None,
             date_raw=r.date_raw if r else None, summary=r.summary if r else None,
         ))
@@ -646,7 +653,7 @@ async def list_persons(
         .correlate(Person).scalar_subquery()
     )
     stmt = (
-        select(Person.id, Name.given, Name.surname, Person.sex,
+        select(Person.id, Name.given, Name.surname, Person.sex, Person.privacy_status,
                birth_sq.label("birth_year"), death_sq.label("death_year"))
         .outerjoin(Name, (Name.person_id == Person.id) & Name.is_primary.is_(True))
     )
@@ -674,8 +681,9 @@ async def list_persons(
     total = await session.scalar(count_stmt) or 0
     return PersonPage(
         total=total,
-        items=[PersonRow(id=pid, given=g, surname=s, sex=sex, birth_year=by, death_year=dy)
-               for pid, g, s, sex, by, dy in rows],
+        items=[PersonRow(id=pid, given=g, surname=s, sex=sex, privacy_status=privacy,
+                         birth_year=by, death_year=dy)
+               for pid, g, s, sex, privacy, by, dy in rows],
     )
 
 

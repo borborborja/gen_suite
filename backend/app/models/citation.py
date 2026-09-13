@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 
 from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -41,4 +42,15 @@ class Citation(Base, TimestampMixin):
     match_candidate_id: Mapped[uuid.UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("match_candidates.id", ondelete="SET NULL")
     )
+    # The original evidence links above remain useful for generated citations.  ``source_id``
+    # introduces the bibliographic layer needed for manual and interoperable research.
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("research_sources.id", ondelete="SET NULL"), index=True
+    )
+    assertion_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("research_assertions.id", ondelete="SET NULL"), index=True
+    )
+    locator: Mapped[dict | None] = mapped_column(JSONB)  # folio, region, line range, archive ref…
+    quote: Mapped[str | None] = mapped_column(Text)
+    quality: Mapped[str | None] = mapped_column(String(16))  # original/derivative/uncertain
     note: Mapped[str | None] = mapped_column(Text)

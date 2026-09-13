@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from httpx import AsyncClient
 
@@ -45,7 +46,11 @@ async def test_credential_is_encrypted_masked_and_resolvable(client: AsyncClient
     binding = await client.put(
         "/api/providers/bindings",
         headers=h,
-        json={"task_type": "transcription", "credential_id": cred_id},
+        json={"task_type": "transcription", "credential_id": cred_id,
+              "params": {"budget_policy": {"model": "gpt-4o-mini", "context_tokens": 100000,
+                  "max_output_tokens": 4096, "input_usd_per_million": "1", "output_usd_per_million": "2",
+                  "valid_until": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+                  "source": "Synthetic fixture — not a provider price"}}},
     )
     assert binding.status_code == 200
 

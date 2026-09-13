@@ -13,6 +13,9 @@ class ImportResult(BaseModel):
     places: int
     events: int
     encoding: str
+    sources: int = 0
+    repositories: int = 0
+    citations: int = 0
 
 
 class TreePerson(BaseModel):
@@ -79,6 +82,7 @@ class PersonDetail(BaseModel):
     id: uuid.UUID
     sex: str
     notes: str | None = None
+    privacy_status: str = "unknown"
     names: list[NameOut]
     events: list[EventOut]
     parents: list[RelatedPerson]
@@ -104,16 +108,28 @@ class FamilyOut(BaseModel):
 
 
 class CitationIn(BaseModel):
-    target_type: str  # person | event
+    target_type: str  # person | name | event | family | assertion
     target_id: uuid.UUID
     document_id: uuid.UUID | None = None
     page_no: int | None = None
+    source_id: uuid.UUID | None = None
+    assertion_id: uuid.UUID | None = None
+    locator: dict | None = None
+    quote: str | None = None
+    quality: str | None = None
     note: str | None = None
 
 
 class CitationPatch(BaseModel):
     document_id: uuid.UUID | None = None
     page_no: int | None = None
+    source_id: uuid.UUID | None = None
+    clear_source: bool = False
+    assertion_id: uuid.UUID | None = None
+    clear_assertion: bool = False
+    locator: dict | None = None
+    quote: str | None = None
+    quality: str | None = None
     note: str | None = None
 
 
@@ -231,6 +247,7 @@ class PersonRow(BaseModel):
     sex: str
     birth_year: int | None
     death_year: int | None
+    privacy_status: str = "unknown"
 
 
 class PersonPage(BaseModel):
@@ -262,6 +279,12 @@ class CitationOut(BaseModel):
     target_type: str
     document_id: uuid.UUID | None = None
     document_title: str | None = None
+    source_id: uuid.UUID | None = None
+    source_title: str | None = None
+    assertion_id: uuid.UUID | None = None
+    locator: dict | None = None
+    quote: str | None = None
+    quality: str | None = None
     page_no: int | None = None
     record_type: str | None = None
     date_raw: str | None = None

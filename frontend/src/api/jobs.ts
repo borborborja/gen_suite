@@ -31,7 +31,7 @@ async function finalEventFromStatus(id: string): Promise<JobEvent | undefined> {
     const kind =
       job.status === "completed" ? "all_done" :
       job.status === "cancelled" ? "cancelled" :
-      job.status === "error" ? "book_fail" : "stream_lost"; // still queued/running
+      job.status === "error" || job.status === "partial" ? "book_fail" : "stream_lost";
     return { kind, done: job.progress?.done, total: job.progress?.total,
              error: job.error ?? undefined, status: job.status };
   } catch {

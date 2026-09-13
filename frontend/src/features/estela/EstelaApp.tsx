@@ -1,4 +1,5 @@
 import { rootStyle } from "./theme";
+import { lazy, Suspense, type ReactNode } from "react";
 import { EstelaProvider, useEstela } from "./store";
 import Sidebar from "./Sidebar";
 import { Toast, ZoomModal } from "./Chrome";
@@ -11,11 +12,15 @@ import VisorView from "./views/VisorView";
 import BuscarView from "./views/BuscarView";
 import SuperView from "./views/SuperView";
 import FsView from "./views/FsView";
-import AjustesView from "./views/AjustesView";
 import LugaresView from "./views/LugaresView";
 import HistorialView from "./views/HistorialView";
 import EstadisticasView from "./views/EstadisticasView";
 import ConsistenciaView from "./views/ConsistenciaView";
+
+const InvestigacionView = lazy(() => import("./views/InvestigacionView"));
+const AjustesView = lazy(() => import("./views/AjustesView"));
+const CompartirView = lazy(() => import("./views/CompartirView"));
+const SincronizacionView = lazy(() => import("./views/SincronizacionView"));
 
 const KEYFRAMES = `
 @keyframes estIn{from{transform:translateY(9px)}to{transform:none}}
@@ -47,16 +52,23 @@ function Shell({ account }: { account?: Account }) {
         {e.nav === "buscar" && <BuscarView />}
         {e.nav === "super" && <SuperView />}
         {e.nav === "familysearch" && <FsView />}
-        {e.nav === "ajustes" && <AjustesView />}
+        {e.nav === "ajustes" && <Deferred><AjustesView /></Deferred>}
         {e.nav === "lugares" && <LugaresView />}
         {e.nav === "historial" && <HistorialView />}
         {e.nav === "estadisticas" && <EstadisticasView />}
         {e.nav === "consistencia" && <ConsistenciaView />}
+        {e.nav === "investigacion" && <Deferred><InvestigacionView /></Deferred>}
+        {e.nav === "compartir" && <Deferred><CompartirView /></Deferred>}
+        {e.nav === "sincronizacion" && <Deferred><SincronizacionView /></Deferred>}
       </main>
       <Toast />
       <ZoomModal />
     </div>
   );
+}
+
+function Deferred({ children }: { children: ReactNode }) {
+  return <Suspense fallback={<div style={{ padding: "32px 44px", color: "var(--muted)" }}>Cargando…</div>}>{children}</Suspense>;
 }
 
 export default function EstelaApp({ account }: { account?: Account }) {

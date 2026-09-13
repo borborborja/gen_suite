@@ -12,12 +12,15 @@ from ...core.security import Principal
 from ...models.document import Document
 from ...models.job import Job
 from ...models.membership import MembershipRole
-from ...modules.providers.service import ProviderService, embed_texts
+from ...modules.providers.service import embed_texts_with_usage
 from ..jobs.schemas import JobOut
 from . import service
 from .schemas import RecordHit, SearchHit, SuggestionOut
+from .index_router import router as index_router
+from .indexes import query_context
 
 router = APIRouter(prefix="/search", tags=["search"])
+router.include_router(index_router)
 
 _WRITE = (MembershipRole.tenant_admin.value, MembershipRole.researcher.value)
 
@@ -31,17 +34,19 @@ async def search(
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> list[SearchHit]:
-    qvec = None
+    qvec = None; generation = None; usage = {}
     if mode in ("semantic", "hybrid"):
-        rc = await ProviderService(db).resolve(tenant_id=principal.tenant_id, task_type="embedding")
-        qvec = (await asyncio.to_thread(embed_texts, rc, [q]))[0]
+        generation, rc = await query_context(db, principal.tenant_id)
+        vectors, usage = await embed_texts_with_usage(rc, [q]); qvec = vectors[0]
 
     if mode == "keyword":
         hits = await service.keyword_search(db, q, scope, principal.tenant_id, limit)
     elif mode == "semantic":
-        hits = await service.vector_search(db, qvec, scope, principal.tenant_id, limit)
+        hits = await service.vector_search(db, qvec, scope, principal.tenant_id, limit,
+            generation_id=generation.id, query_call_id=usage.get("ai_call_id"))
     else:
-        hits = await service.hybrid_search(db, q, qvec, scope, principal.tenant_id, limit)
+        hits = await service.hybrid_search(db, q, qvec, scope, principal.tenant_id, limit,
+            generation_id=generation.id, query_call_id=usage.get("ai_call_id"))
     return [SearchHit(**h) for h in hits]
 
 
@@ -66,14 +71,15 @@ async def search_records(
     """Structured search over extracted acts (record_type/date/place/name/role/book). Fuzzy by
     default (trigram + phonetic, tolerant to HTR errors); optional free-text (operators honoured) or
     semantic ordering."""
-    qvec = None
+    qvec = None; generation = None; usage = {}
     if semantic and q and q.strip():
-        rc = await ProviderService(db).resolve(tenant_id=principal.tenant_id, task_type="embedding")
-        qvec = (await asyncio.to_thread(embed_texts, rc, [q]))[0]
+        generation, rc = await query_context(db, principal.tenant_id)
+        vectors, usage = await embed_texts_with_usage(rc, [q]); qvec = vectors[0]
     hits = await service.search_records(
         db, given=given, surname=surname, record_type=record_type, place=place,
         year_from=year_from, year_to=year_to, role=role, document_id=document_id,
         q=q, qvec=qvec, fuzzy=fuzzy, scope=scope, tenant_id=principal.tenant_id, limit=limit,
+        generation_id=generation.id if generation else None, query_call_id=usage.get("ai_call_id"),
     )
     return [RecordHit(**h) for h in hits]
 
@@ -100,17 +106,21 @@ async def embed_document(
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> JobOut:
+    from sqlalchemy import select
+    from fastapi import HTTPException
+    from ...core.dispatch import schedule
+    from ..jobs.service import active_job_for
+    if not await db.scalar(select(Document.id).where(Document.id == document_id,
+        Document.tenant_id == principal.tenant_id).with_for_update()):
+        raise HTTPException(404, "Documento no encontrado.")
+    existing = await active_job_for(db, principal.tenant_id, "embedding", document_id)
+    if existing: return JobOut.model_validate(existing, from_attributes=True)
     job = Job(
         tenant_id=principal.tenant_id, type="embedding", status="queued",
         params={"document_id": str(document_id)}, created_by=principal.user_id,
     )
     db.add(job)
-    await db.flush()
-    queue = await get_queue()
-    await queue.enqueue_job(
-        "embed_document", job_id=str(job.id), tenant_id=str(principal.tenant_id),
-        document_id=str(document_id),
-    )
+    await schedule(db, job, "embed_document", document_id=str(document_id))
     return JobOut(
         id=job.id, type=job.type, status=job.status, progress=job.progress, result=job.result,
         error=job.error, created_at=job.created_at, started_at=job.started_at,

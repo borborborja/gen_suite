@@ -1,0 +1,142 @@
+name: verify-recovery
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      source:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: gensuite_test_recovery_ci
+          POSTGRES_USER: gensuite_ci
+          POSTGRES_PASSWORD: synthetic-source-pg-ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gensuite_ci -d gensuite_test_recovery_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      target:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: gensuite_restore_ci
+          POSTGRES_USER: gensuite_ci
+          POSTGRES_PASSWORD: synthetic-target-pg-ci
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gensuite_ci -d gensuite_restore_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+
+    env:
+      ENVIRONMENT: development
+      GEN_SUITE_RUN_RECOVERY_INTEGRATION: "yes"
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: gensuite_test_recovery_ci
+      POSTGRES_USER: gensuite_ci
+      POSTGRES_PASSWORD: synthetic-source-pg-ci
+      APP_DB_USER: gensuite_app_ci
+      APP_DB_PASSWORD: synthetic-source-app-ci
+      REDIS_URL: redis://localhost:6379/0
+      MINIO_ENDPOINT: localhost:9000
+      MINIO_ACCESS_KEY: synthetic-source-s3-ci
+      MINIO_SECRET_KEY: synthetic-source-s3-password
+      MINIO_BUCKET_PRIVATE: gensuite-test-recovery-private
+      MINIO_BUCKET_PUBLIC: gensuite-test-recovery-public
+      MINIO_SECURE: "false"
+      MINIO_REGION: us-east-1
+      MINIO_ADDRESSING_STYLE: path
+      JWT_SECRET: synthetic-recovery-ci-jwt-0123456789
+      SUITE_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      ALLOW_FIRST_USER_ADMIN: "true"
+      BACKUP_TO_S3: "false"
+      SMTP_HOST: ""
+      RECOVERY_TEST_TARGET_POSTGRES_HOST: localhost
+      RECOVERY_TEST_TARGET_POSTGRES_PORT: "5433"
+      RECOVERY_TEST_TARGET_POSTGRES_DB: gensuite_restore_ci
+      RECOVERY_TEST_TARGET_POSTGRES_USER: gensuite_ci
+      RECOVERY_TEST_TARGET_POSTGRES_PASSWORD: synthetic-target-pg-ci
+      RECOVERY_TEST_TARGET_APP_DB_USER: gensuite_app_ci
+      RECOVERY_TEST_TARGET_APP_DB_PASSWORD: synthetic-target-app-ci
+      RECOVERY_TEST_TARGET_MINIO_ENDPOINT: localhost:9001
+      RECOVERY_TEST_TARGET_MINIO_ACCESS_KEY: synthetic-target-s3-ci
+      RECOVERY_TEST_TARGET_MINIO_SECRET_KEY: synthetic-target-s3-password
+      RECOVERY_TEST_TARGET_MINIO_BUCKET_PRIVATE: gensuite-restore-ci-private
+      RECOVERY_TEST_TARGET_MINIO_BUCKET_PUBLIC: gensuite-restore-ci-public
+      RECOVERY_TEST_TARGET_MINIO_SECURE: "false"
+      RECOVERY_TEST_TARGET_MINIO_REGION: us-east-1
+      RECOVERY_TEST_TARGET_MINIO_ADDRESSING_STYLE: path
+      RECOVERY_TEST_TARGET_SUITE_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Iniciar dos almacenes sintéticos independientes
+        run: |
+          # Legacy MinIO is only the system under test, not an approved production backend.
+          docker run -d --name recovery-source-s3 -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=synthetic-source-s3-ci \
+            -e MINIO_ROOT_PASSWORD=synthetic-source-s3-password \
+            quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          docker run -d --name recovery-target-s3 -p 127.0.0.1:9001:9000 \
+            -e MINIO_ROOT_USER=synthetic-target-s3-ci \
+            -e MINIO_ROOT_PASSWORD=synthetic-target-s3-password \
+            quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live && curl -fsS http://localhost:9001/minio/health/live; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: Construir backend con clientes PostgreSQL 16
+        run: docker build -f docker/backend.Dockerfile -t gen-suite-recovery:ci .
+      - name: Migrar solo origen y ejecutar copia/restauración completas
+        run: |
+          mkdir "${RUNNER_TEMP}/gensuite-recovery"
+          recovery_names=(ENVIRONMENT GEN_SUITE_RUN_RECOVERY_INTEGRATION
+            POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD
+            APP_DB_USER APP_DB_PASSWORD REDIS_URL MINIO_ENDPOINT MINIO_ACCESS_KEY MINIO_SECRET_KEY
+            MINIO_BUCKET_PRIVATE MINIO_BUCKET_PUBLIC MINIO_SECURE MINIO_REGION MINIO_ADDRESSING_STYLE
+            JWT_SECRET SUITE_MASTER_KEY ALLOW_FIRST_USER_ADMIN BACKUP_TO_S3 SMTP_HOST)
+          recovery_target_fields=(POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD
+            APP_DB_USER APP_DB_PASSWORD MINIO_ENDPOINT MINIO_ACCESS_KEY MINIO_SECRET_KEY
+            MINIO_BUCKET_PRIVATE MINIO_BUCKET_PUBLIC MINIO_SECURE MINIO_REGION MINIO_ADDRESSING_STYLE SUITE_MASTER_KEY)
+          for field in "${recovery_target_fields[@]}"; do recovery_names+=("RECOVERY_TEST_TARGET_${field}"); done
+          recovery_args=()
+          for name in "${recovery_names[@]}"; do recovery_args+=(-e "$name"); done
+          run_recovery() {
+            docker run --rm --network host --user "$(id -u):$(id -g)" --read-only --cap-drop ALL \
+              --security-opt no-new-privileges --pids-limit 256 --memory 2g \
+              --tmpfs /tmp:size=512m,mode=1777,nosuid,nodev \
+              --mount "type=bind,source=${RUNNER_TEMP}/gensuite-recovery,target=/recovery" \
+              "${recovery_args[@]}" gen-suite-recovery:ci "$@"
+          }
+          run_recovery alembic upgrade head
+          run_recovery python -c 'from checks.smoke_recovery import configuration, s3_client, settings
+          for config in (settings, configuration()):
+              client = s3_client(config)
+              for bucket in (config.minio_bucket_private, config.minio_bucket_public):
+                  client.create_bucket(Bucket=bucket)'
+          run_recovery python checks/smoke_recovery.py /recovery/bundle
+      - name: Conservar copia sintética o parcial para inspección
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-recovery-bundle
+          path: ${{ runner.temp }}/gensuite-recovery
+          if-no-files-found: ignore
+          retention-days: 3

@@ -15,9 +15,10 @@ interface Me {
   active_role: string | null;
   memberships: Membership[];
 }
-interface TokenPair {
-  access_token: string;
-  refresh_token: string;
+interface PublicTree {
+  title: string;
+  published_at: string | null;
+  payload: { persons?: Array<{ id: string; given: string | null; surname: string | null; events?: Array<{ type: string; date_raw: string | null; value: string | null }> }>; families?: unknown[] };
 }
 
 // Optional dev auto-login: set VITE_DEV_BYPASS=true (plus VITE_DEV_EMAIL / VITE_DEV_PASSWORD)
@@ -28,6 +29,9 @@ const DEV_EMAIL = import.meta.env.VITE_DEV_EMAIL as string | undefined;
 const DEV_PASSWORD = import.meta.env.VITE_DEV_PASSWORD as string | undefined;
 
 export default function App() {
+  const publicMatch = /^\/p\/([a-z0-9-]+)$/i.exec(window.location.pathname);
+  if (publicMatch) return <PublicShare slug={publicMatch[1]} />;
+  if (window.location.pathname === "/reset") return <ResetPassword />;
   const [me, setMe] = useState<Me | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [booting, setBooting] = useState(true);
@@ -40,8 +44,8 @@ export default function App() {
       // exactly one membership and none active → auto-select it so we land in Estela, not the picker
       const target = m.active_tenant_id ? null : (m.memberships.length === 1 ? m.memberships[0].tenant_id : null);
       if (target) {
-        const t = await api<TokenPair>(`/auth/switch/${target}`, { method: "POST" });
-        setTokens(t.access_token, t.refresh_token);
+        const t = await api<{ access_token: string }>(`/auth/session/switch/${target}`, { method: "POST" });
+        setTokens(t.access_token);
         setMe(await api<Me>("/auth/me"));
       } else {
         setMe(m);
@@ -54,11 +58,11 @@ export default function App() {
 
   const autoLogin = useCallback(async () => {
     try {
-      const t = await api<TokenPair>("/auth/login", {
+      const t = await api<{ access_token: string }>("/auth/session/login", {
         method: "POST",
         body: JSON.stringify({ email: DEV_EMAIL, password: DEV_PASSWORD }),
       }, false);
-      setTokens(t.access_token, t.refresh_token);
+      setTokens(t.access_token);
       await loadMe();
     } catch (e) {
       setError((e as Error).message);
@@ -68,8 +72,13 @@ export default function App() {
 
   useEffect(() => {
     if (hasToken()) { void loadMe().finally(() => setBooting(false)); return; }
-    if (DEV_BYPASS && DEV_EMAIL && DEV_PASSWORD) { void autoLogin(); return; }
-    setBooting(false);
+    void api<{ access_token: string }>("/auth/session/refresh", { method: "POST" }, false)
+      .then((t) => { setTokens(t.access_token); return loadMe(); })
+      .catch(() => {
+        if (DEV_BYPASS && DEV_EMAIL && DEV_PASSWORD) return autoLogin();
+        return undefined;
+      })
+      .finally(() => setBooting(false));
   }, [loadMe, autoLogin]);
 
   // The API client fires this when a refresh fails (session truly expired) — drop to the login view.
@@ -81,10 +90,7 @@ export default function App() {
 
   const logout = useCallback(async () => {
     try {
-      await api("/auth/logout", {
-        method: "POST",
-        body: JSON.stringify({ refresh_token: localStorage.getItem("gs_refresh") }),
-      });
+      await api("/auth/session/logout", { method: "POST" }, false);
     } catch {
       /* ignore */
     }
@@ -112,6 +118,32 @@ export default function App() {
   // a minimal setup screen lets the user create or select a tenant.
   if (me.active_tenant_id) return <EstelaApp account={{ email: me.user.email, onLogout: logout }} />;
   return <TenantSetup me={me} reload={loadMe} onLogout={logout} error={error} setError={setError} />;
+}
+
+function PublicShare({ slug }: { slug: string }) {
+  const [tree, setTree] = useState<PublicTree | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    const token = window.location.hash.slice(1);
+    // Remove the capability from copy/paste history as soon as it has been read.
+    window.history.replaceState(null, "", `/p/${slug}`);
+    if (!token) { setError("Este enlace no contiene una clave de acceso válida."); return; }
+    void api<PublicTree>(`/public/share/${encodeURIComponent(slug)}`, {
+      method: "POST", body: JSON.stringify({ token }),
+    }, false).then(setTree).catch(() => setError("El enlace no existe, ha caducado o fue revocado."));
+  }, [slug]);
+  return <Shell>
+    <h1 style={styles.brand}>{tree?.title || "Árbol compartido"}</h1>
+    {error && <p style={styles.error}>{error}</p>}
+    {!tree && !error && <p style={styles.muted}>Cargando árbol…</p>}
+    {tree && <div style={styles.card}>
+      <p style={styles.sub}>{tree.payload.persons?.length || 0} personas publicadas</p>
+      {(tree.payload.persons || []).map((person) => <div key={person.id} style={{ padding: "9px 0", borderBottom: "1px solid #e2dbd0" }}>
+        <strong>{[person.given, person.surname].filter(Boolean).join(" ") || "Sin nombre"}</strong>
+        {(person.events || []).map((event, index) => <div key={index} style={styles.muted}>{event.type}{event.date_raw ? ` · ${event.date_raw}` : ""}{event.value ? ` · ${event.value}` : ""}</div>)}
+      </div>)}
+    </div>}
+  </Shell>;
 }
 
 // ── shared minimal styling for the pre-Estela screens (login / tenant setup) ──
@@ -143,9 +175,12 @@ function Auth({
   onAuthed: () => Promise<void>;
   initialError: string | null;
 }) {
-  const [mode, setMode] = useState<"login" | "register">("login");
+  const inviteToken = new URLSearchParams(window.location.search).get("token");
+  const [mode, setMode] = useState<"login" | "register" | "request">(inviteToken ? "register" : "login");
   const [email, setEmail] = useState("");
+  const [fullName, setFullName] = useState("");
   const [password, setPassword] = useState("");
+  const [mfaCode, setMfaCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(initialError);
 
@@ -153,11 +188,16 @@ function Auth({
     setError(null);
     setBusy(true);
     try {
-      const t = await api<TokenPair>(`/auth/${mode}`, {
+      if (mode === "request") {
+        await api("/auth/access-requests", { method: "POST", body: JSON.stringify({ email, full_name: fullName || undefined }) }, false);
+        setError("Solicitud enviada. Recibirás una invitación si se aprueba el acceso.");
+        return;
+      }
+      const t = await api<{ access_token: string }>(`/auth/session/${mode}`, {
         method: "POST",
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ email, password, invite_token: mode === "register" ? inviteToken : undefined, mfa_code: mfaCode || undefined }),
       }, false);
-      setTokens(t.access_token, t.refresh_token);
+      setTokens(t.access_token);
       await onAuthed();
     } catch (e) {
       setError((e as Error).message);
@@ -169,8 +209,10 @@ function Auth({
     <Shell>
       <h1 style={styles.brand}>Estela</h1>
       <p style={styles.sub}>Investigación genealógica sobre tus libros parroquiales</p>
-      <form onSubmit={(ev) => { ev.preventDefault(); if (email && password.length >= 8) void submit(); }}>
+      <form onSubmit={(ev) => { ev.preventDefault(); if (email && (mode === "request" || password.length >= 8)) void submit(); }}>
         <input style={styles.input} placeholder="email" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+        {mode === "request" && <input style={styles.input} placeholder="nombre (opcional)" value={fullName} onChange={(e) => setFullName(e.target.value)} />}
+        {mode !== "request" && <>
         <input
           style={styles.input}
           placeholder="contraseña (mín. 8 caracteres)"
@@ -179,18 +221,40 @@ function Auth({
           value={password}
           onChange={(e) => setPassword(e.target.value)}
         />
-        <button type="submit" style={{ ...styles.primary, opacity: !email || password.length < 8 || busy ? 0.6 : 1 }} disabled={!email || password.length < 8 || busy}>
-          {busy ? "Un momento…" : mode === "login" ? "Entrar" : "Crear cuenta"}
+        {mode === "login" && <input style={styles.input} placeholder="código MFA (si lo activaste)" inputMode="numeric" autoComplete="one-time-code" value={mfaCode} onChange={(e) => setMfaCode(e.target.value)} />}
+        </>}
+        <button type="submit" style={{ ...styles.primary, opacity: !email || (mode !== "request" && password.length < 8) || busy ? 0.6 : 1 }} disabled={!email || (mode !== "request" && password.length < 8) || busy}>
+          {busy ? "Un momento…" : mode === "login" ? "Entrar" : mode === "register" ? "Crear cuenta" : "Solicitar acceso"}
         </button>
       </form>
       <p style={{ marginTop: 16 }}>
-        <button style={styles.ghost} onClick={() => { setError(null); setMode(mode === "login" ? "register" : "login"); }}>
-          {mode === "login" ? "¿No tienes cuenta? Regístrate" : "¿Ya tienes cuenta? Entra"}
+        <button style={styles.ghost} onClick={() => { setError(null); setMode(mode === "login" ? "request" : "login"); }}>
+          {mode === "login" ? "¿Necesitas acceso? Solicítalo" : "¿Ya tienes cuenta? Entra"}
         </button>
       </p>
+      {mode === "request" && <p><button style={styles.ghost} onClick={() => setMode("register")}>¿Tienes una invitación o eres la administración inicial? Crear cuenta</button></p>}
+      {inviteToken && mode !== "register" && <p><button style={styles.ghost} onClick={() => setMode("register")}>Usar la invitación recibida</button></p>}
       {error && <p style={styles.error}>{error}</p>}
     </Shell>
   );
+}
+
+function ResetPassword() {
+  const token = new URLSearchParams(window.location.search).get("token") || "";
+  const [password, setPassword] = useState("");
+  const [message, setMessage] = useState<string | null>(null);
+  async function submit() {
+    try {
+      await api("/auth/password-reset/confirm", { method: "POST", body: JSON.stringify({ token, new_password: password }) }, false);
+      setMessage("Contraseña restablecida. Ya puedes entrar.");
+    } catch (error) { setMessage((error as Error).message); }
+  }
+  return <Shell><h1 style={styles.brand}>Restablecer contraseña</h1>
+    <p style={styles.sub}>El enlace solo puede usarse una vez.</p>
+    <input style={styles.input} type="password" autoComplete="new-password" placeholder="nueva contraseña (mín. 8 caracteres)" value={password} onChange={(event) => setPassword(event.target.value)} />
+    <button style={styles.primary} disabled={!token || password.length < 8} onClick={() => void submit()}>Guardar contraseña</button>
+    {message && <p style={styles.error}>{message}</p>}
+  </Shell>;
 }
 
 function TenantSetup({
@@ -211,8 +275,8 @@ function TenantSetup({
   async function switchTenant(tid: string) {
     setError(null);
     try {
-      const t = await api<TokenPair>(`/auth/switch/${tid}`, { method: "POST" });
-      setTokens(t.access_token, t.refresh_token);
+      const t = await api<{ access_token: string }>(`/auth/session/switch/${tid}`, { method: "POST" });
+      setTokens(t.access_token);
       await reload();
     } catch (e) {
       setError((e as Error).message);

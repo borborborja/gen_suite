@@ -1,8 +1,8 @@
 name: gen_suite
 
 # Generic, portable stack — works on any host (amd64/arm64) with Docker.
-#   1) cp config/.env.example config/.env   and fill the secrets (openssl rand -base64 32 → SUITE_MASTER_KEY)
-#   2) docker compose --env-file config/.env up -d --build
+#   Configure config/.env, then: docker compose --env-file config/.env up -d --build --wait
+#   Initial administration and optional setup helper: see DEPLOY.md.
 #
 # Config lives in ./config (config/.env) and all persistent data under ./data (DATA_DIR) — both
 # host-mapped so you can see/back-up/move them. Object storage defaults to a bundled MinIO (profile
@@ -10,6 +10,13 @@ name: gen_suite
 # config/.env and the bundled MinIO won't start. The frontend (nginx + /api proxy) is on :8080.
 # Homelab overlay (Cloudflare tunnel, external nets): docker compose -f compose.micapum.yaml up -d --build
 # Build on the target arch (or: docker buildx build --platform linux/amd64) — see DEPLOY.md.
+
+# Each consumer can build the shared image on a clean host; no installer/pre-build is required.
+x-backend-image: &backend-image
+  build:
+    context: .
+    dockerfile: docker/backend.Dockerfile
+  image: gen-suite-backend:latest
 
 services:
   gen-suite-db:
@@ -45,7 +52,7 @@ services:
   # Bundled object storage. Only runs with COMPOSE_PROFILES=bundled-storage (the default in
   # config/.env.example). For external S3, clear COMPOSE_PROFILES and set the MINIO_* vars.
   gen-suite-minio:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     container_name: gen-suite-minio
     profiles: ["bundled-storage"]
     command: ["server", "/data", "--console-address", ":9001"]
@@ -55,12 +62,17 @@ services:
       TZ: ${TZ:-UTC}
     volumes:
       - ${DATA_DIR:-./data}/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     ports:
       - 127.0.0.1:9001:9001   # console — localhost only; do not publish
     restart: unless-stopped
 
   gen-suite-migrate:
-    image: gen-suite-backend:latest
+    <<: *backend-image
     container_name: gen-suite-migrate
     command: ["alembic", "upgrade", "head"]
     env_file: [config/.env]
@@ -72,10 +84,7 @@ services:
     restart: "no"
 
   gen-suite-backend:
-    build:
-      context: .
-      dockerfile: docker/backend.Dockerfile
-    image: gen-suite-backend:latest
+    <<: *backend-image
     container_name: gen-suite-backend
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file: [config/.env]
@@ -90,19 +99,22 @@ services:
         condition: service_healthy
       gen-suite-redis:
         condition: service_healthy
+      gen-suite-minio:
+        condition: service_healthy
+        required: false  # absent when using external S3
       gen-suite-migrate:
         condition: service_completed_successfully
     ports:
       - 127.0.0.1:8000:8000   # API + Swagger at /docs — localhost (the frontend proxies /api internally)
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/readyz"]
       interval: 10s
       timeout: 5s
       retries: 6
     restart: unless-stopped
 
   gen-suite-worker:
-    image: gen-suite-backend:latest
+    <<: *backend-image
     container_name: gen-suite-worker
     command: ["arq", "app.tasks.worker.WorkerSettings"]
     env_file: [config/.env]
@@ -114,8 +126,46 @@ services:
     depends_on:
       gen-suite-redis:
         condition: service_healthy
+      gen-suite-minio:
+        condition: service_healthy
+        required: false
       gen-suite-migrate:
         condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Optional local PDF/A conversion. No public port, Docker socket or data mount.
+  gen-suite-pdfa:
+    profiles: ["pdfa"]
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      target: pdfa
+    image: gen-suite-pdfa:latest
+    command: ["arq", "app.tasks.worker.PdfaWorkerSettings"]
+    env_file: [config/.env]
+    environment:
+      POSTGRES_HOST: gen-suite-db
+      REDIS_URL: redis://:${REDIS_PASSWORD}@gen-suite-redis:6379/0
+    read_only: true
+    user: "10001:10001"
+    init: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:size=4g,mode=1777,nosuid,nodev"]
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 256
+    stop_grace_period: 30s
+    depends_on:
+      gen-suite-redis: { condition: service_healthy }
+      gen-suite-minio: { condition: service_healthy, required: false }
+      gen-suite-migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "arq", "--check", "app.tasks.worker.PdfaWorkerSettings"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
     restart: unless-stopped
 
   gen-suite-frontend:
@@ -128,5 +178,10 @@ services:
       gen-suite-backend:
         condition: service_healthy
     ports:
-      - ${FRONTEND_PORT:-8080}:80   # the app UI — point your reverse proxy / browser here
+      - 127.0.0.1:${FRONTEND_PORT:-8080}:80  # expose only through the host TLS proxy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
     restart: unless-stopped

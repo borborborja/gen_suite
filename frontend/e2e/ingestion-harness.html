@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Importador — prueba aislada</title></head>
+<body><div id="root"></div><script type="module">
+import React from "react";
+import { createRoot } from "react-dom/client";
+import IngestPanel from "../src/features/estela/views/IngestPanel.tsx";
+createRoot(document.getElementById("root")).render(React.createElement(IngestPanel, {
+  onClose() { document.getElementById("root").textContent = "Cerrado"; },
+  onChanged() {},
+}));
+</script></body></html>

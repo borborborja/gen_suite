@@ -12,15 +12,125 @@ tu dominio (p. ej. `https://TU-DOMINIO`). API, worker, Postgres, Redis y MinIO s
   secreto es un placeholder/valor de ejemplo (ver `settings.validate_runtime_secrets`).
 - **Redis con contraseña** (`--requirepass`), y `REDIS_URL` con credenciales en backend/worker.
 - El proxy/túnel apunta a `gen-suite-frontend:80` (build estático), **no** al dev-server de Vite.
+- Activa `INVITATION_ONLY=true`, `API_DOCS_ENABLED=false` y deja `GRAMPS_SYNC_ENABLED=false` hasta que
+  exista una validación bidireccional completa. Configura SMTP con SPF, DKIM y DMARC: las invitaciones y
+  los restablecimientos de contraseña son enlaces de un solo uso.
+- El puerto del frontend queda ligado a `127.0.0.1`; publica únicamente 80/443 desde Caddy/nginx, con TLS,
+  firewall y SSH limitado a IPs de administración. `/healthz` comprueba proceso y `/readyz` comprueba
+  Postgres, Redis y S3: el monitor externo debe consultar este último.
 
-## Pasos de despliegue
-1. `cp config/.env.example config/.env` y rellena los secretos; `docker compose --env-file config/.env up -d --build`.
-2. **Primer arranque — bootstrap del admin**: pon temporalmente `ALLOW_FIRST_USER_ADMIN=true` en `config/.env`,
-   `docker compose --env-file config/.env up -d --build`, **regístrate** (ese primer usuario será server-admin),
-   y vuelve a poner `ALLOW_FIRST_USER_ADMIN=false` + `docker compose --env-file config/.env up -d` para
-   recargar. Después nadie más se autopromociona.
-3. Apunta tu proxy/túnel a `gen-suite-frontend:80` y verifica: `https://TU-DOMINIO` carga el login; la
-   API responde 401 sin token.
+## Instalación principal: Docker Compose
+
+Solo necesitas Docker con Compose 2.20+ y acceso al daemon (`docker info`). No hace falta instalar
+Python ni Node en el servidor, ejecutar `install.sh` ni crear `config/installer.json`.
+
+### 1. Preparar la configuración una sola vez
+
+Si ya existe `config/.env`, consérvalo. En una instalación nueva:
+
+```bash
+cp -n config/.env.example config/.env
+chmod 600 config/.env
+```
+
+Edita `config/.env` antes del primer arranque:
+
+- Pon valores aleatorios distintos en `POSTGRES_PASSWORD`, `APP_DB_PASSWORD`, `REDIS_PASSWORD`,
+  `MINIO_SECRET_KEY` y `JWT_SECRET`. Puedes generar cada uno con `openssl rand -hex 32`.
+- Genera `SUITE_MASTER_KEY` con `openssl rand -base64 32`.
+- Ajusta `FRONTEND_PUBLIC_URL` y `CORS_ORIGINS` a tu dominio HTTPS y configura SMTP (STARTTLS).
+- Mantén `ENVIRONMENT=production`, `DEBUG=false`, `ALLOW_FIRST_USER_ADMIN=false` e `INVITATION_ONLY=true`.
+
+No cambies los secretos al reiniciar. No publiques el archivo ni ejecutes `source config/.env`.
+Compose aplica las variables exportadas del shell por encima de `--env-file`: evita exportar valores
+distintos para las claves de la suite. Si existen datos pero falta su `.env`, restaura la configuración
+original antes de arrancar; generar otras contraseñas no recupera el acceso.
+
+### 2. Arrancar el stack
+
+```bash
+docker compose --env-file config/.env up -d --build --wait --wait-timeout 180
+```
+
+`compose.yaml` contiene la construcción de la imagen compartida por API, worker y migraciones:
+no necesita que un script la construya previamente. Compose espera a Postgres y Redis, y a MinIO
+cuando está activo. La API y el worker requieren que las migraciones terminen correctamente.
+`--wait` también comprueba la salud del backend y del frontend; amplía `--wait-timeout` si el host es lento.
+En una instalación nueva, una migración fallida bloquea el arranque de la aplicación.
+
+### PDF/A opcional
+
+Para convertir y validar derivados PDF/A-2b, activa el perfil `pdfa`:
+
+```bash
+docker compose --env-file config/.env --profile pdfa up -d --build --wait --wait-timeout 180
+```
+
+Mantén `pdfa` en `COMPOSE_PROFILES` si quieres conservarlo en futuros arranques.
+Es un worker independiente, sin puerto público y con temporales/memoria limitados;
+no añade herramientas al host ni consume IA al exportar. Versiones, límites, prueba
+sintética y uso con imágenes publicadas: [PDF/A opcional](docs/PDFA.md).
+
+### 3. Crear la administración inicial
+
+```bash
+docker compose --env-file config/.env run --rm --no-deps gen-suite-backend python -m app.bootstrap_admin
+```
+
+El comando usa Python **dentro del contenedor**, pide correo y contraseña oculta y mantiene cerrado
+el bootstrap público. Solo crea una cuenta cuando la base está vacía; conserva la administración
+existente y nunca promociona otras cuentas. No incluyas la contraseña en argumentos ni en el `.env`.
+
+### 4. Conectar HTTPS y comprobar el acceso
+
+Conecta tu proxy TLS del host a `127.0.0.1:8080` (o al puerto `FRONTEND_PORT`). DNS, TLS, firewall y
+SMTP se administran aparte. En el dominio público verifica el login y `/readyz` (JSON con
+`status=ready`): la comprobación interna de Docker no certifica el acceso desde Internet.
+
+Consulta estado y registros con Compose; los logs pueden contener datos privados, no los publiques:
+
+```bash
+docker compose --env-file config/.env ps --all
+docker compose --env-file config/.env logs --tail 100 gen-suite-migrate gen-suite-backend gen-suite-frontend
+```
+
+### Instalar desde imágenes publicadas (sin build)
+
+Copia `compose.release.yaml` y `config/.env.example` al servidor, prepara `config/.env` como arriba y
+fija `GEN_SUITE_VERSION` a una versión **publicada** que incluya `app.bootstrap_admin`. No se presupone
+que esta revisión ya esté publicada en GHCR. Después:
+
+```bash
+docker compose -f compose.release.yaml --env-file config/.env pull
+docker compose -f compose.release.yaml --env-file config/.env up -d --wait --wait-timeout 180
+docker compose -f compose.release.yaml --env-file config/.env run --rm --no-deps gen-suite-backend python -m app.bootstrap_admin
+```
+
+Usa siempre el mismo `-f compose.release.yaml` al consultar estado, logs o actualizar este despliegue.
+
+### Actualizar una instalación
+
+Realiza y verifica un backup antes de actualizar. Para instalaciones desde código, incorpora la
+revisión elegida y repite `docker compose --env-file config/.env up -d --build --wait --wait-timeout 180`.
+Para releases, cambia solo `GEN_SUITE_VERSION` en `config/.env` a la versión publicada elegida y repite
+`pull` y `up` con `-f compose.release.yaml`. Compose no consulta `config/installer.json`.
+No hace falta recrear la administración, regenerar configuración ni borrar volúmenes.
+Backend, worker y migraciones deben utilizar la misma imagen. La reversión de una migración requiere
+el procedimiento de recuperación de datos; cambiar solo la imagen no revierte el esquema.
+
+### Asistente opcional
+
+`install.sh` se conserva para quien prefiera preguntas guiadas, pero no es un requisito de instalación:
+
+- Con Python 3.10+ en el host, `./install.sh --domain arbol.example.org --configure-only` genera una
+  configuración nueva y un ejemplo de Caddy; después puedes seguir exclusivamente con Compose.
+- `./install.sh` ejecuta Compose por fases, genera secretos solo si falta `.env` y conserva las cuentas.
+- Solo el asistente consulta `config/installer.json`. Si vuelves a él tras cambiar una release mediante
+  Compose, sincroniza su campo `release` con `GEN_SUITE_VERSION`; para builds locales usa `release: null`.
+- Si ya usas un overlay privado o nombres distintos, conserva tu procedimiento Compose.
+
+Pruebas de configuración Compose y del asistente: `python3 -m unittest discover -s scripts/tests -v`;
+no usan el `.env` ni los datos del despliegue. La CI prueba bootstrap contra una base desechable.
 
 > Para el despliegue privado del autor (túnel Cloudflare/Dockflare, redes externas, IPs de LAN) usa el
 > overlay `compose.micapum.yaml` (ignorado por git): `docker compose -f compose.micapum.yaml up -d --build`.
@@ -36,6 +146,11 @@ tu dominio (p. ej. `https://TU-DOMINIO`). API, worker, Postgres, Redis y MinIO s
 La biblioteca se guarda en el MinIO del stack, con los datos en `./data/minio` (host-mapeado).
 `COMPOSE_PROFILES=bundled-storage` en `config/.env` lo activa.
 
+El perfil bundled sirve para evaluación y uso privado controlado, pero la edición
+comunitaria fijada tiene un [aviso de seguridad pendiente](docs/ESTADO_VALIDACION_REAL.md#minio-multipart-corregido-bloqueo-de-seguridad-pendiente).
+Para una exposición pública usa por ahora un S3 mantenido y acreditado; no presentes
+el perfil bundled como almacenamiento aprobado de producción.
+
 ### S3 externo (AWS / Backblaze / Wasabi)
 1. Pre-crea los **dos buckets** (privado y público) en tu proveedor.
 2. En `config/.env`: `COMPOSE_PROFILES=` (vacío, para no arrancar el MinIO local) y
@@ -46,11 +161,21 @@ La biblioteca se guarda en el MinIO del stack, con los datos en `./data/minio` (
    El acceso a los blobs sigue siendo **a través de la API** (auth + RLS), nunca por URL pública, así que
    ambos buckets pueden ser privados a nivel de S3.
 
-### Backups de la BBDD a S3
-`BACKUP_TO_S3=true` (en `config/.env`) activa un `pg_dump` diario (hora `BACKUP_HOUR` UTC) que sube un dump
-en formato custom a `{MINIO_BUCKET_PRIVATE}/_backups/gensuite-FECHA.dump`, conservando los `BACKUP_RETENTION`
-más recientes. **Restaurar**: descarga el `.dump` y
-`pg_restore --clean --no-owner -h <host> -U <POSTGRES_USER> -d <POSTGRES_DB> archivo.dump`.
+### Backups y restauración
+
+`BACKUP_TO_S3=true` activa un dump diario **solo de PostgreSQL** (hora `BACKUP_HOUR` UTC)
+en `BACKUP_S3_BUCKET`. No protege los JPG/PDF de S3 por sí solo. Ahora transfiere desde
+un archivo temporal privado y declara expresamente su alcance en un descriptor SHA-256.
+
+La herramienta [Recuperación completa](docs/RECUPERACION_COMPLETA.md) permite copiar
+PostgreSQL **más ambos buckets**, verificar, subir/descargar del almacén de backup y
+restaurar únicamente en otro clúster y buckets vacíos, con cuarentena. Se ejecuta mediante
+el overlay opcional `compose.recovery.yaml`; requiere detener todos los escritores y
+custodiar por separado configuración y clave maestra. No borra copias ni utiliza `--clean`.
+
+Configura y comprueba cifrado, versionado y retención/Object Lock del destino con una
+cuenta separada: el código no acredita esas políticas. Exige un ensayo real de restauración
+antes de la release; la verificación de checksums o `/readyz` por sí solos no bastan.
 
 ## Avisos importantes
 - **Volumen de Postgres**: las contraseñas solo se aplican al **inicializar** el volumen `pgdata`. Si ya
@@ -71,7 +196,7 @@ ARM, x86 o cualquier sitio**. Las únicas dependencias con binarios (`pymupdf`, 
 (`pgvector/pgvector:pg16`, `redis`, `minio`, `python:3.12-slim`, `nginx`) son **multi-arch**.
 
 **Único matiz real:** las imágenes se construyen para la arquitectura donde haces `docker build`.
-- **Recomendado:** construir **en el servidor de destino** (x86): `git pull && docker compose up -d --build` → x86 automático.
+- **Recomendado:** construir **en el servidor de destino** (x86): `docker compose --env-file config/.env up -d --build --wait` → x86 automático.
 - Si construyes en tu **Mac (ARM)** para desplegar en x86: `docker buildx build --platform linux/amd64 …`
   (o añade `platform: linux/amd64` a los servicios de `compose.yaml`).
 - El `.venv-local` (binarios ARM del dev) **no entra** en la imagen (`.dockerignore`); el contenedor hace su

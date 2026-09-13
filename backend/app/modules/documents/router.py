@@ -13,6 +13,13 @@ from . import service
 from .schemas import DocumentOut, PageOut, PublishRequest
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+from .exports import router as exports_router
+router.include_router(exports_router)
+from .ingestion import router as ingestion_router
+from .cleanup import router as cleanup_router
+# Static /ingestion/quota must precede the dynamic /ingestion/{session_id} route.
+router.include_router(cleanup_router)
+router.include_router(ingestion_router)
 
 _WRITE = (MembershipRole.tenant_admin.value, MembershipRole.researcher.value)
 
@@ -35,7 +42,7 @@ async def _read_capped(files: list[UploadFile]) -> list[tuple[str | None, str | 
         # Starlette populates .size from Content-Length; reject up front when present.
         if f.size is not None and f.size > cap:
             raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "archivo demasiado grande")
-        data = await f.read()
+        data = await f.read(min(cap, _MAX_TOTAL_BYTES - total) + 1)
         if len(data) > cap:
             raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "archivo demasiado grande")
         total += len(data)
@@ -184,11 +191,7 @@ async def compact_pdf(
 @router.get("/{doc_id}/pages", response_model=list[PageOut])
 async def list_pages(doc_id: uuid.UUID, db: AsyncSession = Depends(get_tenant_db)) -> list[PageOut]:
     return [
-        PageOut(
-            id=p.id, page_no=p.page_no, folio_label=p.folio_label, kind=p.kind,
-            content_type=p.content_type,
-            width=p.width, height=p.height, byte_size=p.byte_size, source_ref=p.source_ref,
-        )
+        PageOut.model_validate(p, from_attributes=True)
         for p in await service.list_pages(db, doc_id)
     ]
 
@@ -214,9 +217,7 @@ async def set_page_kind(
     db: AsyncSession = Depends(get_tenant_db),
 ) -> PageOut:
     p = await service.set_page_kind(db, principal.tenant_id, doc_id, page_no, body.kind)
-    return PageOut(id=p.id, page_no=p.page_no, folio_label=p.folio_label, kind=p.kind,
-                   content_type=p.content_type, width=p.width, height=p.height,
-                   byte_size=p.byte_size, source_ref=p.source_ref)
+    return PageOut.model_validate(p, from_attributes=True)
 
 
 class SplitRequest(BaseModel):

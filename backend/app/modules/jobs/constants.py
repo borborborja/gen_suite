@@ -11,14 +11,17 @@ class JobStatus:
     QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"
+    PARTIAL = "partial"
     ERROR = "error"
     CANCELLED = "cancelled"
+    PAUSED = "paused"
 
 
 # Statuses a job can still leave.
 ACTIVE_STATUSES = (JobStatus.QUEUED, JobStatus.RUNNING)
-# Statuses a job never leaves.
-TERMINAL_STATUSES = (JobStatus.COMPLETED, JobStatus.ERROR, JobStatus.CANCELLED)
+# An execution attempt ends here. Only the ResearchRun controller may explicitly rearm a
+# paused/failed stage, retaining its job identity and incrementing the dispatch generation.
+TERMINAL_STATUSES = (JobStatus.COMPLETED, JobStatus.PARTIAL, JobStatus.ERROR, JobStatus.CANCELLED, JobStatus.PAUSED)
 
 # SSE event kinds that mean the job is over — the relay closes the stream on one of these.
 TERMINAL_EVENT_KINDS = {"all_done", "book_fail", "cancelled", "error"}
@@ -26,6 +29,7 @@ TERMINAL_EVENT_KINDS = {"all_done", "book_fail", "cancelled", "error"}
 _STATUS_TO_KIND = {
     JobStatus.COMPLETED: "all_done",
     JobStatus.CANCELLED: "cancelled",
+    JobStatus.PAUSED: "cancelled",
 }
 
 

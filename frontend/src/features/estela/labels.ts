@@ -43,25 +43,37 @@ export const JOB_LABEL: Record<string, string> = {
   embed_mentions: "Embeddings de menciones", embedding: "Embeddings", embed_document: "Embeddings",
   reembed_corpus: "Re-embeber corpus", linkage: "Descubrimiento", linkage_family: "Descubrimiento familiar",
   reconstruction: "Reconstrucción", rasterize: "Rasterizado de PDF", rerasterize: "Re-rasterizado",
-  compact_pdf: "Compactar PDF", index: "Índice", fs_download: "Descarga de FamilySearch",
+  compact_pdf: "PDF con transcripción", document_archive: "Paquete de preservación",
+  document_pdfa: "PDF/A-2b validado",
+  ingest_collection: "Importación de colección",
+  cleanup_ingestion: "Limpieza de temporales", inventory_storage: "Inventario de almacenamiento",
+  recount_storage: "Recuento protegido de cuota",
+  index: "Índice", fs_download: "Descarga de FamilySearch",
 };
 export const JOB_GERUND: Record<string, string> = {
   transcription: "Transcribiendo", extraction: "Extrayendo",
   embed_mentions: "Generando embeddings", embedding: "Generando embeddings", embed_document: "Generando embeddings",
   reembed_corpus: "Re-embebiendo corpus", linkage: "Buscando coincidencias", linkage_family: "Buscando hermanos",
   reconstruction: "Reconstruyendo árbol", rasterize: "Rasterizando", rerasterize: "Re-rasterizando",
-  compact_pdf: "Compactando PDF", index: "Parseando índice", fs_download: "Descargando",
+  compact_pdf: "Generando PDF", document_archive: "Preparando paquete de preservación",
+  document_pdfa: "Convirtiendo y validando PDF/A",
+  ingest_collection: "Verificando originales de la colección",
+  cleanup_ingestion: "Limpiando temporales autorizados", inventory_storage: "Inventariando almacenamiento",
+  recount_storage: "Recontando cuota con escrituras bloqueadas",
+  index: "Parseando índice", fs_download: "Descargando",
 };
 export const jobLabel = (t: string) => JOB_LABEL[t] ?? t;
 export const jobGerund = (t: string) => JOB_GERUND[t] ?? jobLabel(t);
 
 export const STATUS_COLOR: Record<string, string> = {
   completed: "var(--ok)", running: "var(--accent)", queued: "var(--warn)",
-  error: "var(--danger)", cancelled: "var(--muted)",
+  error: "var(--danger)", cancelled: "var(--muted)", paused: "var(--warn)",
+  partial: "var(--warn)",
 };
 
 export const STATUS_LABEL: Record<string, string> = {
   completed: "completado", running: "en curso", queued: "en cola",
-  error: "error", cancelled: "cancelado",
+  error: "error", cancelled: "cancelado", paused: "pausado",
+  partial: "completado con incidencias",
 };
 export const statusLabel = (s: string) => STATUS_LABEL[s] ?? s;

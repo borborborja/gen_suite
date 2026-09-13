@@ -6,7 +6,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ...core.queue import get_queue
+from ...core.dispatch import schedule
 from ...models.document import Document
 from ...models.job import Job
 from ...models.record import Record
@@ -21,7 +21,10 @@ async def create_job(
     override: dict | None = None,
     modality: str = "sync",
 ) -> Job:
-    if not await session.get(Document, document_id):
+    if modality == "batch":
+        raise HTTPException(409, "Batch está temporalmente desactivado hasta disponer de conciliación por solicitud. Usa extracción síncrona.")
+    if not await session.scalar(select(Document).where(Document.id == document_id,
+        Document.tenant_id == tenant_id).with_for_update()):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
     # don't pile up duplicate jobs on the same book (double-click / impatient retry)
     from ..jobs.service import active_job_for
@@ -37,11 +40,7 @@ async def create_job(
         created_by=created_by,
     )
     session.add(job)
-    await session.commit()  # durable before enqueue so the worker can't race ahead of the row
-
-    queue = await get_queue()
-    await queue.enqueue_job(
-        "extract_records", job_id=str(job.id), tenant_id=str(tenant_id),
+    await schedule(session, job, "extract_records",
         document_id=str(document_id), override=override, options={"modality": modality},
     )
     return job
@@ -50,7 +49,8 @@ async def create_job(
 async def create_embed_mentions_job(
     session: AsyncSession, tenant_id: uuid.UUID, created_by: uuid.UUID, *, document_id: uuid.UUID
 ) -> Job:
-    if not await session.get(Document, document_id):
+    if not await session.scalar(select(Document).where(Document.id == document_id,
+        Document.tenant_id == tenant_id).with_for_update()):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
     from ..providers.service import assert_within_budget
     await assert_within_budget(session, tenant_id)
@@ -59,11 +59,7 @@ async def create_embed_mentions_job(
         params={"document_id": str(document_id)}, created_by=created_by,
     )
     session.add(job)
-    await session.commit()  # durable before enqueue
-    queue = await get_queue()
-    await queue.enqueue_job(
-        "embed_mentions", job_id=str(job.id), tenant_id=str(tenant_id), document_id=str(document_id)
-    )
+    await schedule(session, job, "embed_mentions", document_id=str(document_id))
     return job
 
 
@@ -75,10 +71,16 @@ async def reextract_transcription(
     from ...models.record import Record
     from ...models.transcription import Transcription
     from sqlalchemy import or_, update
+    from sqlalchemy import delete
+    from ...models.processing_checkpoint import ProcessingCheckpoint
 
     t = await session.get(Transcription, transcription_id)
     if not t:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "transcription not found")
+    if t.tenant_id != tenant_id or not t.is_active:
+        raise HTTPException(409, "Selecciona una transcripción activa de tu espacio")
+    await session.execute(delete(ProcessingCheckpoint).where(
+        ProcessingCheckpoint.transcription_id == transcription_id, ProcessingCheckpoint.tenant_id == tenant_id))
     # Supersede records starting OR ending on this page — a cross-page entry whose second sheet was
     # corrected must be re-stitched, not left stale.
     await session.execute(
@@ -94,10 +96,7 @@ async def reextract_transcription(
         params={"document_id": str(t.document_id), "override": {}}, created_by=created_by,
     )
     session.add(job)
-    await session.commit()  # durable before enqueue
-    queue = await get_queue()
-    await queue.enqueue_job(
-        "extract_records", job_id=str(job.id), tenant_id=str(tenant_id),
+    await schedule(session, job, "extract_records",
         document_id=str(t.document_id), override={},
     )
     return job

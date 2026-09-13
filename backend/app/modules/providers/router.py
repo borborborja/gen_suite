@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,11 +12,13 @@ from ...core.deps import get_current_principal, get_tenant_db, require_roles
 from ...core.queue import get_queue
 from ...core.security import Principal
 from ...models.job import Job
+from ...models.ai_call import AiCall
 from ...models.membership import MembershipRole
 from ...models.tenant import Tenant
 from ..jobs.schemas import JobOut
 from . import service
 from .catalog import PROVIDER_CATALOG
+from .authorizations import router as authorizations_router
 from .schemas import (
     BindingOut,
     BindingUpsert,
@@ -25,6 +28,7 @@ from .schemas import (
 )
 
 router = APIRouter(prefix="/providers", tags=["providers"])
+router.include_router(authorizations_router)
 
 _ADMIN = (MembershipRole.tenant_admin.value,)
 
@@ -37,9 +41,8 @@ async def reembed_corpus(
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> JobOut:
-    """Re-embed the whole corpus with the currently-bound embedding model. Run this after switching
-    the `embedding` provider — vectors from different models aren't comparable, so the old ones must
-    be recomputed or vector search breaks."""
+    """Legacy entry point: build a separate generation, retaining the active index.
+    Activation remains an explicit, audited action in the generation API."""
     from ..jobs.service import active_job_of_type
     existing = await active_job_of_type(db, principal.tenant_id, "reembed_corpus")
     if existing:
@@ -48,16 +51,9 @@ async def reembed_corpus(
             result=existing.result, error=existing.error, created_at=existing.created_at,
             started_at=existing.started_at, finished_at=existing.finished_at,
         )
-    from .service import assert_within_budget
-    await assert_within_budget(db, principal.tenant_id)
-    job = Job(
-        tenant_id=principal.tenant_id, type="reembed_corpus", status="queued",
-        params={}, created_by=principal.user_id,
-    )
-    db.add(job)
-    await db.flush()
-    queue = await get_queue()
-    await queue.enqueue_job("reembed_corpus", job_id=str(job.id), tenant_id=str(principal.tenant_id))
+    from ..search.index_router import GenerationCreate, create_generation
+    generation = await create_generation(db, principal, GenerationCreate(client_id=uuid.uuid4(), authorize=True))
+    job = await db.get(Job, generation.job_id)
     return JobOut(
         id=job.id, type=job.type, status=job.status, progress=job.progress, result=job.result,
         error=job.error, created_at=job.created_at, started_at=job.started_at, finished_at=job.finished_at,
@@ -146,10 +142,22 @@ async def upsert_binding(
 class SpendOut(BaseModel):
     month_cents: int            # AI spend so far this calendar month (USD cents, estimated)
     budget_cents: int | None    # monthly cap, or null if none
+    reserved_cents: int = 0
+    settled_microusd: int = 0
+    reserved_microusd: int = 0
+    unknown_calls: int = 0
 
 
 class BudgetUpdate(BaseModel):
-    monthly_budget_cents: int | None  # null clears the cap
+    monthly_budget_cents: int | None = Field(ge=0, le=100_000_000, strict=True)
+
+
+async def _spend(db, tenant_id):
+    from .admission import totals
+    balance = await totals(db, tenant_id)
+    budget = await db.scalar(select(Tenant.monthly_budget_cents).where(Tenant.id == tenant_id))
+    return SpendOut(month_cents=(balance["settled_microusd"] + 9999) // 10000,
+        reserved_cents=(balance["reserved_microusd"] + 9999) // 10000, budget_cents=budget, **balance)
 
 
 @router.get("/spend", response_model=SpendOut)
@@ -157,9 +165,7 @@ async def get_spend(
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> SpendOut:
-    spent = await service.month_spend_cents(db, principal.tenant_id)
-    budget = await db.scalar(select(Tenant.monthly_budget_cents).where(Tenant.id == principal.tenant_id))
-    return SpendOut(month_cents=spent, budget_cents=budget)
+    return await _spend(db, principal.tenant_id)
 
 
 @router.put("/budget", response_model=SpendOut, dependencies=[Depends(require_roles(*_ADMIN))])
@@ -170,5 +176,103 @@ async def set_budget(
 ) -> SpendOut:
     await db.execute(update(Tenant).where(Tenant.id == principal.tenant_id).values(
         monthly_budget_cents=body.monthly_budget_cents))
-    spent = await service.month_spend_cents(db, principal.tenant_id)
-    return SpendOut(month_cents=spent, budget_cents=body.monthly_budget_cents)
+    return await _spend(db, principal.tenant_id)
+
+
+class AiCallOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    job_id: uuid.UUID | None
+    task_type: str
+    state: str
+    profile: dict
+    reserved_microusd: int
+    cost_microusd: int | None
+    provider_request_id: str | None
+    error_code: str | None
+    created_at: datetime
+    settled_at: datetime | None
+    reconciliation: dict | None
+
+
+@router.get("/ai-calls", response_model=list[AiCallOut], dependencies=[Depends(require_roles(*_ADMIN))])
+async def list_ai_calls(
+    state: str | None = Query(None, pattern="^(inflight|unknown|succeeded|reconciled)$"),
+    limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
+):
+    stmt = select(AiCall).where(AiCall.tenant_id == principal.tenant_id)
+    if state:
+        stmt = stmt.where(AiCall.state == state)
+    return list((await db.scalars(stmt.order_by(AiCall.created_at.desc(), AiCall.id).offset(offset).limit(limit))).all())
+
+
+class ReconcileCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cost_microusd: int = Field(ge=0, le=100_000_000_000, strict=True)
+    evidence: str = Field(min_length=10, max_length=2000)
+    provider_request_id: str | None = Field(None, max_length=256)
+
+
+@router.post("/ai-calls/{call_id}/reconcile", response_model=AiCallOut,
+             dependencies=[Depends(require_roles(*_ADMIN))])
+async def reconcile_ai_call(
+    call_id: uuid.UUID, body: ReconcileCall,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
+):
+    await db.scalar(select(Tenant.id).where(Tenant.id == principal.tenant_id).with_for_update(key_share=True))
+    call = await db.scalar(select(AiCall).where(AiCall.id == call_id,
+        AiCall.tenant_id == principal.tenant_id).with_for_update())
+    if not call:
+        raise HTTPException(404, "Llamada no encontrada.")
+    from .response_guard import review_call
+    await review_call(db, call)
+    if call.state not in ("unknown", "inflight"):
+        raise HTTPException(409, "La llamada ya tiene una liquidación; no se sobrescribe el historial.")
+    if call.state == "inflight" and call.created_at > datetime.now(timezone.utc) - timedelta(minutes=15):
+        raise HTTPException(409, "La llamada aún puede estar en ejecución. Espera antes de conciliarla.")
+    call.cost_microusd = body.cost_microusd
+    call.provider_request_id = body.provider_request_id or call.provider_request_id
+    call.state = "reconciled"
+    call.settled_at = datetime.now(timezone.utc)
+    call.reconciliation = {"by": str(principal.user_id), "evidence": body.evidence,
+                           "at": call.settled_at.isoformat(), "previous_error": call.error_code}
+    await db.flush()
+    return call
+
+
+@router.post("/ai-calls/{call_id}/recover", response_model=AiCallOut,
+             dependencies=[Depends(require_roles(*_ADMIN))])
+async def recover_ai_response(
+    call_id: uuid.UUID,
+    principal: Principal = Depends(get_current_principal), db: AsyncSession = Depends(get_tenant_db),
+):
+    """Recover the window S3-success/DB-failure, without contacting the billed provider."""
+    from .admission import BudgetPolicy, read_saved_response, validate_usage
+    call = await db.scalar(select(AiCall).where(AiCall.id == call_id, AiCall.tenant_id == principal.tenant_id))
+    if not call:
+        raise HTTPException(404, "Llamada no encontrada.")
+    from .response_guard import review_call
+    await review_call(db, call)
+    if call.state not in ("unknown", "inflight"):
+        raise HTTPException(409, "La llamada ya está liquidada.")
+    if call.state == "inflight" and call.created_at > datetime.now(timezone.utc) - timedelta(minutes=15):
+        raise HTTPException(409, "La llamada todavía puede estar ejecutándose.")
+    key = f"{principal.tenant_id}/ai-calls/{call.id}/response.json"
+    try:
+        envelope, checksum = await read_saved_response(key)
+        cost = validate_usage(envelope["usage"], BudgetPolicy.model_validate(call.profile["budget_policy"]))
+        if "data" not in envelope:
+            raise ValueError("missing_data")
+    except Exception:
+        raise HTTPException(409, "No hay una respuesta guardada verificable. Conserva la reserva y concilia con evidencia del proveedor.") from None
+    await db.scalar(select(Tenant.id).where(Tenant.id == principal.tenant_id).with_for_update(key_share=True))
+    changed = await db.execute(update(AiCall).where(AiCall.id == call_id, AiCall.tenant_id == principal.tenant_id,
+        AiCall.state.in_(("unknown", "inflight"))).values(state="succeeded", cost_microusd=cost,
+            usage=envelope["usage"], provider_request_id=envelope["usage"].get("request_id"),
+            result_key=key, result_checksum=checksum, error_code=envelope.get("error"),
+            settled_at=datetime.now(timezone.utc), reconciliation={"by": str(principal.user_id), "recovered_from_private_storage": True}))
+    if not changed.rowcount:
+        raise HTTPException(409, "Otra operación acaba de liquidar esta llamada.")
+    await db.refresh(call)
+    return call

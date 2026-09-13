@@ -32,6 +32,10 @@ export interface PageOut {
   height: number | null;
   byte_size: number | null;
   source_ref: string | null;        // exact image origin (e.g. FamilySearch ARK)
+  original_filename?: string | null;
+  checksum?: string | null;
+  source_page_no?: number | null;
+  source_region?: { unit: string; bbox: number[] } | null;
 }
 
 export interface UploadFlags {
@@ -63,8 +67,8 @@ export interface SeriesGap {
 }
 export const getSeriesGaps = () => api<SeriesGap[]>("/documents/series-gaps");
 
-export const listDocuments = (scope: "mine" | "public" | "all" = "mine") =>
-  api<DocumentOut[]>(`/documents?scope=${scope}`);
+export const listDocuments = (scope: "mine" | "public" | "all" = "mine", offset = 0, limit = 100) =>
+  api<DocumentOut[]>(`/documents?scope=${scope}&offset=${offset}&limit=${limit}`);
 export const getDocument = (id: string) => api<DocumentOut>(`/documents/${id}`);
 export const getPages = (id: string) => api<PageOut[]>(`/documents/${id}/pages`);
 export const publishDoc = (id: string, rights: string) =>
@@ -130,3 +134,78 @@ export const setRasterSettings = (s: RasterSettings) =>
   api<RasterSettings>("/documents/raster-settings", { method: "PUT", body: JSON.stringify(s) });
 export const rerasterize = (id: string) =>
   api<{ id: string; status: string }>(`/documents/${id}/rerasterize`, { method: "POST" });
+
+export interface DocumentExport {
+  id: string; kind: "pdf" | "pdfa" | "bagit"; byte_size: number; checksum: string;
+  created_at: string; stale: boolean; pdfa: string; text_mode: string; scope: "document";
+}
+export const listDocumentExports = (id: string) => api<DocumentExport[]>(`/documents/${id}/exports`);
+export const getExportCapabilities = (id: string) =>
+  api<{ pdfa_available: boolean; pdfa_profile: string; text_mode: string }>(`/documents/${id}/export-capabilities`);
+export const createDocumentExport = (id: string, kind: "pdf" | "pdfa" | "bagit") =>
+  api<{ id: string; status: string }>(`/documents/${id}/exports`, { method: "POST", body: JSON.stringify({ kind }) });
+
+interface ExportWriter { write(value: Uint8Array): Promise<void>; close(): Promise<void>; abort(): Promise<void> }
+interface ExportHandle { createWritable(): Promise<ExportWriter> }
+
+export async function downloadDocumentExport(id: string, item: DocumentExport): Promise<void> {
+  return downloadPrivateExport(`/documents/${id}/exports/${item.id}/content`,
+    `${item.id}.${item.kind === "bagit" ? "zip" : "pdf"}`, item.byte_size);
+}
+
+export async function downloadPrivateExport(path: string, filename: string, byteSize: number): Promise<void> {
+  const picker = (window as unknown as { showSaveFilePicker?: (options: { suggestedName: string }) => Promise<ExportHandle> }).showSaveFilePicker;
+  // Request the destination during the click gesture, before awaiting network I/O.
+  const handle = picker ? await picker.call(window, { suggestedName: filename }) : undefined;
+  if (!handle && byteSize > 200 * 1024 * 1024)
+    throw new Error("Esta exportación supera 200 MB. Usa un navegador con guardado directo a disco para evitar cargarla entera en memoria.");
+  const response = await authFetch(path);
+  if (!response.ok || !response.body) throw new Error("No se ha podido descargar la exportación");
+  if (handle) {
+    const destination = await handle.createWritable();
+    const reader = response.body.getReader();
+    let received = 0;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > byteSize) throw new Error("La descarga supera el tamaño de la exportación revisada");
+        await destination.write(value);
+      }
+      if (received !== byteSize) throw new Error("La descarga está incompleta; no se ha guardado como terminada");
+      await destination.close();
+    } catch (error) { await reader.cancel().catch(() => undefined); await destination.abort(); throw error; }
+    finally { reader.releaseLock(); }
+  } else {
+    const reader = response.body.getReader();
+    const parts: BlobPart[] = [];
+    let received = 0;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > byteSize || received > 200 * 1024 * 1024)
+          throw new Error("La descarga supera el tamaño de la exportación revisada");
+        parts.push(value);
+      }
+      if (received !== byteSize) throw new Error("La descarga no coincide con el tamaño de la exportación revisada");
+    } catch (error) { await reader.cancel().catch(() => undefined); throw error; }
+    finally { reader.releaseLock(); }
+    const blob = new Blob(parts, { type: response.headers.get("content-type") ?? "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url; link.download = filename; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+}
+
+export async function downloadExportValidation(id: string, item: DocumentExport): Promise<void> {
+  const response = await authFetch(`/documents/${id}/exports/${item.id}/validation`);
+  if (!response.ok) throw new Error("No se ha podido descargar el informe PDF/A");
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url; link.download = `${item.id}-validation.json`; link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}

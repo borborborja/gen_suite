@@ -437,6 +437,7 @@ function EditPanel({ person, onChange }: { person: PersonDetail; onChange: () =>
   const [surname, setSurname] = useState(primary?.surname ?? "");
   const [sex, setSex] = useState(person.sex);
   const [notes, setNotes] = useState(person.notes ?? "");
+  const [privacy, setPrivacy] = useState(person.privacy_status ?? "unknown");
   const [factTypes, setFactTypes] = useState<FactType[]>([]);
   const [ft, setFt] = useState("residence");
   const [fdate, setFdate] = useState("");
@@ -457,7 +458,7 @@ function EditPanel({ person, onChange }: { person: PersonDetail; onChange: () =>
   const failed = (err: unknown) => est.notify((err as Error).message || "No se pudo guardar", "var(--danger)");
   async function saveIdentity() {
     try {
-      await updatePerson(person.id, { given, surname, sex, notes }); flash("Identidad guardada"); onChange();
+      await updatePerson(person.id, { given, surname, sex, notes, privacy_status: privacy }); flash("Identidad guardada"); onChange();
     } catch (err) { failed(err); }
   }
   async function saveFact() {
@@ -484,6 +485,7 @@ function EditPanel({ person, onChange }: { person: PersonDetail; onChange: () =>
           <label style={lbl}>Nombre<input style={fld} value={given} onChange={(e) => setGiven(e.target.value)} /></label>
           <label style={lbl}>Apellidos<input style={fld} value={surname} onChange={(e) => setSurname(e.target.value)} /></label>
           <label style={lbl}>Sexo<select style={fld} value={sex} onChange={(e) => setSex(e.target.value)}><option value="U">—</option><option value="M">Hombre</option><option value="F">Mujer</option></select></label>
+          <label style={lbl}>Visibilidad pública<select style={fld} value={privacy} onChange={(e) => setPrivacy(e.target.value)}><option value="unknown">No publicar (sin revisar)</option><option value="living">Persona viva</option><option value="private">Privada</option><option value="deceased">Histórica, fallecida</option><option value="public">Publicar explícitamente</option></select></label>
           <label style={lbl}>Notas<textarea style={{ ...fld, minHeight: 64, resize: "vertical" }} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Anotaciones de investigación…" /></label>
           <button onClick={saveIdentity} style={saveBtn}>Guardar</button>
         </div>

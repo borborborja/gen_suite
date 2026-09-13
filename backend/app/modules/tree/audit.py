@@ -9,9 +9,7 @@ it can itself be reverted.
 Only ORM mutations are visible to the listeners — tree editing code must not use bulk
 ``update()/delete()`` statements for audited tables.
 
-Scope: the audit covers the MANUAL tree-editing endpoints. Worker/linkage flows
-(confirm candidate, reconstruction, extraction) mutate the tree without writing here —
-by design: they have their own provenance (citations, match decisions, jobs).
+Scope: tree editors and reviewed linkage/reconstruction decisions use this same journal.
 """
 from __future__ import annotations
 
@@ -23,7 +21,7 @@ from contextlib import asynccontextmanager
 from fastapi import HTTPException, status
 from sqlalchemy import event as sa_event
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text as sa_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import get_history
@@ -32,14 +30,18 @@ from ...core.errors import AppError
 from ...core.security import Principal
 from ...models.change_log import ChangeLog
 from ...models.citation import Citation
+from ...models.collaboration import ChangeProposal, Publication
 from ...models.document import Page
 from ...models.event import Event
 from ...models.family import Family, FamilyChild
+from ...models.interop import InteropConnection, SyncBaseline, SyncChange, SyncObject
 from ...models.match_candidate import MatchCandidate
 from ...models.mention import PersonMention
 from ...models.person import Name, Person
 from ...models.place import Place
 from ...models.record import Record
+from ...models.reconstruction import Reconstruction
+from ...models.research import Assertion, Note, ObjectTag, Repository, ResearchProject, ResearchSearch, ResearchTask, Source, Tag
 from ...models.transcription import Transcription
 from ...models.user import User
 from .schemas import ChangeDetail, ChangeItem, ChangePage
@@ -48,11 +50,22 @@ TABLE_MODELS = {
     "persons": Person, "names": Name, "events": Event, "families": Family,
     "family_children": FamilyChild, "citations": Citation, "places": Place,
     "person_mentions": PersonMention, "match_candidates": MatchCandidate,
+    "reconstructions": Reconstruction,
+    "repositories": Repository, "research_sources": Source, "research_notes": Note,
+    "research_tags": Tag, "research_object_tags": ObjectTag, "research_projects": ResearchProject,
+    "research_tasks": ResearchTask, "research_assertions": Assertion,
+    "research_searches": ResearchSearch,
+    "change_proposals": ChangeProposal, "publications": Publication,
+    "interop_connections": InteropConnection, "sync_baselines": SyncBaseline, "sync_changes": SyncChange,
+    "sync_objects": SyncObject,
 }
 _MODEL_TABLES = {m: t for t, m in TABLE_MODELS.items()}
 # FK-safe re-insert order (parents before dependents); deletes run in reverse.
-TABLE_ORDER = ["persons", "families", "places", "names", "events", "family_children",
-               "person_mentions", "match_candidates", "citations"]
+TABLE_ORDER = ["persons", "families", "places", "repositories", "research_projects", "research_tags",
+               "research_sources", "names", "events", "family_children", "person_mentions",
+               "match_candidates", "research_assertions", "research_notes", "research_object_tags",
+               "research_tasks", "research_searches", "change_proposals", "publications", "interop_connections",
+               "sync_baselines", "sync_changes", "sync_objects", "reconstructions", "citations"]
 _SKIP_COMPARE = {"created_at", "updated_at"}
 MAX_ROWS = 20_000
 
@@ -60,7 +73,8 @@ MAX_ROWS = 20_000
 # (e.g. re-extraction deletes Records). When resurrecting a citation, a dead reference is
 # nulled — same end state the DB would have produced — instead of failing the whole revert.
 _CITATION_REFS = {"record_id": Record, "transcription_id": Transcription, "page_id": Page,
-                  "person_mention_id": PersonMention, "match_candidate_id": MatchCandidate}
+                  "person_mention_id": PersonMention, "match_candidate_id": MatchCandidate,
+                  "source_id": Source, "assertion_id": Assertion}
 
 # DB-level dependents of a deletable row (CASCADE or SET NULL): reverting a creation may
 # only delete the row if every dependent is captured in the same change — otherwise the
@@ -73,6 +87,13 @@ _DELETE_DEPENDENTS: dict[str, list] = {
     "families": [(Event, "subject_family_id"), (FamilyChild, "family_id"),
                  (Citation, "target_id")],
     "places": [(Event, "place_id"), (Place, "parent_id")],
+    "repositories": [(Source, "repository_id")],
+    "research_sources": [(Citation, "source_id")],
+    "research_projects": [(ResearchTask, "project_id"), (ResearchSearch, "project_id")],
+    "research_tags": [(ObjectTag, "tag_id")],
+    "research_assertions": [(Citation, "assertion_id")],
+    "interop_connections": [(SyncBaseline, "connection_id"), (SyncChange, "connection_id"), (SyncObject, "connection_id")],
+    "sync_changes": [(SyncChange, "conflict_with_id")],
 }
 
 
@@ -122,6 +143,7 @@ def _pk_tuple(model, pk: dict):
 class Capture:
     def __init__(self) -> None:
         self.rows: list[dict] = []
+        self.change_id: uuid.UUID | None = None
 
 
 @asynccontextmanager
@@ -170,23 +192,52 @@ async def capture_changes(session: AsyncSession):
         sa_event.remove(sync, "after_flush", after_flush)
 
 
+def _coalesce_rows(rows: list[dict]) -> list[dict]:
+    """Keep one initial/final image per row across multiple ORM flushes.
+
+    Linkage decisions create a person, then its name/citation, and may flush between those
+    operations.  Recording every intermediate image makes a safe inverse unnecessarily
+    fragile; a transient insert followed by a delete has no durable effect at all.
+    """
+    merged: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        key = (row["table"], _pk_key(row["pk"]))
+        prior = merged.get(key)
+        if prior is None:
+            merged[key] = dict(row)
+            continue
+        prior["after"] = row["after"]
+    return [row for row in merged.values() if not (row["before"] is None and row["after"] is None)]
+
+
 @asynccontextmanager
 async def audited(session: AsyncSession, principal: Principal, *, action: str,
                   entity_type: str | None = None, entity_id: uuid.UUID | None = None,
                   summary: str | None = None, revert_of: uuid.UUID | None = None):
-    """Run a mutation capturing its row-images and persist them as one ChangeLog entry."""
+    """Run a mutation capturing its row-images and persist them as one ChangeLog entry.
+
+    The transaction-scoped advisory lock serializes tree writes and reversions per tenant.
+    It prevents two valid previews from being applied against each other before either one
+    reaches the conflict check, while keeping unrelated tenants independent.
+    """
+    await session.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:tenant_key))"), {
+        "tenant_key": str(principal.tenant_id),
+    })
     async with capture_changes(session) as cap:
         yield cap
+    cap.rows = _coalesce_rows(cap.rows)
     if len(cap.rows) > MAX_ROWS:
         raise AppError(409, "El cambio afecta a demasiadas filas para registrarse en el "
                             "historial; hazlo por partes", code="change_too_big")
     if cap.rows:
-        session.add(ChangeLog(
+        change = ChangeLog(
             tenant_id=principal.tenant_id, actor_user_id=principal.user_id, action=action,
             entity_type=entity_type, entity_id=entity_id, summary=summary,
             rows=cap.rows, revert_of=revert_of,
-        ))
+        )
+        session.add(change)
         await session.flush()
+        cap.change_id = change.id
 
 
 async def list_changes(session: AsyncSession, *, page: int = 1, page_size: int = 50) -> ChangePage:
@@ -229,6 +280,11 @@ def _conflict(n: int) -> AppError:
 
 
 async def revert_change(session: AsyncSession, principal: Principal, change_id: uuid.UUID) -> ChangeLog:
+    # Fetching the change itself must be inside the same tenant lock as the inverse writes;
+    # otherwise two simultaneous "Deshacer" requests can both observe unreverted state.
+    await session.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:tenant_key))"), {
+        "tenant_key": str(principal.tenant_id),
+    })
     change = await session.get(ChangeLog, change_id)
     if not change:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "cambio no encontrado")

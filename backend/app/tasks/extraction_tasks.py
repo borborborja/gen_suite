@@ -18,7 +18,10 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 
 from ..core import events
-from ..db.rls import set_rls_context
+from ..core.dispatch import schedule
+from ..core.job_lifecycle import job_is_active, update_active_job
+from ..core.task_execution import serialized_job
+from ..db.rls import set_rls_context, commit_keep_rls
 from ..db.session import SessionLocal
 from ..models.document import Document, Page
 from ..models.job import Job
@@ -26,6 +29,8 @@ from ..models.mention import PersonMention
 from ..models.place import Place
 from ..models.record import Record
 from ..models.transcription import Transcription
+from ..models.processing_checkpoint import ProcessingCheckpoint
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from ..modules.extraction.normalize import compute_keys, normalize_role, split_name
 from ..modules.extraction.schemas import SYSTEM_PROMPT, ExtractedPage, ExtractedRecord
 from ..modules.providers.service import ProviderService, extract_structured_with_usage
@@ -36,28 +41,40 @@ _ACTIVE = ("extracted", "needs_review", "reviewed")  # non-superseded, non-rejec
 
 
 def _final_status(failed: int, attempted: int) -> str:
-    """A run where most pages failed (provider out of credit, rate-limited…) is NOT a clean
-    success — mark it 'error' so the UI flags it and the user can switch provider and re-run
-    (the anti-join reprocesses the failed pages). A few failures stay 'completed'."""
-    return "error" if failed and failed > attempted * 0.3 else "completed"
+    """Any failed page makes the run partial; no successful pages means error."""
+    return "error" if failed and failed >= attempted else "partial" if failed else "completed"
 
 
 def _parse_page(raw: dict) -> ExtractedPage:
-    """Tolerant parse of a model's page output. LLMs (esp. richer ones like Gemini Pro) occasionally
-    emit one malformed record/field; salvage the records that validate individually instead of
-    dropping the whole page, so a single bad field doesn't lose a page full of acts."""
-    try:
-        return ExtractedPage.model_validate(raw)
-    except Exception:
-        recs: list[ExtractedRecord] = []
-        for r in (raw.get("records") or []) if isinstance(raw, dict) else []:
-            try:
-                recs.append(ExtractedRecord.model_validate(r))
-            except Exception:
-                continue
-        folio = raw.get("folio_label") if isinstance(raw, dict) else None
-        return ExtractedPage(has_record=bool(recs),
-                             folio_label=folio if isinstance(folio, str) else None, records=recs)
+    """Validate the complete response, including an explicit assertion for empty pages."""
+    # Do not silently drop malformed acts and claim this page has been processed completely.
+    if not isinstance(raw, dict) or "records" not in raw:
+        raise ValueError("La respuesta no contiene una lista explícita de actas")
+    page = ExtractedPage.model_validate(raw)
+    if not page.records and raw.get("has_record") is not False:
+        raise ValueError("Una página sin actas debe indicarlo explícitamente")
+    return page
+
+
+async def _checkpoint(session, tenant_id, transcription_id, job_id, count):
+    await session.execute(pg_insert(ProcessingCheckpoint).values(
+        tenant_id=tenant_id, transcription_id=transcription_id, job_id=job_id,
+        stage="extraction", records_count=count,
+    ).on_conflict_do_nothing(constraint="uq_processing_checkpoint"))
+
+
+async def _schedule_mentions(session, tenant_id, document_id, research_run_id=None):
+    """Commit follow-up work together with the extraction's terminal transition."""
+    if research_run_id:
+        return  # The research coordinator owns the following stage and its budget/profile.
+    from ..modules.jobs.service import active_job_for
+    await session.scalar(select(Document.id).where(Document.id == document_id).with_for_update())
+    if await active_job_for(session, tenant_id, "embed_mentions", document_id):
+        return
+    job = Job(tenant_id=tenant_id, type="embed_mentions", status="queued",
+              params={"document_id": str(document_id)})
+    session.add(job)
+    await schedule(session, job, "embed_mentions", document_id=str(document_id))
 
 
 def _folio_parse(label: str | None) -> tuple[int, str] | None:
@@ -135,6 +152,7 @@ async def _persist_record(
     session, *, tenant_id, document_id, job_id, rc, visibility, rec: ExtractedRecord,
     page_id, transcription_id, position: int,
     page_end_id=None, transcription_end_id=None, is_continued: bool = False,
+    ai_call_id: str | None = None,
 ) -> tuple[Record, bool]:
     """Insert one Record + its PersonMentions. Returns (record, low_confidence_flag). The within-page
     reading position is stashed in raw_json (``_pos``) so the stitch pass can find the first/last
@@ -143,6 +161,8 @@ async def _persist_record(
     low_conf = rec.confidence < CONFIDENCE_FLOOR or not rec.mentions
     raw = rec.model_dump()
     raw["_pos"] = position
+    if ai_call_id:
+        raw["_ai_call_id"] = ai_call_id
     record = Record(
         tenant_id=tenant_id, document_id=document_id, page_id=page_id,
         transcription_id=transcription_id, page_end_id=page_end_id,
@@ -200,19 +220,23 @@ async def merge_boundary_records(
     start_text: str, end_text: str, job_id=None,
 ) -> Record:
     """Re-extract the boundary (tail of start page + head of next page) into ONE complete record that
-    spans both pages, then delete the two half-records (mentions cascade). Deterministic field-union
+    spans both pages, retaining the superseded half-records. Deterministic field-union
     fallback if the LLM call fails. Shared by the auto-stitch pass and the manual merge endpoint."""
     tail, head = (start_text or "")[-2000:], (end_text or "")[:2000]
     merged: ExtractedRecord | None = None
+    ai_call_id = None
+    merge_method = "deterministic_union"
     try:
-        raw, _ = await asyncio.to_thread(
-            extract_structured_with_usage, rc,
+        raw, usage = await extract_structured_with_usage(
+            rc,
             f"FINAL DE LA HOJA:\n{tail}\n\nPRINCIPIO DE LA SIGUIENTE:\n{head}",
             schema=schema, system=_STITCH_SYSTEM, schema_name="ExtractedPage",
         )
         pg = _parse_page(raw)
         if pg.records:
             merged = pg.records[0]
+            ai_call_id = usage.get("ai_call_id")
+            merge_method = "ai"
     except Exception:
         merged = None
     if merged is None:
@@ -228,9 +252,12 @@ async def merge_boundary_records(
         page_id=start_rec.page_id, transcription_id=start_rec.transcription_id,
         page_end_id=end_rec.page_id, transcription_end_id=end_rec.transcription_id,
         is_continued=True, position=(start_rec.raw_json or {}).get("_pos", 0),
+        ai_call_id=ai_call_id,
     )
-    await session.delete(start_rec)
-    await session.delete(end_rec)
+    start_rec.status = "superseded"
+    end_rec.status = "superseded"
+    new_rec.status = "needs_review"
+    new_rec.attributes = {**(new_rec.attributes or {}), "merged_from": [str(start_rec.id), str(end_rec.id)], "merge_method": merge_method}
     await session.flush()
     return new_rec
 
@@ -261,6 +288,8 @@ async def _stitch_spans(session, *, tenant_id, document_id, job_id, rc, schema, 
 
     merges = 0
     for pno in sorted(by_page):
+        if not await job_is_active(session, job_id):
+            break
         nxt = pno + 1
         if nxt not in by_page:
             continue
@@ -333,42 +362,48 @@ async def _run_batch_extraction(session, *, job_id, tenant_id, document_id, rc, 
     job = await session.get(Job, job_id)
     batch_id = (job.params or {}).get("batch_id") if job else None
     if not batch_id:
-        items = [(str(tid), doc_context + text) for (tid, _pid, _pno, text, _vis) in targets]
-        batch_id = await asyncio.to_thread(submit_chat_batch, rc, items, system=SYSTEM_PROMPT)
-        params = dict(job.params or {}); params["batch_id"] = batch_id
-        await session.execute(update(Job).where(Job.id == job_id).values(
-            params=params, progress={"phase": "batch_submitted", "total": len(targets)}))
-        await session.commit()
-        await pub({"kind": "page_ok", "done": 0, "total": len(targets), "phase": "batch enviado"})
+        if not await job_is_active(session, job_id):
+            await pub({"kind": "cancelled"})
+            return
+        error = "Batch desactivado hasta disponer de conciliación por solicitud. Crea un trabajo síncrono."
+        await update_active_job(session, job_id, status="error", error=error,
+                                finished_at=datetime.now(timezone.utc))
+        await commit_keep_rls(session, tenant_id=tenant_id)
+        await pub({"kind": "book_fail", "error": error})
+        return
 
     status, out_file = "validating", None
     for _ in range(240):  # poll ~4h max (under job_timeout); batch id persists for a later resume
         await set_rls_context(session, tenant_id=tenant_id)
-        if await session.scalar(select(Job.status).where(Job.id == job_id)) == "cancelled":
+        if not await job_is_active(session, job_id):
             await pub({"kind": "cancelled"}); return
         status, out_file = await asyncio.to_thread(poll_batch, rc, batch_id)
         await session.execute(update(Job).where(Job.id == job_id).values(
             progress={"phase": status, "total": len(targets)}))
-        await session.commit()
+        await commit_keep_rls(session, tenant_id=tenant_id)
         if status in ("completed", "failed", "expired", "cancelled"):
             break
         await asyncio.sleep(60)
     if status != "completed" or not out_file:
         await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(update(Job).where(Job.id == job_id).values(
-            status="error", error=f"batch {status}", finished_at=datetime.now(timezone.utc)))
-        await session.commit()
-        await pub({"kind": "book_fail", "error": f"batch {status}"}); return
+        changed = await update_active_job(session, job_id,
+            status="error", error=f"batch {status}", finished_at=datetime.now(timezone.utc))
+        await commit_keep_rls(session, tenant_id=tenant_id)
+        await pub({"kind": "book_fail" if changed else "cancelled", "error": f"batch {status}"}); return
 
     results, tokens = await asyncio.to_thread(fetch_batch_results, rc, out_file)
     await set_rls_context(session, tenant_id=tenant_id)
+    await session.scalar(select(Document.id).where(Document.id == document_id).with_for_update())
+    from ..modules.providers.service import record_usage
+    await record_usage(session, tenant_id=tenant_id, job_id=job_id, task_type="extraction",
+                       model=rc.model, prompt_tokens=tokens.get("prompt", 0),
+                       completion_tokens=tokens.get("completion", 0))
     records_made = failed = flagged = 0
-    for tid, raw in results.items():
-        tgt = by_tid.get(tid)
-        if tgt is None:
-            continue
+    for tid, tgt in by_tid.items():
+        raw = results.get(tid)  # Missing provider responses are failures, not empty pages.
         _, page_id, _pno, _text, visibility = tgt
-        if raw is None:
+        still_active = await session.scalar(select(Transcription.is_active).where(Transcription.id == uuid.UUID(tid)))
+        if raw is None or not still_active:
             failed += 1; continue
         try:
             page = _parse_page(raw)
@@ -384,50 +419,40 @@ async def _run_batch_extraction(session, *, job_id, tenant_id, document_id, rc, 
                     transcription_id=uuid.UUID(tid), position=i)
                 records_made += 1
                 flagged += 1 if low else 0
-    await session.commit()
+        await _checkpoint(session, tenant_id, uuid.UUID(tid), job_id, len(page.records))
+    await commit_keep_rls(session, tenant_id=tenant_id)
 
     await set_rls_context(session, tenant_id=tenant_id)
+    if not await job_is_active(session, job_id):
+        await pub({"kind": "cancelled"})
+        return
     folios = await _normalize_folios(session, document_id=document_id)
     merges = await _stitch_spans(session, tenant_id=tenant_id, document_id=document_id, job_id=job_id,
                                  rc=rc, schema=schema, pub=pub)
     seq = await _validate_sequence(session, document_id=document_id)
-    await session.commit()
+    await commit_keep_rls(session, tenant_id=tenant_id)
 
-    final_status = _final_status(failed, len(results))
+    final_status = _final_status(failed, len(targets))
     await set_rls_context(session, tenant_id=tenant_id)
-    await session.execute(update(Job).where(Job.id == job_id).values(
+    changed = await update_active_job(session, job_id,
         status=final_status, finished_at=datetime.now(timezone.utc),
-        error=(f"{failed}/{len(results)} páginas fallaron" if final_status == "error" else None),
-        result={"pages": len(results), "records": records_made, "failed": failed,
+        error=(f"{failed}/{len(targets)} páginas fallaron" if final_status != "completed" else None),
+        result={"pages": len(targets), "records": records_made, "failed": failed,
                 "needs_review": flagged + seq, "stitched": merges, "sequence_flags": seq,
                 "folios_filled": folios, "modality": "batch", "model": rc.model,
-                "tokens": tokens}))
-    await session.commit()
+                "tokens": tokens})
+    if changed and records_made:
+        await _schedule_mentions(session, tenant_id, document_id, rc.research_run_id)
+    await commit_keep_rls(session, tenant_id=tenant_id)
 
-    # Log AI spend for the spending control (best-effort) — same as the sync path.
-    from ..modules.providers.service import record_usage
-    await set_rls_context(session, tenant_id=tenant_id)
-    await record_usage(session, tenant_id=tenant_id, job_id=job_id, task_type="extraction",
-                       model=rc.model, prompt_tokens=tokens["prompt"],
-                       completion_tokens=tokens["completion"])
-    await session.commit()
-
-    if records_made:
-        try:
-            from ..core.queue import get_queue
-            await set_rls_context(session, tenant_id=tenant_id)
-            ej = Job(tenant_id=tenant_id, type="embed_mentions", status="queued",
-                     params={"document_id": str(document_id)})
-            session.add(ej); await session.commit()
-            q = await get_queue()
-            await q.enqueue_job("embed_mentions", job_id=str(ej.id), tenant_id=str(tenant_id),
-                                document_id=str(document_id))
-        except Exception:
-            pass
-    await pub({"kind": "book_fail" if final_status == "error" else "all_done",
-               "pages": len(results), "records": records_made, "failed": failed, "stitched": merges})
+    if not changed:
+        await pub({"kind": "cancelled"})
+        return
+    await pub({"kind": "book_fail" if final_status != "completed" else "all_done", "status": final_status,
+               "pages": len(targets), "records": records_made, "failed": failed, "stitched": merges})
 
 
+@serialized_job
 async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None, options=None):
     job_id = uuid.UUID(str(job_id))
     tenant_id = uuid.UUID(str(tenant_id))
@@ -435,33 +460,32 @@ async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None,
     override = override or {}
 
     async def pub(event: dict) -> None:
-        await events.publish(tenant_id, job_id, event)
+        try:
+            await events.publish(tenant_id, job_id, event)
+        except Exception:
+            pass  # Publishing progress must not interrupt persistence of paid results.
 
     schema = ExtractedPage.model_json_schema()
 
     async with SessionLocal() as session:
         await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(
-            update(Job).where(Job.id == job_id).values(
-                status="running", started_at=datetime.now(timezone.utc)
-            )
-        )
-        await session.commit()
+        started = await update_active_job(session, job_id,
+            status="running", started_at=datetime.now(timezone.utc))
+        await commit_keep_rls(session, tenant_id=tenant_id)
+        if not started:
+            return
 
         await set_rls_context(session, tenant_id=tenant_id)
         try:
             rc = await ProviderService(session).resolve(
-                tenant_id=tenant_id, task_type="inference", override=override
+                tenant_id=tenant_id, task_type="inference", override=override, job_id=job_id,
             )
         except Exception as exc:
             await set_rls_context(session, tenant_id=tenant_id)
-            await session.execute(
-                update(Job).where(Job.id == job_id).values(
-                    status="error", error=str(exc)[:1000], finished_at=datetime.now(timezone.utc)
-                )
-            )
-            await session.commit()
-            await pub({"kind": "book_fail", "error": str(exc)[:300]})
+            changed = await update_active_job(session, job_id,
+                status="error", error="No se pudo resolver el proveedor de extracción", finished_at=datetime.now(timezone.utc))
+            await commit_keep_rls(session, tenant_id=tenant_id)
+            await pub({"kind": "book_fail" if changed else "cancelled", "error": "Revisa la configuración del proveedor"})
             return
 
         # resumable: skip transcriptions that already produced a (non-superseded) record — either as
@@ -469,7 +493,8 @@ async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None,
         # of a stitched entry isn't re-extracted as if empty. A corrected page (records superseded)
         # falls back in.
         done_start = select(Record.transcription_id).where(
-            Record.document_id == document_id, Record.status != "superseded"
+            Record.document_id == document_id, Record.status != "superseded",
+            Record.transcription_id.is_not(None),
         )
         done_end = select(Record.transcription_end_id).where(
             Record.document_id == document_id, Record.status != "superseded",
@@ -485,6 +510,8 @@ async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None,
                     Transcription.document_id == document_id,
                     Transcription.text.is_not(None),
                     Transcription.is_active.is_(True),
+                    Transcription.id.not_in(select(ProcessingCheckpoint.transcription_id).where(
+                        ProcessingCheckpoint.tenant_id == tenant_id, ProcessingCheckpoint.stage == "extraction")),
                     Transcription.id.not_in(done_start),
                     Transcription.id.not_in(done_end),
                     Transcription.page_id.not_in(nonrecord_pages),
@@ -506,7 +533,7 @@ async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None,
         if doc and (doc.year_from or doc.year_to):
             ctx_bits.append(f"Años que abarca el libro: {doc.year_from or '?'}–{doc.year_to or '?'}.")
         doc_context = ("CONTEXTO DEL LIBRO (úsalo para acotar y no inventar) — " + " ".join(ctx_bits) + "\n\n") if ctx_bits else ""
-        await session.commit()
+        await commit_keep_rls(session, tenant_id=tenant_id)
 
         # Modality: Batch API (async, ~50% cheaper) when chosen and the provider supports it.
         from ..modules.providers.catalog import PROVIDER_CATALOG
@@ -532,14 +559,14 @@ async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None,
         for start in range(0, total, CONCURRENCY):
             chunk = targets[start : start + CONCURRENCY]
             await set_rls_context(session, tenant_id=tenant_id)
-            if await session.scalar(select(Job.status).where(Job.id == job_id)) == "cancelled":
+            if not await job_is_active(session, job_id):
                 await pub({"kind": "cancelled", "done": done, "total": total})
                 return
 
             # run the page extractions in parallel (pure LLM calls, no DB)
             results = await asyncio.gather(*[
-                asyncio.to_thread(
-                    extract_structured_with_usage, rc, doc_context + t,
+                extract_structured_with_usage(
+                    rc, doc_context + t,
                     schema=schema, system=SYSTEM_PROMPT, schema_name="ExtractedPage",
                 )
                 for (_tid, _pid, _pno, t, _vis) in chunk
@@ -547,6 +574,7 @@ async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None,
 
             # persist results serially through the one session
             await set_rls_context(session, tenant_id=tenant_id)
+            await session.scalar(select(Document.id).where(Document.id == document_id).with_for_update())
             for (tid, page_id, _page_no, _text, visibility), res in zip(chunk, results):
                 done += 1
                 if isinstance(res, Exception):
@@ -557,6 +585,11 @@ async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None,
                 raw, usage = res
                 for k in tokens:
                     tokens[k] += usage.get(k, 0)
+                still_active = await session.scalar(select(Transcription.is_active).where(Transcription.id == tid))
+                if not still_active:
+                    failed += 1
+                    last_error = "La transcripción cambió durante la extracción; vuelve a procesar su revisión activa."
+                    continue
                 try:
                     page = _parse_page(raw)
                 except Exception as exc:
@@ -574,35 +607,39 @@ async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None,
                             session, tenant_id=tenant_id, document_id=document_id, job_id=job_id,
                             rc=rc, visibility=visibility, rec=rec,
                             page_id=page_id, transcription_id=tid, position=i,
+                            ai_call_id=usage.get("ai_call_id"),
                         )
                         records_made += 1
                         if low:
                             flagged += 1
+                await _checkpoint(session, tenant_id, tid, job_id, len(page.records))
             await session.execute(
                 update(Job).where(Job.id == job_id).values(
                     progress={"done": done, "total": total, "records": records_made, "failed": failed}
                 )
             )
-            await session.commit()
+            await commit_keep_rls(session, tenant_id=tenant_id)
             await pub({"kind": "page_ok", "done": done, "total": total, "records": records_made, "failed": failed})
 
         # Phase B/C: fill sequential folios, stitch cross-page entries, validate entry numbering.
         await set_rls_context(session, tenant_id=tenant_id)
+        if not await job_is_active(session, job_id):
+            await pub({"kind": "cancelled"})
+            return
         folios_filled = await _normalize_folios(session, document_id=document_id)
         merges = await _stitch_spans(
             session, tenant_id=tenant_id, document_id=document_id, job_id=job_id,
             rc=rc, schema=schema, pub=pub,
         )
         seq_flagged = await _validate_sequence(session, document_id=document_id)
-        await session.commit()
+        await commit_keep_rls(session, tenant_id=tenant_id)
 
         per_page = round(tokens["total"] / (done - failed), 1) if (done - failed) else 0
         final_status = _final_status(failed, done)
         err_msg = (f"{failed}/{done} páginas fallaron en la extracción · ej.: {last_error}"
-                   if final_status == "error" else None)
+                   if final_status != "completed" else None)
         await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(
-            update(Job).where(Job.id == job_id).values(
+        changed = await update_active_job(session, job_id,
                 status=final_status, error=err_msg, finished_at=datetime.now(timezone.utc),
                 result={
                     "pages": done, "records": records_made, "failed": failed,
@@ -611,39 +648,16 @@ async def extract_records(ctx, *, job_id, tenant_id, document_id, override=None,
                     "tokens": tokens, "tokens_per_page": per_page, "model": rc.model,
                     "last_error": last_error,
                 },
-            )
         )
-        await session.commit()
-
-        # Log AI spend for the spending control (best-effort).
-        from ..modules.providers.service import record_usage
-        await set_rls_context(session, tenant_id=tenant_id)
-        await record_usage(session, tenant_id=tenant_id, job_id=job_id, task_type="extraction",
-                           model=rc.model, prompt_tokens=tokens["prompt"], completion_tokens=tokens["completion"])
-        await session.commit()
-
-        # Auto-embed the new mentions so semantic search + vector linkage work without a manual step.
-        if records_made:
-            try:
-                from ..core.queue import get_queue
-                await set_rls_context(session, tenant_id=tenant_id)
-                embed_job = Job(
-                    tenant_id=tenant_id, type="embed_mentions", status="queued",
-                    params={"document_id": str(document_id)},
-                )
-                session.add(embed_job)
-                await session.commit()  # durable before enqueue
-                eid = embed_job.id
-                queue = await get_queue()
-                await queue.enqueue_job(
-                    "embed_mentions", job_id=str(eid), tenant_id=str(tenant_id),
-                    document_id=str(document_id),
-                )
-            except Exception:  # embedding is best-effort; never fail the extraction over it
-                pass
+        if changed and records_made:
+            await _schedule_mentions(session, tenant_id, document_id, rc.research_run_id)
+        await commit_keep_rls(session, tenant_id=tenant_id)
+        if not changed:
+            await pub({"kind": "cancelled"})
+            return
 
         await pub({
-            "kind": "book_fail" if final_status == "error" else "all_done",
+            "kind": "book_fail" if final_status != "completed" else "all_done", "status": final_status,
             "pages": done, "records": records_made, "failed": failed,
             "needs_review": flagged + seq_flagged, "stitched": merges,
             "tokens_per_page": per_page, "error": err_msg,

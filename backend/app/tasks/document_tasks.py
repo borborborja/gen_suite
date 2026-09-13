@@ -1,280 +1,327 @@
-"""ARQ job: rasterize an uploaded PDF into per-page JPEGs (plan 2.2).
-
-Moved out of the HTTP request: a book of hundreds of pages would time out the upload. The document
-row + original PDF are created synchronously; this task renders each page with pymupdf, stores the
-JPEGs in object storage, inserts ``Page`` rows, and reports progress via SSE — mirroring the
-transcription/extraction job pattern.
-"""
+"""Non-destructive document generations and offline, versioned exports."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
+import json
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
-from sqlalchemy import delete, select, update
+from PIL import Image
+from sqlalchemy import inspect, or_, select, update
 
 from ..core import events, storage
-from ..db.rls import set_rls_context
+from ..core.task_execution import serialized_job
+from ..db.rls import commit_keep_rls, set_rls_context
 from ..db.session import SessionLocal
 from ..models.document import Document, Page
+from ..models.document_export import DocumentExport
 from ..models.job import Job
-from ..modules.documents.service import _rasterize_pdf
+from ..models.transcription import Transcription
+from ..modules.documents.preservation import ConsultationPDF, PreservationBag, file_checksum
+from ..modules.documents.pdfa import ExportCancelled, PdfaError, convert
+from ..settings import settings
+from ..modules.documents.service import _iter_rasterize_pdf
+
+# MuPDF is not thread-safe. All document rendering in a worker uses one dedicated thread;
+# object transfers stay asynchronous and do not occupy it.
+_DOCUMENT_CPU = ThreadPoolExecutor(max_workers=1, thread_name_prefix="document-render")
 
 
-async def _raster_settings(session, tenant_id) -> tuple[int, str, bool]:
+async def _cpu(function, *args, **kwargs):
+    return await asyncio.get_running_loop().run_in_executor(_DOCUMENT_CPU, partial(function, *args, **kwargs))
+
+
+async def _publish(tenant_id, job_id, event):
+    try:
+        await events.publish(tenant_id, job_id, event)
+    except Exception:
+        pass  # DB status remains authoritative when pub/sub is unavailable.
+
+
+async def _state(session, tenant_id, job_id):
+    await set_rls_context(session, tenant_id=tenant_id)
+    return await session.scalar(select(Job.status).where(Job.id == job_id))
+
+
+async def _start(session, tenant_id, job_id):
+    from sqlalchemy import func
+    changed = await session.execute(update(Job).where(Job.id == job_id,
+        Job.status.in_(("queued", "running"))).values(status="running",
+        started_at=func.coalesce(Job.started_at, datetime.now(timezone.utc))))
+    return bool(changed.rowcount)
+
+
+async def _finish(session, tenant_id, job_id, *, result=None, error=None):
+    await set_rls_context(session, tenant_id=tenant_id)
+    changed = await session.execute(update(Job).where(
+        Job.id == job_id, Job.status.in_(("queued", "running")),
+    ).values(status="error" if error else "completed", result=result, error=error,
+             finished_at=datetime.now(timezone.utc)))
+    await commit_keep_rls(session, tenant_id=tenant_id)
+    if changed.rowcount:
+        await _publish(tenant_id, job_id, {"kind": "book_fail" if error else "all_done",
+                       "error": error, **(result or {})})
+
+
+async def _owned_document(session, tenant_id, document_id):
+    doc = await session.scalar(select(Document).where(
+        Document.id == document_id, Document.tenant_id == tenant_id,
+    ).with_for_update())
+    if doc is None:
+        raise ValueError("Documento no encontrado")
+    return doc
+
+
+async def _raster_settings(session, tenant_id):
     from ..models.tenant import Tenant
-    t = await session.get(Tenant, tenant_id)
-    if not t:
-        return 300, "webp", True
-    return int(t.raster_dpi or 300), (t.raster_format or "webp"), bool(t.raster_autosplit)
+    tenant = await session.get(Tenant, tenant_id)
+    return {"dpi": int(tenant.raster_dpi or 300), "fmt": tenant.raster_format or "webp",
+            "autosplit": bool(tenant.raster_autosplit)} if tenant else {"dpi": 300, "fmt": "webp", "autosplit": True}
 
 
+async def _render(session, tenant_id, job_id, doc):
+    job = await session.get(Job, job_id)
+    options = (job.params or {}).get("raster_settings") or await _raster_settings(session, tenant_id)
+    job.params = {**(job.params or {}), "raster_settings": options}
+    if not await _start(session, tenant_id, job_id):
+        return
+    await commit_keep_rls(session, tenant_id=tenant_id)
+    count = 0
+    with TemporaryDirectory(prefix="gensuite-raster-") as tmp:
+        source_path = str(Path(tmp) / "original.pdf")
+        await storage.download_file(doc.storage_bucket, f"{doc.storage_prefix}original.pdf", source_path)
+        iterator = _iter_rasterize_pdf(source_path, **options)
+        try:
+            while True:
+                if await _state(session, tenant_id, job_id) not in ("running", "queued"):
+                    return
+                rendered = await _cpu(next, iterator, None)
+                if rendered is None:
+                    break
+                count += 1
+                image, ct, physical_no, region = rendered
+                previous = await session.scalar(select(Page).where(Page.document_id == doc.id, Page.page_no == count))
+                if previous is None:
+                    digest = hashlib.sha256(image).hexdigest()
+                    extension = "webp" if ct == "image/webp" else "jpg"
+                    key = f"{doc.storage_prefix}pages/{count}.{extension}"
+                    await storage.put_object(doc.storage_bucket, key, image, ct)
+                    with Image.open(io.BytesIO(image)) as im:
+                        width, height = im.size
+                    session.add(Page(tenant_id=tenant_id, document_id=doc.id, visibility=doc.visibility,
+                        page_no=count, storage_key=key, content_type=ct, byte_size=len(image),
+                        width=width, height=height, checksum=digest,
+                        source_page_no=physical_no, source_region=region))
+                await session.execute(update(Job).where(Job.id == job_id).values(
+                    progress={"done": count, "total": max(count, doc.page_count)}))
+                await commit_keep_rls(session, tenant_id=tenant_id)
+                await _publish(tenant_id, job_id, {"kind": "page_ok", "done": count, "total": max(count, doc.page_count)})
+        finally:
+            await _cpu(iterator.close)
+    if not count:
+        raise ValueError("El PDF no contiene páginas")
+    doc.page_count = count
+    await _finish(session, tenant_id, job_id, result={"pages": count, "document_id": str(doc.id)})
+
+
+@serialized_job
 async def rasterize_document(ctx, *, job_id, tenant_id, document_id):
-    job_id = uuid.UUID(str(job_id))
-    tenant_id = uuid.UUID(str(tenant_id))
-    document_id = uuid.UUID(str(document_id))
-
-    async def pub(event: dict) -> None:
-        await events.publish(tenant_id, job_id, event)
-
     async with SessionLocal() as session:
         await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(
-            update(Job).where(Job.id == job_id).values(status="running", started_at=datetime.now(timezone.utc))
-        )
-        await session.commit()
-
-        await set_rls_context(session, tenant_id=tenant_id)
-        doc = await session.get(Document, document_id)
-        if not doc:
-            await session.execute(update(Job).where(Job.id == job_id).values(status="error", error="document gone"))
-            await session.commit()
-            return
-        dpi, fmt, autosplit = await _raster_settings(session, tenant_id)
         try:
-            data, _ = await storage.get_object(doc.storage_bucket, f"{doc.storage_prefix}original.pdf")
-            pages = await asyncio.to_thread(_rasterize_pdf, data, dpi=dpi, fmt=fmt, autosplit=autosplit)
-        except Exception as exc:
-            await set_rls_context(session, tenant_id=tenant_id)
-            await session.execute(
-                update(Job).where(Job.id == job_id).values(
-                    status="error", error=str(exc)[:1000], finished_at=datetime.now(timezone.utc)
-                )
-            )
-            await session.commit()
-            await pub({"kind": "book_fail", "error": str(exc)[:300]})
-            return
-
-        total = len(pages)
-        await pub({"kind": "book_start", "total": total, "engine": "pymupdf"})
-        for i, (img, ct) in enumerate(pages, start=1):
-            ext = "webp" if ct == "image/webp" else "jpg"
-            key = f"{doc.storage_prefix}pages/{i}.{ext}"
-            await storage.put_object(doc.storage_bucket, key, img, ct)
-            width = height = None
-            try:
-                from PIL import Image
-                with Image.open(io.BytesIO(img)) as im:
-                    width, height = im.size
-            except Exception:
-                pass
-            await set_rls_context(session, tenant_id=tenant_id)
-            session.add(Page(
-                tenant_id=tenant_id, document_id=document_id, visibility=doc.visibility,
-                page_no=i, storage_key=key, content_type=ct,
-                byte_size=len(img), width=width, height=height,
-            ))
-            await session.execute(
-                update(Job).where(Job.id == job_id).values(progress={"done": i, "total": total})
-            )
-            await session.commit()
-            await pub({"kind": "page_ok", "done": i, "total": total})
-
-        await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(
-            update(Document).where(Document.id == document_id).values(page_count=total)
-        )
-        await session.execute(
-            update(Job).where(Job.id == job_id).values(
-                status="completed", finished_at=datetime.now(timezone.utc), result={"pages": total}
-            )
-        )
-        await session.commit()
-        await pub({"kind": "all_done", "pages": total})
-
-
-async def rerasterize_document(ctx, *, job_id, tenant_id, document_id):
-    """Re-render an already-uploaded PDF from its retained original at the tenant's CURRENT raster
-    settings (higher DPI / WebP / auto-split spreads), and reset the document's derived data so it can
-    be re-transcribed/re-extracted at the new quality. Wipes this document's records (→ mentions cascade,
-    citations keep but unlink), transcriptions and pages, then re-creates the pages. Destructive WITHIN
-    this one document only; the original PDF is untouched so it's repeatable."""
-    from ..models.record import Record
-    from ..models.transcription import Transcription
-    from ..models.index_entry import IndexEntry
-
-    job_id = uuid.UUID(str(job_id)); tenant_id = uuid.UUID(str(tenant_id)); document_id = uuid.UUID(str(document_id))
-
-    async def pub(event: dict) -> None:
-        await events.publish(tenant_id, job_id, event)
-
-    async with SessionLocal() as session:
-        await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(update(Job).where(Job.id == job_id).values(
-            status="running", started_at=datetime.now(timezone.utc)))
-        await session.commit()
-
-        await set_rls_context(session, tenant_id=tenant_id)
-        doc = await session.get(Document, document_id)
-        if not doc:
-            await session.execute(update(Job).where(Job.id == job_id).values(status="error", error="document gone"))
-            await session.commit(); return
-        dpi, fmt, autosplit = await _raster_settings(session, tenant_id)
-        try:
-            data, _ = await storage.get_object(doc.storage_bucket, f"{doc.storage_prefix}original.pdf")
-            pages = await asyncio.to_thread(_rasterize_pdf, data, dpi=dpi, fmt=fmt, autosplit=autosplit)
-        except Exception as exc:
-            await set_rls_context(session, tenant_id=tenant_id)
-            await session.execute(update(Job).where(Job.id == job_id).values(
-                status="error", error=str(exc)[:1000], finished_at=datetime.now(timezone.utc)))
-            await session.commit(); await pub({"kind": "book_fail", "error": str(exc)[:300]}); return
-
-        # wipe derived data (records cascade their mentions; citations unlink via SET NULL) + old images
-        await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(delete(Record).where(Record.document_id == document_id))
-        await session.execute(delete(IndexEntry).where(IndexEntry.document_id == document_id))
-        await session.execute(delete(Transcription).where(Transcription.document_id == document_id))
-        await session.execute(delete(Page).where(Page.document_id == document_id))
-        await session.commit()
-        try:
-            await storage.delete_prefix(doc.storage_bucket, f"{doc.storage_prefix}pages/")
+            doc = await _owned_document(session, tenant_id, uuid.UUID(str(document_id)))
+            await _render(session, tenant_id, job_id, doc)
         except Exception:
-            pass
-
-        total = len(pages)
-        await pub({"kind": "book_start", "total": total, "engine": "pymupdf", "dpi": dpi})
-        for i, (img, ct) in enumerate(pages, start=1):
-            ext = "webp" if ct == "image/webp" else "jpg"
-            key = f"{doc.storage_prefix}pages/{i}.{ext}"
-            await storage.put_object(doc.storage_bucket, key, img, ct)
-            width = height = None
-            try:
-                from PIL import Image
-                with Image.open(io.BytesIO(img)) as im:
-                    width, height = im.size
-            except Exception:
-                pass
-            await set_rls_context(session, tenant_id=tenant_id)
-            session.add(Page(
-                tenant_id=tenant_id, document_id=document_id, visibility=doc.visibility,
-                page_no=i, storage_key=key, content_type=ct, byte_size=len(img), width=width, height=height,
-            ))
-            await session.execute(update(Job).where(Job.id == job_id).values(progress={"done": i, "total": total}))
-            await session.commit()
-            await pub({"kind": "page_ok", "done": i, "total": total})
-
-        await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(update(Document).where(Document.id == document_id).values(page_count=total))
-        await session.execute(update(Job).where(Job.id == job_id).values(
-            status="completed", finished_at=datetime.now(timezone.utc),
-            result={"pages": total, "dpi": dpi, "format": fmt, "autosplit": autosplit}))
-        await session.commit()
-        await pub({"kind": "all_done", "pages": total})
+            await session.rollback()
+            await _finish(session, tenant_id, job_id, error="No se pudo rasterizar el PDF; los originales y páginas existentes se conservan.")
 
 
-async def compact_to_pdf(ctx, *, job_id, tenant_id, document_id):
-    """Combine an image_set document's pages into a single PDF, as a NEW derived `pdf` document.
-    Preserves provenance end-to-end: the new doc inherits ``source_ref`` (origin URL) and points to its
-    parent via ``derived_from_id``; each copied page keeps its ``source_ref`` (the FamilySearch ARK).
-    Pages are copied verbatim (no re-rasterize) so quality + per-image traceability are kept."""
-    from PIL import Image
-
-    job_id = uuid.UUID(str(job_id))
-    tenant_id = uuid.UUID(str(tenant_id))
-    document_id = uuid.UUID(str(document_id))
-
-    async def pub(event: dict) -> None:
-        await events.publish(tenant_id, job_id, event)
-
+@serialized_job
+async def rerasterize_document(ctx, *, job_id, tenant_id, document_id):
+    """A new document generation; never delete or renumber the cited source's pages."""
     async with SessionLocal() as session:
         await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(update(Job).where(Job.id == job_id).values(
-            status="running", started_at=datetime.now(timezone.utc)))
-        await session.commit()
-
-        await set_rls_context(session, tenant_id=tenant_id)
-        src = await session.get(Document, document_id)
-        if not src:
-            await session.execute(update(Job).where(Job.id == job_id).values(status="error", error="document gone"))
-            await session.commit()
-            return
-        pages = list((await session.scalars(
-            select(Page).where(Page.document_id == document_id).order_by(Page.page_no))).all())
-        metas = [(p.page_no, p.storage_key, p.source_ref, p.content_type) for p in pages]
-        bucket = src.storage_bucket
-        parent = {
-            "title": src.title, "visibility": src.visibility, "source_ref": src.source_ref,
-            "image_policy": src.image_policy, "may_contain_living": src.may_contain_living,
-            "source_origin": src.source_origin, "default_record_type": src.default_record_type,
-            "place_id": src.place_id, "year_from": src.year_from, "year_to": src.year_to,
-            "created_by": src.created_by,
-        }
-        await session.commit()
-
         try:
-            raw: list[tuple[int, bytes, str | None, str | None]] = []
-            for pno, key, sref, ct in metas:
-                data, _ = await storage.get_object(bucket, key)
-                raw.append((pno, data, sref, ct))
-            imgs = [Image.open(io.BytesIO(d)).convert("RGB") for _, d, _, _ in raw]
-            pdf_buf = io.BytesIO()
-            if imgs:
-                imgs[0].save(pdf_buf, format="PDF", save_all=True, append_images=imgs[1:])
-        except Exception as exc:
-            await set_rls_context(session, tenant_id=tenant_id)
-            await session.execute(update(Job).where(Job.id == job_id).values(
-                status="error", error=str(exc)[:1000], finished_at=datetime.now(timezone.utc)))
-            await session.commit()
-            await pub({"kind": "book_fail", "error": str(exc)[:300]})
-            return
+            source = await _owned_document(session, tenant_id, uuid.UUID(str(document_id)))
+            derived_id = uuid.uuid5(uuid.UUID(str(job_id)), "raster-generation")
+            doc = await session.get(Document, derived_id)
+            if doc is None:
+                prefix = f"{tenant_id}/{derived_id}/"
+                with TemporaryDirectory(prefix="gensuite-source-") as tmp:
+                    original = str(Path(tmp) / "original.pdf")
+                    await storage.download_file(source.storage_bucket, f"{source.storage_prefix}original.pdf", original)
+                    await storage.upload_file(source.storage_bucket, f"{prefix}original.pdf", original, "application/pdf")
+                doc = Document(id=derived_id, tenant_id=tenant_id, title=f"{source.title[:470]} (nueva digitalización)",
+                    doc_type="pdf", visibility="private", derived_from_id=source.id,
+                    source_kind=source.source_kind, source_origin=source.source_origin, source_ref=source.source_ref,
+                    storage_bucket=source.storage_bucket, storage_prefix=prefix, page_count=source.page_count,
+                    fingerprint=source.fingerprint, default_record_type=source.default_record_type,
+                    place_id=source.place_id, year_from=source.year_from, year_to=source.year_to,
+                    book_number=source.book_number, is_index=source.is_index, created_by=source.created_by,
+                    image_policy=source.image_policy, may_contain_living=source.may_contain_living,
+                    rights_declaration=source.rights_declaration)
+                session.add(doc)
+                await commit_keep_rls(session, tenant_id=tenant_id)
+            await _render(session, tenant_id, job_id, doc)
+        except Exception:
+            await session.rollback()
+            await _finish(session, tenant_id, job_id, error="No se pudo crear la nueva digitalización; el documento anterior no se ha modificado.")
 
-        new_id = uuid.uuid4()
-        new_prefix = f"{tenant_id}/{new_id}/"
-        await storage.put_object(bucket, f"{new_prefix}original.pdf", pdf_buf.getvalue(), "application/pdf")
+
+def _json_row(row):
+    excluded = {"embedding", "storage_bucket", "storage_prefix", "storage_key"}
+    return {column.key: getattr(row, column.key) for column in inspect(type(row)).columns if column.key not in excluded}
+
+
+async def _export(ctx, *, job_id, tenant_id, document_id, kind):
+    async with SessionLocal() as session:
         await set_rls_context(session, tenant_id=tenant_id)
-        session.add(Document(
-            id=new_id, tenant_id=tenant_id, title=(parent["title"] + " (PDF)")[:512], doc_type="pdf",
-            visibility=parent["visibility"], source_kind="familysearch_pdf",
-            storage_bucket=bucket, storage_prefix=new_prefix, page_count=len(raw),
-            source_ref=parent["source_ref"], derived_from_id=document_id,
-            image_policy=parent["image_policy"], may_contain_living=parent["may_contain_living"],
-            source_origin=parent["source_origin"], default_record_type=parent["default_record_type"],
-            place_id=parent["place_id"], year_from=parent["year_from"], year_to=parent["year_to"],
-            created_by=parent["created_by"],
-        ))
-        await session.commit()
+        try:
+            doc = await _owned_document(session, tenant_id, uuid.UUID(str(document_id)))
+            if not await _start(session, tenant_id, job_id):
+                return
+            export_id = uuid.uuid5(uuid.UUID(str(job_id)), kind)
+            existing = await session.get(DocumentExport, export_id)
+            if existing:
+                await _finish(session, tenant_id, job_id, result={"export_id": str(export_id), "document_id": str(doc.id)})
+                return
+            pages = list((await session.scalars(select(Page).where(Page.document_id == doc.id).order_by(Page.page_no))).all())
+            if not pages or any(p.image_purged for p in pages):
+                raise ValueError("Faltan imágenes")
+            is_pdf = kind in ("pdf", "pdfa")
+            if kind == "pdfa" and (len(pages) > settings.pdfa_max_pages or
+                sum(p.byte_size or 0 for p in pages) > settings.pdfa_max_bytes):
+                raise PdfaError("El libro supera el límite del perfil PDF/A; divide el libro o ajusta su capacidad.")
+            transcriptions = list((await session.scalars(select(Transcription).where(
+                Transcription.document_id == doc.id).order_by(Transcription.created_at))).all())
+            active = {t.page_no: t for t in transcriptions if t.is_active}
+            snapshot = {str(t.page_no): str(t.id) for t in active.values()}
+            manifest = {"schema_version": 1, "scope": "document", "document_id": str(doc.id),
+                "transcriptions": snapshot, "pages": [_json_row(p) for p in pages],
+                "pdfa": "not_validated", "text_mode": "appendix" if is_pdf else "json",
+                "source_page_count": len(pages)}
+            metadata = {"manifest": manifest, "document": _json_row(doc),
+                        "transcriptions": [_json_row(t) for t in transcriptions]}
+            if kind == "bagit":
+                from ..models.record import Record
+                from ..models.mention import PersonMention
+                from ..models.citation import Citation
+                from ..models.research import Source, Repository
+                records = list((await session.scalars(select(Record).where(Record.document_id == doc.id))).all())
+                record_ids = [r.id for r in records]
+                citations = list((await session.scalars(select(Citation).where(or_(
+                    Citation.record_id.in_(record_ids), Citation.page_id.in_([p.id for p in pages]),
+                    Citation.transcription_id.in_([t.id for t in transcriptions]),
+                )))).all())
+                sources = list((await session.scalars(select(Source).where(or_(
+                    Source.id.in_([c.source_id for c in citations if c.source_id]), Source.primary_document_id == doc.id,
+                )))).all())
+                metadata.update({"records": [_json_row(r) for r in records],
+                    "mentions": [_json_row(m) for m in (await session.scalars(select(PersonMention).where(PersonMention.record_id.in_(record_ids)))).all()],
+                    "citations": [_json_row(c) for c in citations], "sources": [_json_row(s) for s in sources],
+                    "repositories": [_json_row(r) for r in (await session.scalars(select(Repository).where(Repository.id.in_([s.repository_id for s in sources if s.repository_id])))).all()]})
+            await commit_keep_rls(session, tenant_id=tenant_id)
+            with TemporaryDirectory(prefix="gensuite-export-") as tmp:
+                extension = "pdf" if is_pdf else "zip"
+                path = str(Path(tmp) / f"export.{extension}")
+                writer = await _cpu(ConsultationPDF if is_pdf else PreservationBag, path)
+                try:
+                    if kind == "bagit" and doc.doc_type == "pdf":
+                        original = str(Path(tmp) / "original.pdf")
+                        await storage.download_file(doc.storage_bucket, f"{doc.storage_prefix}original.pdf", original)
+                        if doc.fingerprint and await asyncio.to_thread(file_checksum, original) != doc.fingerprint:
+                            raise ValueError("El PDF original no coincide con su checksum")
+                        await asyncio.to_thread(writer.add_file, original, "data/originals/original.pdf")
+                    if kind == "bagit":
+                        from botocore.exceptions import ClientError
+                        source_manifest = str(Path(tmp) / "original-manifest.json")
+                        try:
+                            await storage.download_file(doc.storage_bucket, f"{doc.storage_prefix}original-manifest.json", source_manifest)
+                            await asyncio.to_thread(writer.add_file, source_manifest, "data/originals/original-manifest.json")
+                        except ClientError as exc:
+                            if str(exc.response.get("Error", {}).get("Code")) not in {"404", "NoSuchKey", "NotFound"}:
+                                raise
+                            metadata["warnings"] = ["Documento histórico sin manifest de importación original"]
+                        for t in transcriptions:
+                            await asyncio.to_thread(writer.add_text, t.text or "", f"data/transcriptions/{t.id}.txt")
+                    for number, page in enumerate(pages, 1):
+                        if await _state(session, tenant_id, job_id) != "running":
+                            return
+                        part = str(Path(tmp) / "page.bin")
+                        await storage.download_file(doc.storage_bucket, page.storage_key, part)
+                        checksum = await asyncio.to_thread(file_checksum, part)
+                        if page.checksum and checksum != page.checksum:
+                            raise ValueError("La imagen no coincide con su checksum")
+                        if is_pdf:
+                            image = await asyncio.to_thread(Path(part).read_bytes)
+                            await _cpu(writer.add_image, image)
+                        else:
+                            ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/tiff": "tif"}.get(page.content_type, "bin")
+                            entry = f"data/images/{page.id}.{ext}"
+                            await asyncio.to_thread(writer.add_file, part, entry)
+                            manifest["pages"][number - 1]["archive_path"] = entry
+                        await session.execute(update(Job).where(Job.id == job_id).values(progress={"done": number, "total": len(pages)}))
+                        await commit_keep_rls(session, tenant_id=tenant_id)
+                    if is_pdf:
+                        for page in pages:
+                            if await _state(session, tenant_id, job_id) != "running":
+                                return
+                            t = active.get(page.page_no)
+                            await _cpu(writer.add_transcription, page.page_no,
+                                t.text if t else None, reviewed=bool(t and t.status == "corrected"))
+                            await session.execute(update(Job).where(Job.id == job_id).values(
+                                progress={"stage": "transcription_appendix", "done": page.page_no, "total": len(pages)}))
+                            await commit_keep_rls(session, tenant_id=tenant_id)
+                        manifest["output_page_count"] = writer.page_count
+                    else:
+                        await asyncio.to_thread(writer.add_json, metadata)
+                finally:
+                    await _cpu(writer.close)
+                if kind == "pdfa":
+                    async def checkpoint():
+                        if await _state(session, tenant_id, job_id) != "running":
+                            return False
+                        await session.execute(update(Job).where(Job.id == job_id, Job.status == "running").values(
+                            progress={"stage": "pdfa_conversion_validation", "done": len(pages), "total": len(pages)}))
+                        await commit_keep_rls(session, tenant_id=tenant_id)
+                        return True
+                    converted, proof = await convert(Path(path), checkpoint=checkpoint)
+                    path = str(converted)
+                    manifest.update({"pdfa": "validated", "validation": proof})
+                if await _state(session, tenant_id, job_id) != "running":
+                    return
+                key = f"{doc.storage_prefix}exports/{export_id}.{extension}"
+                await storage.upload_file(doc.storage_bucket, key, path, "application/pdf" if is_pdf else "application/zip")
+                session.add(DocumentExport(id=export_id, tenant_id=tenant_id, document_id=doc.id, kind=kind,
+                    storage_key=key, checksum=await asyncio.to_thread(file_checksum, path),
+                    byte_size=Path(path).stat().st_size, manifest=json.loads(json.dumps(manifest, default=str))))
+                await _finish(session, tenant_id, job_id, result={"export_id": str(export_id), "document_id": str(doc.id), "kind": kind})
+        except ExportCancelled:
+            await session.rollback()
+        except PdfaError as exc:
+            await session.rollback()
+            await _finish(session, tenant_id, job_id, error=str(exc))
+        except Exception:
+            await session.rollback()
+            await _finish(session, tenant_id, job_id, error="No se pudo generar la exportación. Comprueba las imágenes y el almacenamiento; los originales se conservan.")
 
-        total = len(raw)
-        await pub({"kind": "book_start", "total": total})
-        _EXT = {"image/jpeg": ".jpg", "image/webp": ".webp", "image/png": ".png"}
-        for i, (pno, data, sref, ct) in enumerate(raw, start=1):
-            # keep the stored key's extension in sync with the actual content type
-            key = f"{new_prefix}pages/{pno}{_EXT.get(ct or 'image/jpeg', '.jpg')}"
-            await storage.put_object(bucket, key, data, ct or "image/jpeg")
-            await set_rls_context(session, tenant_id=tenant_id)
-            session.add(Page(
-                tenant_id=tenant_id, document_id=new_id, visibility=parent["visibility"],
-                page_no=pno, storage_key=key, content_type=ct or "image/jpeg",
-                byte_size=len(data), source_ref=sref,  # keep the exact image ARK
-            ))
-            await session.execute(update(Job).where(Job.id == job_id).values(progress={"done": i, "total": total}))
-            await session.commit()
-            await pub({"kind": "page_ok", "done": i, "total": total})
 
-        await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(update(Job).where(Job.id == job_id).values(
-            status="completed", finished_at=datetime.now(timezone.utc),
-            result={"document_id": str(new_id), "pages": total}))
-        await session.commit()
-        await pub({"kind": "all_done", "pages": total, "document_id": str(new_id)})
+@serialized_job
+async def compact_to_pdf(ctx, *, job_id, tenant_id, document_id):
+    return await _export(ctx, job_id=job_id, tenant_id=tenant_id, document_id=document_id, kind="pdf")
+
+
+@serialized_job
+async def export_document_archive(ctx, *, job_id, tenant_id, document_id):
+    return await _export(ctx, job_id=job_id, tenant_id=tenant_id, document_id=document_id, kind="bagit")
+
+
+@serialized_job
+async def export_document_pdfa(ctx, *, job_id, tenant_id, document_id):
+    return await _export(ctx, job_id=job_id, tenant_id=tenant_id, document_id=document_id, kind="pdfa")

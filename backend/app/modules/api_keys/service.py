@@ -16,8 +16,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.security import Principal
+from ...db.rls import set_rls_context
 from ...db.session import SessionLocal
 from ...models.api_key import ApiKey
+from ...models.membership import Membership
 
 
 def _hash(token: str) -> str:
@@ -35,7 +37,7 @@ async def create_key(
     if principal.tenant_id is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no active tenant")
     scope = scope if scope in ("read", "write") else "read"
-    role = "viewer" if scope == "read" else (principal.role or "researcher")
+    role = "viewer" if scope == "read" else (principal.role or "editor")
     token, prefix, token_hash = _generate()
     expires_at = (
         datetime.now(timezone.utc) + timedelta(days=expires_days) if expires_days else None
@@ -73,11 +75,21 @@ async def resolve_api_key(token: str) -> Principal | None:
             return None
         if key.expires_at is not None and key.expires_at < datetime.now(timezone.utc):
             return None
+        # A key is an authentication secret, not a permanent privilege grant.  Re-read the
+        # workspace membership so removing/demoting someone takes effect immediately for every
+        # previously-issued gsk_ token.
+        await set_rls_context(session, user_id=key.user_id, tenant_id=key.tenant_id, role=key.role)
+        membership = await session.scalar(select(Membership).where(
+            Membership.tenant_id == key.tenant_id, Membership.user_id == key.user_id
+        ))
+        if membership is None:
+            return None
         key.last_used_at = datetime.now(timezone.utc)
         try:
             await session.commit()
         except Exception:
             await session.rollback()
         return Principal(
-            user_id=key.user_id, is_server_admin=False, tenant_id=key.tenant_id, role=key.role,
+            user_id=key.user_id, is_server_admin=False, tenant_id=key.tenant_id,
+            role="viewer" if key.scope == "read" else membership.role,
         )

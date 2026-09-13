@@ -11,9 +11,23 @@ from ..db.base import Base, TimestampMixin, uuid_pk
 
 
 class MembershipRole(str, enum.Enum):
-    tenant_admin = "tenant_admin"
-    researcher = "researcher"
+    """Workspace roles, ordered from least to most privileged.
+
+    The aliases keep existing module constants readable while migration 0030 moves persisted
+    rows to the new collaboration vocabulary.  A contributor deliberately cannot alter the
+    approved tree directly: their work enters through a proposal.
+    """
+
+    owner = "owner"
+    admin = "admin"
+    editor = "editor"
+    contributor = "contributor"
     viewer = "viewer"
+    guest = "guest"
+
+    # Source-compatible names used by the original API.  They serialize as the new values.
+    tenant_admin = "admin"
+    researcher = "editor"
 
 
 class Membership(Base, TimestampMixin):

@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Exportaciones — prueba aislada</title></head>
+<body><div id="root"></div><script type="module">
+import React from "react";
+import { createRoot } from "react-dom/client";
+import { ExportPanel } from "../src/features/estela/views/BibliotecaView.tsx";
+createRoot(document.getElementById("root")).render(React.createElement(ExportPanel, {
+  doc: { id: "book", title: "Libro sintético" }, onClose: () => {}, notify: () => {}
+}));
+</script></body></html>

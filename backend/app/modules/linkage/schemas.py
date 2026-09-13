@@ -49,6 +49,8 @@ class CandidateOut(BaseModel):
     person_mention_id: uuid.UUID
     record_id: uuid.UUID | None
     score: float
+    score_kind: str = "heuristic"
+    score_version: str = "v1"
     status: str
     method: str
     relation: str = "self"  # self | sibling
@@ -64,6 +66,7 @@ class DecisionOut(BaseModel):
     status: str
     resolved_person_id: uuid.UUID | None = None
     created_inferred: list[uuid.UUID] = []
+    change_id: uuid.UUID | None = None
 
 
 class ProposalOut(BaseModel):
@@ -78,3 +81,36 @@ class ProposalOut(BaseModel):
 class AcceptedOut(BaseModel):
     person_id: uuid.UUID
     mention_id: uuid.UUID
+
+
+class DecisionActionOut(BaseModel):
+    kind: str
+    mention_id: uuid.UUID
+    name: str
+    relation: str
+    role: str | None = None
+    required: bool
+
+
+class CandidatePreviewOut(BaseModel):
+    candidate_id: uuid.UUID
+    status: str
+    relation: str
+    tree_person_id: uuid.UUID
+    actions: list[DecisionActionOut]
+    updated_at: datetime
+    preview_token: str
+
+
+class CandidateApplyIn(BaseModel):
+    preview_token: str
+    relative_mention_ids: list[uuid.UUID] = []
+    # JSON object keys are mention UUIDs and values are explicitly selected tree persons.
+    existing_person_ids: dict[uuid.UUID, uuid.UUID] = {}
+    # Used only for a sibling candidate; omitting it explicitly creates a new person.
+    candidate_person_id: uuid.UUID | None = None
+
+
+class CandidateApplyOut(DecisionOut):
+    change_id: uuid.UUID
+    created_or_linked_person_ids: list[uuid.UUID]

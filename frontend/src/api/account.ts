@@ -14,3 +14,9 @@ export const updateMe = (body: { full_name?: string; email?: string }) =>
 
 export const changePassword = (current_password: string, new_password: string) =>
   api<void>("/auth/change-password", { method: "POST", body: JSON.stringify({ current_password, new_password }) });
+
+export const beginMfa = () => api<{ otpauth_url: string }>("/auth/mfa/enroll", { method: "POST" });
+export const confirmMfa = (code: string) =>
+  api<{ recovery_codes: string[] }>("/auth/mfa/confirm", { method: "POST", body: JSON.stringify({ code }) });
+export const disableMfa = (password: string, code: string) =>
+  api<void>("/auth/mfa/disable", { method: "POST", body: JSON.stringify({ password, code }) });

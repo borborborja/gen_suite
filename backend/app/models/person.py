@@ -22,6 +22,11 @@ class Person(Base, TimestampMixin):
     gedcom_xref: Mapped[str | None] = mapped_column(String(64), index=True)
     sex: Mapped[str] = mapped_column(String(1), server_default=text("'U'"), nullable=False)  # M/F/U
     notes: Mapped[str | None] = mapped_column(Text)
+    # Publication is opt-in. Unknown status is treated as private by public snapshots, so an
+    # imported tree cannot accidentally disclose a living person.
+    privacy_status: Mapped[str] = mapped_column(
+        String(16), server_default=text("'unknown'"), nullable=False
+    )  # unknown | living | deceased | public | private
     # Unmapped GEDCOM sub-records, preserved for round-trip export.
     raw: Mapped[list | None] = mapped_column(JSONB)
 

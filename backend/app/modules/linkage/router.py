@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.deps import get_current_principal, get_tenant_db, require_roles
@@ -14,18 +19,53 @@ from ...models.job import Job
 from ...models.membership import MembershipRole
 from ...models.mention import PersonMention
 from ...models.record import Record
+from ...models.mutation_request import MutationRequest
+from ...models.change_log import ChangeLog
+from ...settings import settings
 from ..jobs.schemas import JobOut
 from ..tree.service import _summaries
 from . import dedup, service
 from .schemas import (
-    AcceptedOut, CandidateOut, DecisionOut, DiscoverRequest, MentionOut, ProposalOut, RecordOut,
-    TreePersonOut,
+    AcceptedOut, CandidateApplyIn, CandidateApplyOut, CandidateOut, CandidatePreviewOut,
+    DecisionOut, DiscoverRequest, MentionOut, ProposalOut, RecordOut, TreePersonOut,
 )
 from .service import ROLE_RELATION
+from ..tree.audit import audited
 
 router = APIRouter(prefix="/linkage", tags=["linkage"])
 
 _WRITE = (MembershipRole.tenant_admin.value, MembershipRole.researcher.value)
+
+
+def _preview_token(payload: dict) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    sig = hmac.new(settings.jwt_secret.encode(), raw, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=") + "." + base64.urlsafe_b64encode(sig).decode().rstrip("=")
+
+
+def _read_preview_token(token: str) -> dict:
+    try:
+        raw_part, sig_part = token.split(".", 1)
+        raw = base64.urlsafe_b64decode(raw_part + "=" * (-len(raw_part) % 4))
+        actual = base64.urlsafe_b64decode(sig_part + "=" * (-len(sig_part) % 4))
+        expected = hmac.new(settings.jwt_secret.encode(), raw, hashlib.sha256).digest()
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "previsualización inválida") from exc
+    if not hmac.compare_digest(actual, expected) or int(payload.get("expires_at", 0)) < int(time.time()):
+        raise HTTPException(status.HTTP_409_CONFLICT, "la previsualización ha caducado; vuelve a revisarla")
+    return payload
+
+
+def _request_hash(body: CandidateApplyIn) -> str:
+    raw = json.dumps(body.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+async def _lock_tree(db: AsyncSession, tenant_id: uuid.UUID) -> None:
+    await db.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:tenant_key))"), {
+        "tenant_key": str(tenant_id),
+    })
 
 
 def _job_out(job: Job) -> JobOut:
@@ -189,9 +229,11 @@ async def merge_reconstruction(
     if not r or not r.graph:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "reconstruction not found or empty")
     from datetime import datetime, timezone
-    result = await _merge(db, principal.tenant_id, r.graph, family_keys=body.family_keys)
-    r.merged_at = datetime.now(timezone.utc)
-    return result
+    async with audited(db, principal, action="reconstruction_merge", entity_type="reconstruction",
+                       entity_id=recon_id, summary="Fusionó una reconstrucción revisada") as capture:
+        result = await _merge(db, principal.tenant_id, r.graph, family_keys=body.family_keys)
+        r.merged_at = datetime.now(timezone.utc)
+    return {**result, "change_id": str(capture.change_id) if capture.change_id else None}
 
 
 def _mention_out(m: PersonMention) -> MentionOut:
@@ -240,7 +282,8 @@ async def candidates(
         tp = summaries.get(mc.tree_person_id)
         out.append(CandidateOut(
             id=mc.id, tree_person_id=mc.tree_person_id, person_mention_id=mc.person_mention_id,
-            record_id=mc.record_id, score=mc.score, status=mc.status, method=mc.method,
+            record_id=mc.record_id, score=mc.score, score_kind=mc.score_kind,
+            score_version=mc.score_version, status=mc.status, method=mc.method,
             relation=getattr(mc, "relation", "self"),
             evidence=mc.evidence, record=rec_out,
             mention=_mention_out(mention) if mention else None,
@@ -254,6 +297,92 @@ async def candidates(
 
 
 @router.post(
+    "/candidates/{candidate_id}/preview", response_model=CandidatePreviewOut,
+    dependencies=[Depends(require_roles(*_WRITE))],
+)
+async def preview_candidate(
+    candidate_id: uuid.UUID,
+    db: AsyncSession = Depends(get_tenant_db),
+) -> CandidatePreviewOut:
+    """Build a non-mutating, short-lived review of the exact tree decision."""
+    preview = await service.preview_candidate(db, candidate_id)
+    token_payload = {
+        "candidate_id": preview["candidate_id"], "status": preview["status"],
+        "updated_at": preview["updated_at"], "expires_at": int(time.time()) + 15 * 60,
+    }
+    return CandidatePreviewOut(**preview, preview_token=_preview_token(token_payload))
+
+
+@router.post(
+    "/candidates/{candidate_id}/apply", response_model=CandidateApplyOut,
+    dependencies=[Depends(require_roles(*_WRITE))],
+)
+async def apply_candidate(
+    candidate_id: uuid.UUID, body: CandidateApplyIn,
+    idempotency_key: str | None = Header(default=None),
+    principal: Principal = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> CandidateApplyOut:
+    """Apply a human-reviewed decision once, with an auditable server-side undo."""
+    if not idempotency_key or len(idempotency_key) > 128:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "se requiere la cabecera Idempotency-Key (máximo 128 caracteres)")
+    payload = _read_preview_token(body.preview_token)
+    if payload.get("candidate_id") != str(candidate_id):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "la previsualización no corresponde a esta propuesta")
+    request_hash = _request_hash(body)
+    await _lock_tree(db, principal.tenant_id)
+    prior = await db.scalar(select(MutationRequest).where(
+        MutationRequest.tenant_id == principal.tenant_id,
+        MutationRequest.idempotency_key == idempotency_key,
+    ))
+    if prior:
+        if prior.request_hash != request_hash:
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                "la clave de idempotencia ya se usó con otra decisión")
+        if prior.change_id:
+            prior_change = await db.get(ChangeLog, prior.change_id)
+            if prior_change and prior_change.reverted_at:
+                raise HTTPException(status.HTTP_409_CONFLICT,
+                                    "esa decisión fue deshecha; vuelve a previsualizarla")
+        return CandidateApplyOut(**prior.response)
+
+    from ...models.match_candidate import MatchCandidate
+    candidate = await db.get(MatchCandidate, candidate_id)
+    if (not candidate or candidate.status != payload.get("status") or
+            candidate.updated_at.isoformat() != payload.get("updated_at")):
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "la propuesta cambió; vuelve a previsualizarla antes de aplicarla")
+
+    async with audited(db, principal, action="linkage_apply", entity_type="candidate",
+                       entity_id=candidate_id, summary="Aplicó una propuesta revisada al árbol") as capture:
+        candidate, people = await service.apply_reviewed_candidate(
+            db, principal.tenant_id, candidate_id, principal.user_id,
+            relative_mention_ids=body.relative_mention_ids,
+            existing_person_ids=body.existing_person_ids,
+            candidate_person_id=body.candidate_person_id,
+        )
+    if not capture.change_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "la propuesta no produjo ningún cambio")
+    resolved_person_id = candidate.tree_person_id
+    if candidate.relation != "self":
+        mention = await db.get(PersonMention, candidate.person_mention_id)
+        resolved_person_id = mention.resolved_person_id if mention else None
+    response = {
+        "id": str(candidate.id), "status": candidate.status,
+        "resolved_person_id": str(resolved_person_id) if resolved_person_id else None,
+        "created_inferred": [], "change_id": str(capture.change_id),
+        "created_or_linked_person_ids": [str(person.id) for person in people if person],
+    }
+    # The ledger is committed with the tree change by get_tenant_db; a response can never
+    # claim success unless the corresponding ChangeLog entry commits too.
+    db.add(MutationRequest(tenant_id=principal.tenant_id, idempotency_key=idempotency_key,
+                           request_hash=request_hash, response=response, change_id=capture.change_id))
+    await db.flush()
+    return CandidateApplyOut(**response)
+
+
+@router.post(
     "/candidates/{candidate_id}/confirm", response_model=DecisionOut,
     dependencies=[Depends(require_roles(*_WRITE))],
 )
@@ -262,8 +391,8 @@ async def confirm(
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> DecisionOut:
-    mc = await service.confirm_candidate(db, candidate_id, principal.user_id)
-    return DecisionOut(id=mc.id, status=mc.status, resolved_person_id=mc.tree_person_id)
+    raise HTTPException(status.HTTP_410_GONE,
+                        "usa la previsualización y aplicación revisable de la propuesta")
 
 
 @router.post(
@@ -275,8 +404,10 @@ async def reject(
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> DecisionOut:
-    mc = await service.reject_candidate(db, candidate_id, principal.user_id)
-    return DecisionOut(id=mc.id, status=mc.status)
+    async with audited(db, principal, action="linkage_reject", entity_type="candidate",
+                       entity_id=candidate_id, summary="Descartó una propuesta") as capture:
+        mc = await service.reject_candidate(db, candidate_id, principal.user_id)
+    return DecisionOut(id=mc.id, status=mc.status, change_id=capture.change_id)
 
 
 @router.get("/mentions/{mention_id}/coreferents")
@@ -322,7 +453,5 @@ async def accept_proposal(
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> AcceptedOut:
-    person = await service.accept_proposal(
-        db, principal.tenant_id, candidate_id, mention_id, principal.user_id
-    )
-    return AcceptedOut(person_id=person.id, mention_id=mention_id)
+    raise HTTPException(status.HTTP_410_GONE,
+                        "selecciona los familiares en la aplicación revisable de la propuesta")

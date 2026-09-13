@@ -1,0 +1,21 @@
+# Optional operator tool. Never started by the normal Compose installation.
+# Sources are read-only; this client receives no PostgreSQL or object-storage credentials.
+services:
+  gen-suite-import:
+    profiles: ["import"]
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: gen-suite-backend:latest
+    environment:
+      GEN_SUITE_IMPORT_TOKEN: ${GEN_SUITE_IMPORT_TOKEN:-}
+    volumes:
+      - type: bind
+        source: ${GEN_SUITE_IMPORT_PATH:?Selecciona la carpeta de originales}
+        target: /originals
+        read_only: true
+        bind:
+          create_host_path: false
+    entrypoint: ["python", "-m", "app.ingest_import"]
+    command: ["/originals", "--base-url", "http://gen-suite-backend:8000/api", "--allow-http"]
+    restart: "no"

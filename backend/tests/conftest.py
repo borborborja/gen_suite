@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest_asyncio
+import os
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -17,6 +18,10 @@ async def clean_db():
     """Truncate identity tables before each test (uses the admin role, bypassing RLS), and clear
     the per-IP rate-limit buckets — every test registers from the same client IP, so with a live
     Redis the auth limiter would otherwise start returning 429 after a few tests."""
+    if os.environ.get("GEN_SUITE_ALLOW_TEST_TRUNCATE") != "yes" or not (
+        settings.postgres_db.startswith("gensuite_test_") or settings.postgres_db == "gensuite_ci"
+    ):
+        raise RuntimeError("Pruebas bloqueadas: usa una BD gensuite_test_* aislada y GEN_SUITE_ALLOW_TEST_TRUNCATE=yes.")
     admin = create_async_engine(settings.admin_database_url)
     async with admin.begin() as conn:
         await conn.execute(

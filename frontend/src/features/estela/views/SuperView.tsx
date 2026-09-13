@@ -163,17 +163,18 @@ export default function SuperView() {
   const built = useMemo(() => graph ? buildGraph(graph, focusId ?? graph.focus, cand) : null, [graph, focusId, cand]);
   const layout = useMemo(() => built ? computeLayout(built.graph) : null, [built]);
 
-  const [mode, setMode] = useState<"crawl" | "corpus">("crawl");
+  // The old browser-side crawler was not durable and applied relatives implicitly.  Corpus
+  // reconstruction remains a reviewable background job; person-level review lives in
+  // Descubrimientos where every change now has a server-side undo.
+  const [mode] = useState<"corpus">("corpus");
 
   return (
     <section style={{ padding: "32px 44px 64px" }}>
       {confirmDialog}
       <h1 style={{ fontFamily: fonts.serif, fontWeight: 600, fontSize: 34, margin: 0, letterSpacing: "-.02em" }}>Superdescubrimiento</h1>
-      <div style={{ display: "inline-flex", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 9, padding: 3, gap: 2, margin: "14px 0 10px" }}>
-        {([["crawl", "Persona a persona"], ["corpus", "Todo el corpus"]] as const).map(([k, l]) => (
-          <span key={k} onClick={() => setMode(k)} style={{ padding: "8px 14px", borderRadius: 7, cursor: "pointer", fontSize: 13, fontWeight: mode === k ? 600 : 500, color: mode === k ? "#fff" : "var(--muted)", background: mode === k ? "var(--accent)" : "transparent" }}>{l}</span>
-        ))}
-      </div>
+      <p style={{ color: "var(--muted)", fontSize: 14, margin: "8px 0 20px", maxWidth: 720 }}>
+        Las coincidencias individuales se revisan en Descubrimientos. Aquí puedes reconstruir el corpus completo como una propuesta que después se incorpora al árbol y puede deshacerse.
+      </p>
 
       {mode === "corpus" ? (
         <CorpusReconstruction ask={ask} />
@@ -316,7 +317,8 @@ function CorpusReconstruction({ ask }: { ask: (o: import("../ui").ConfirmOpts) =
     setMerging(true);
     try {
       const r = await mergeReconstruction(recon.id);
-      e.notify(`Fusionado: ${r.persons} personas y ${r.families} familias añadidas`, "var(--ok)");
+      if (r.change_id) e.notifyChange(`Fusionado: ${r.persons} personas y ${r.families} familias añadidas`, r.change_id, "var(--ok)");
+      else e.notify(`Fusionado: ${r.persons} personas y ${r.families} familias añadidas`, "var(--ok)");
       e.go("arbol");
     } catch (err) { e.notify((err as Error).message, "var(--danger)"); }
     setMerging(false);

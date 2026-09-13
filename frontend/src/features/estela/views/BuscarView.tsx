@@ -9,6 +9,7 @@ import { getRecordTypes, listDocuments, type RecordType, type DocumentOut } from
 import { geoSearch, type GeoResult } from "../../../api/geo";
 import { roleLabel } from "../labels";
 import { useDebouncedSearch } from "../ui";
+import { activeIndex, type ActiveIndex } from "../../../api/indexes";
 
 const tabs = [
   { key: "archivo", label: "En el archivo" },
@@ -42,10 +43,12 @@ export default function BuscarView() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [docs, setDocs] = useState<DocumentOut[]>([]);
+  const [indexInfo, setIndexInfo] = useState<ActiveIndex | null>(null);
   const [sugs, setSugs] = useState<{ field: "surname" | "given" | "place"; value: string; count: number }[]>([]);
 
   useEffect(() => { getRecordTypes().then(setTypes).catch(() => setTypes([])); }, []);
   useEffect(() => { listDocuments("mine").then(setDocs).catch(() => setDocs([])); }, []);
+  useEffect(() => { if (f.semantic) void activeIndex().then(setIndexInfo).catch(() => setIndexInfo(null)); }, [f.semantic]);
   const set = (patch: Partial<Filters>) => setF((prev) => ({ ...prev, ...patch }));
   const typeLabel = (k: string) => types.find((t) => t.key === k)?.label ?? k;
 
@@ -77,8 +80,9 @@ export default function BuscarView() {
   }, [f.surname, f.given, f.place, e.searchTab]);
 
   useEffect(() => {
-    if (!active) { setRecords([]); setPersons([]); setSources([]); setErr(null); return; }
+    if (!active) { setRecords([]); setPersons([]); setSources([]); setErr(null); setLoading(false); return; }
     setLoading(true); setErr(null);
+    let cancelled = false;
     const t = setTimeout(async () => {
       try {
         if (e.searchTab === "archivo") {
@@ -89,12 +93,12 @@ export default function BuscarView() {
             role: f.role || undefined, semantic: f.semantic || undefined,
             fuzzy: f.exact ? false : undefined,
           };
-          setRecords(await searchRecords(rf));
+          const hits = await searchRecords(rf); if (!cancelled) setRecords(hits);
         } else if (e.searchTab === "arbol") {
-          setPersons(await searchPersons(f.text, {
+          const hits = await searchPersons(f.text, {
             given: f.given || undefined, surname: f.surname || undefined,
             year_from: f.yearFrom || undefined, year_to: f.yearTo || undefined,
-          }));
+          }); if (!cancelled) setPersons(hits);
         } else {
           // Fuentes externas: derive given/surname from free text if the explicit fields are empty.
           let given = f.given, surname = f.surname;
@@ -102,14 +106,14 @@ export default function BuscarView() {
             const toks = f.text.trim().split(/\s+/);
             given = toks[0]; surname = toks.slice(1).join(" ");
           }
-          setSources(await listSources({
+          const hits = await listSources({
             given, surname, place: f.place, year_from: f.yearFrom, year_to: f.yearTo, region: f.region,
-          }));
+          }); if (!cancelled) setSources(hits);
         }
-      } catch (e2) { setErr((e2 as Error).message || "error de búsqueda"); }
-      setLoading(false);
+      } catch (e2) { if (!cancelled) setErr((e2 as Error).message || "error de búsqueda"); }
+      if (!cancelled) setLoading(false);
     }, 350);
-    return () => clearTimeout(t);
+    return () => { cancelled = true; clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [JSON.stringify(f), e.searchTab]);
 
@@ -179,14 +183,15 @@ export default function BuscarView() {
       </div>
 
       {!active && <div style={{ color: "var(--muted)", fontSize: 13.5 }}>Introduce un nombre, tipo de acta, lugar o fechas para empezar.</div>}
+      {f.semantic && e.searchTab === "archivo" && <p style={{ fontSize: 12, color: "var(--muted)" }}>La consulta semántica puede consumir IA. {indexInfo?.id ? `Índice: ${indexInfo.model ?? "modelo local"}. ${indexInfo.include_public ? "Incluye los documentos públicos capturados que sigan accesibles." : "Solo cubre el corpus propio indexado; usa búsqueda por palabras para el resto de documentos públicos."}` : "Crea y activa un índice en Ajustes. La búsqueda por palabras no necesita vectores."}</p>}
       {loading && <div style={{ color: "var(--muted)", fontSize: 13.5 }}>Buscando…</div>}
       {err && !loading && (
         <div style={{ background: "var(--danger-faint, rgba(192,57,43,.08))", border: "1px solid var(--danger)", color: "var(--danger)", borderRadius: 10, padding: "11px 15px", fontSize: 13 }}>
-          La búsqueda falló: {err}. No es que no haya resultados — revisa que el servidor esté activo.
+          La búsqueda falló: {err}. No se ha completado; no interpretes este error como ausencia de documentos.
         </div>
       )}
 
-      {active && e.searchTab === "fuentes" && (
+      {active && !loading && !err && e.searchTab === "fuentes" && (
         <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
           <p style={{ color: "var(--muted)", fontSize: 13, margin: 0 }}>Estela abre cada archivo externo con la búsqueda ya rellenada (nombre, lugar y fechas). Fuentes españolas; añade una provincia para ver las provinciales.</p>
           {Object.entries(byCategory).map(([cat, list]) => (
@@ -209,8 +214,8 @@ export default function BuscarView() {
         </div>
       )}
 
-      {active && !loading && e.searchTab === "archivo" && records.length === 0 && <div style={{ color: "var(--muted)", fontSize: 13.5 }}>Sin actas que coincidan.</div>}
-      {active && e.searchTab === "archivo" && (
+      {active && !loading && !err && e.searchTab === "archivo" && records.length === 0 && <div style={{ color: "var(--muted)", fontSize: 13.5 }}>Sin actas que coincidan.</div>}
+      {active && !loading && !err && e.searchTab === "archivo" && (
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {records.map((r) => (
             <div key={r.mention_id ?? r.record_id} onClick={() => e.openDoc(r.document_id, r.page_no ?? undefined)} style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 12, padding: "14px 18px", cursor: "pointer" }}>
@@ -224,13 +229,18 @@ export default function BuscarView() {
                 {r.role && <span style={{ color: "var(--muted)" }}> · {roleLabel(r.role, r.record_type)}</span>}
               </div>
               {r.summary && <div style={{ fontFamily: fonts.serif, fontSize: 13, color: "var(--muted)", marginTop: 4, lineHeight: 1.45 }}>{r.summary}</div>}
+              {r.index_generation_id && <details onClick={(event) => event.stopPropagation()} style={{ fontSize: 11, marginTop: 8, overflowWrap: "anywhere" }}>
+                <summary>Procedencia del resultado semántico</summary>
+                <p>Generación: {r.index_generation_id}. Revisión: {r.transcription_id ?? "Fuente sin transcripción vinculada"}{r.transcription_end_id ? ` → ${r.transcription_end_id}` : ""}.</p>
+                <p>Vector: {r.embedding_item_id}. Huella: {r.source_hash}. Llamada de indexación: {r.embedding_ai_call_id ?? "motor local"}. Consulta: {r.query_ai_call_id ?? "motor local"}.</p>
+              </details>}
             </div>
           ))}
         </div>
       )}
 
-      {active && !loading && e.searchTab === "arbol" && persons.length === 0 && <div style={{ color: "var(--muted)", fontSize: 13.5 }}>Sin personas que coincidan.</div>}
-      {active && e.searchTab === "arbol" && (
+      {active && !loading && !err && e.searchTab === "arbol" && persons.length === 0 && <div style={{ color: "var(--muted)", fontSize: 13.5 }}>Sin personas que coincidan.</div>}
+      {active && !loading && !err && e.searchTab === "arbol" && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(248px,1fr))", gap: 14 }}>
           {persons.map((p) => (
             <div key={p.id} onClick={() => e.openPerson(p.id)} style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 13, padding: 16, cursor: "pointer" }}>

@@ -45,6 +45,6 @@ export const latestReconstruction = () =>
   api<ReconstructionOut | null>("/linkage/reconstruction/latest");
 
 export const mergeReconstruction = (id: string, familyKeys?: string[]) =>
-  api<{ persons: number; families: number }>(`/linkage/reconstruction/${id}/merge`, {
+  api<{ persons: number; families: number; change_id: string | null }>(`/linkage/reconstruction/${id}/merge`, {
     method: "POST", body: JSON.stringify({ family_keys: familyKeys ?? null }),
   });

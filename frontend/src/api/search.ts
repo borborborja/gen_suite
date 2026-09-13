@@ -15,6 +15,14 @@ export interface RecordHit {
   role: string | null;
   summary: string | null;
   score: number;
+  page_id?: string | null;
+  transcription_id?: string | null;
+  transcription_end_id?: string | null;
+  index_generation_id?: string | null;
+  embedding_item_id?: string | null;
+  embedding_ai_call_id?: string | null;
+  query_ai_call_id?: string | null;
+  source_hash?: string | null;
 }
 
 export interface RecordFilters {

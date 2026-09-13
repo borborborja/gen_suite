@@ -5,7 +5,7 @@ import uuid
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import Boolean, Float, ForeignKey, Integer, String, Text
 from sqlalchemy import text as sa_text
-from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy.dialects.postgresql import UUID as PGUUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..db.base import Base, TimestampMixin, uuid_pk
@@ -43,3 +43,7 @@ class Transcription(Base, TimestampMixin):
     job_id: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True))
     # FTS tsv is a DB-generated column (see migration 0006); not mapped here.
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1024))
+    supersedes_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("transcriptions.id", ondelete="SET NULL"))
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    provenance: Mapped[dict | None] = mapped_column(JSONB)
