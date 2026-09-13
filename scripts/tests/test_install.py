@@ -299,7 +299,8 @@ class InstallerTests(unittest.TestCase):
         service = json.loads(result.stdout)["services"]["gen-suite-import"]
         self.assertEqual(set(service["environment"]), {"GEN_SUITE_IMPORT_TOKEN"})
         self.assertTrue(service["volumes"][0]["read_only"])
-        self.assertFalse(service["volumes"][0]["bind"]["create_host_path"])
+        # Compose versions may omit an explicit false from the normalized model.
+        self.assertFalse(service["volumes"][0]["bind"].get("create_host_path", False))
         self.assertNotIn("--upload", service["command"])
 
 
