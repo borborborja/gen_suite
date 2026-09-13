@@ -15,7 +15,7 @@ from app.modules.tree import gedcom
 from .test_research import _tenant_token
 from .test_tree import _auth
 
-RICH = """0 HEAD
+RICH = ("""0 HEAD
 1 GEDC
 2 VERS 5.5.1
 1 CHAR UTF-8
@@ -62,7 +62,7 @@ RICH = """0 HEAD
 1 SOUR @BOOK@
 2 PAGE Familia, entrada 8
 0 TRLR
-""".encode("utf-8")
+""").encode("utf-8")
 
 
 async def setup(client, suffix):
