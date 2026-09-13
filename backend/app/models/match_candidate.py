@@ -36,6 +36,13 @@ class MatchCandidate(Base, TimestampMixin):
         PGUUID(as_uuid=True), ForeignKey("records.id", ondelete="SET NULL"), index=True
     )
     score: Mapped[float] = mapped_column(Float, nullable=False)
+    # Scores rank hypotheses; they are not calibrated probabilities.
+    score_kind: Mapped[str] = mapped_column(
+        String(24), server_default=sa_text("'heuristic'"), nullable=False
+    )
+    score_version: Mapped[str] = mapped_column(
+        String(24), server_default=sa_text("'v1'"), nullable=False
+    )
     evidence: Mapped[dict | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(
         String(16), server_default=sa_text("'pending'"), nullable=False

@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { CSSProperties } from "react";
 import { useEstela, confColors, colMap } from "../store";
 import { fonts } from "../theme";
-import { Check, Cross, SearchPlus } from "../icons";
+import { Check, Cross } from "../icons";
 import { shortcuts } from "../data";
 import SourceScan from "../SourceScan";
 
@@ -30,12 +30,12 @@ export default function DescubrimientosView() {
           <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16, overflow: "hidden", boxShadow: "var(--shadow)" }}>
             {/* confidence bar */}
             <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "16px 24px", borderBottom: "1px solid var(--line2)", background: cc.tint }}>
-              <span style={{ fontFamily: fonts.mono, fontSize: 11, letterSpacing: ".14em", color: "var(--muted)" }}>CONFIANZA</span>
+              <span style={{ fontFamily: fonts.mono, fontSize: 11, letterSpacing: ".14em", color: "var(--muted)" }}>COMPATIBILIDAD HEURÍSTICA</span>
               <span style={{ fontWeight: 700, fontSize: 14, color: cc.c, letterSpacing: ".04em" }}>{cur.cLevel}</span>
               <div style={{ flex: 1, height: 8, borderRadius: 999, background: "var(--line2)", overflow: "hidden", maxWidth: 280 }}>
                 <div style={{ height: "100%", borderRadius: 999, width: `${cur.pct}%`, background: cc.c }} />
               </div>
-              <span style={{ fontFamily: fonts.serif, fontSize: 24, fontWeight: 600, color: cc.c }}>{cur.pct}%</span>
+              <span style={{ fontFamily: fonts.serif, fontSize: 18, fontWeight: 600, color: cc.c }}>{cur.cLevel}</span>
               <span style={{ marginLeft: "auto", fontFamily: fonts.mono, fontSize: 11, color: "var(--muted)" }}>{pos} de {discoveries.length}</span>
             </div>
 
@@ -85,7 +85,7 @@ export default function DescubrimientosView() {
 
             {/* evidence */}
             <div style={{ padding: "20px 24px", borderTop: "1px solid var(--line2)" }}>
-              <div style={{ fontFamily: fonts.mono, fontSize: 10.5, letterSpacing: ".14em", color: "var(--muted)", marginBottom: 14 }}>POR QUÉ CREEMOS QUE ES ÉL</div>
+              <div style={{ fontFamily: fonts.mono, fontSize: 10.5, letterSpacing: ".14em", color: "var(--muted)", marginBottom: 14 }}>SEÑALES DE COMPATIBILIDAD</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
                 {cur.evidence.map((ev, i) => (
                   <div key={i} style={{ display: "flex", alignItems: "center", gap: 14, background: "var(--bg)", border: "1px solid var(--line2)", borderRadius: 10, padding: "11px 14px" }}>
@@ -108,7 +108,7 @@ export default function DescubrimientosView() {
             {!e.panelOpen && (
               <div style={{ display: "flex", gap: 12, padding: "20px 24px", borderTop: "1px solid var(--line2)" }}>
                 <button onClick={e.confirm} style={{ flex: 1, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 9, background: "var(--ok)", color: "#fff", border: "none", borderRadius: 10, padding: 15, fontFamily: "inherit", fontSize: 15.5, fontWeight: 600, cursor: "pointer", boxShadow: "0 4px 16px rgba(47,125,84,.28)" }}>
-                  <Check size={19} />{cur.yes}
+                  <Check size={19} />Revisar y confirmar
                 </button>
                 <button onClick={e.reject} style={{ flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8, background: "var(--surface)", color: "var(--danger)", border: "1px solid var(--line)", borderRadius: 10, padding: "15px 22px", fontFamily: "inherit", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>
                   <Cross size={18} />No es él
@@ -135,7 +135,7 @@ export default function DescubrimientosView() {
               <div style={{ fontFamily: fonts.mono, fontSize: 10.5, letterSpacing: ".12em", color: "var(--muted)", marginBottom: 10 }}>EN COLA · {e.pendingCount}</div>
               <input value={qf} onChange={(ev) => setQf(ev.target.value)} placeholder="filtrar por apellido…" style={{ width: "100%", boxSizing: "border-box", background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 7, padding: "7px 10px", color: "var(--fg)", fontFamily: "inherit", fontSize: 12.5, marginBottom: 8 }} />
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-                <span style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>conf ≥ {minPct}%</span>
+                <span style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>puntuación ≥ {minPct}</span>
                 <input type="range" min={0} max={90} step={10} value={minPct} onChange={(ev) => setMinPct(Number(ev.target.value))} style={{ flex: 1 }} />
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -150,7 +150,7 @@ export default function DescubrimientosView() {
                     <div key={d.id} onClick={() => e.jumpTo(idx)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 9, cursor: "pointer", background: isCur ? "var(--accent-faint)" : "transparent", border: `1px solid ${isCur ? "var(--accent)" : "transparent"}` }}>
                       <span style={{ width: 7, height: 7, borderRadius: "50%", flex: "none", background: dot }} />
                       <span style={{ flex: 1, fontSize: 13, fontWeight: 500, ...strike }}>{d.treeName}</span>
-                      <span style={{ fontFamily: fonts.mono, fontSize: 11, color: dot }}>{dec === "yes" ? "✓" : dec === "no" ? "✕" : `${d.pct}%`}</span>
+                      <span style={{ fontFamily: fonts.mono, fontSize: 11, color: dot }}>{dec === "yes" ? "✓" : dec === "no" ? "✕" : `${d.pct}`}</span>
                     </div>
                   );
                 })}
@@ -192,9 +192,9 @@ function RelativesPanel() {
     <div style={{ padding: "22px 24px", borderTop: "1px solid var(--line2)", background: "var(--ok-faint)" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 6 }}>
         <Check size={18} stroke="var(--ok)" />
-        <span style={{ fontWeight: 600, fontSize: 15, color: "var(--ok)" }}>Confirmado. Esta acta también menciona…</span>
+        <span style={{ fontWeight: 600, fontSize: 15, color: "var(--ok)" }}>Revisa qué personas incorporar con esta acta</span>
       </div>
-      <p style={{ color: "var(--muted)", fontSize: 13, margin: "0 0 16px" }}>Añádelos a tu árbol como <b style={{ color: "var(--warn)" }}>inferidos</b>, cada uno con su fuente.</p>
+      <p style={{ color: "var(--muted)", fontSize: 13, margin: "0 0 16px" }}>La coincidencia y solo los familiares seleccionados se aplicarán juntos, con su fuente y una reversión real.</p>
       <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
         {cur.relatives.map((r) => {
           const done = e.added[r.id];
@@ -210,18 +210,16 @@ function RelativesPanel() {
               <button onClick={() => !done && e.addRel(r.id)} style={done
                 ? { background: "var(--ok-faint)", color: "var(--ok)", border: "1px solid var(--ok)", borderRadius: 8, padding: "9px 16px", fontFamily: "inherit", fontSize: 13, fontWeight: 600, cursor: "default", flex: "none" }
                 : { background: "var(--warn)", color: "#3a2a08", border: "none", borderRadius: 8, padding: "9px 16px", fontFamily: "inherit", fontSize: 13, fontWeight: 600, cursor: "pointer", flex: "none" }}>
-                {done ? "✓ Añadido" : "Añadir"}
+                {done ? "✓ Seleccionado" : "Seleccionar"}
               </button>
             </div>
           );
         })}
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 18, paddingTop: 16, borderTop: "1px solid var(--line2)", flexWrap: "wrap" }}>
-        <button onClick={e.addAllRel} style={{ background: "var(--ok)", color: "#fff", border: "none", borderRadius: 8, padding: "11px 18px", fontFamily: "inherit", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>Añadir todos</button>
-        <button onClick={e.advance} style={{ background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 8, padding: "11px 18px", fontFamily: "inherit", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>Continuar →</button>
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--accent)", fontWeight: 500 }}>
-          <SearchPlus size={16} />Al aceptar, Estela buscará más actas de cada pariente
-        </div>
+        <button onClick={e.addAllRel} style={{ background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 8, padding: "11px 18px", fontFamily: "inherit", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>Seleccionar todos</button>
+        <button onClick={e.applyReview} style={{ background: "var(--ok)", color: "#fff", border: "none", borderRadius: 8, padding: "11px 18px", fontFamily: "inherit", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>Aplicar selección</button>
+        <button onClick={e.advance} style={{ background: "transparent", color: "var(--fg)", border: "1px solid var(--line)", borderRadius: 8, padding: "11px 18px", fontFamily: "inherit", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>Cancelar</button>
       </div>
     </div>
   );

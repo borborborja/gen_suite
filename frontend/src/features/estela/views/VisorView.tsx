@@ -6,7 +6,7 @@ import { fonts } from "../theme";
 import { roleLabel } from "../labels";
 import { ArrowLeft } from "../icons";
 import { fetchPageObjectUrl, getPages, getDocument, setPageKind, splitDocument, type PageOut, type DocumentOut } from "../../../api/documents";
-import { getTranscriptions, correctTranscription, type TranscriptionOut } from "../../../api/transcription";
+import { getTranscriptions, correctTranscription, getTranscriptionHistory, type TranscriptionOut, type TranscriptionRevision } from "../../../api/transcription";
 import { documentRecords, reextract, mergeNext, splitRecord, type ExtractedRecordOut, type MentionLite } from "../../../api/extraction";
 import { streamJob, jobOutcome } from "../../../api/jobs";
 
@@ -24,6 +24,7 @@ function LiveVisor({ docId }: { docId: string }) {
   const [imgUrl, setImgUrl] = useState<string | null>(null);
   const [imgGone, setImgGone] = useState(false);
   const [txs, setTxs] = useState<TranscriptionOut[]>([]);
+  const [history, setHistory] = useState<TranscriptionRevision[] | null>(null);
   const [records, setRecords] = useState<ExtractedRecordOut[]>([]);
   const [draft, setDraft] = useState("");
   const [saved, setSaved] = useState(false);
@@ -55,13 +56,16 @@ function LiveVisor({ docId }: { docId: string }) {
   }, [docId, pageNo]);
 
   const tx = txs.find((t) => t.page_no === pageNo);
-  useEffect(() => { setDraft(tx?.text || ""); setSaved(false); }, [tx?.id, tx?.text]);
+  useEffect(() => { setDraft(tx?.text || ""); setSaved(false); setHistory(null); }, [tx?.id, tx?.text, pageNo]);
 
   async function save() {
     if (!tx) return;
-    await correctTranscription(tx.id, draft);
-    setSaved(true);
-    await reloadData();
+    try {
+      await correctTranscription(tx.id, draft);
+      await reloadData();
+      setSaved(true);
+      e.notify("Nueva revisión guardada. Las pruebas anteriores y las conclusiones del árbol se conservan.", "var(--ok)");
+    } catch (error) { e.notify((error as Error).message, "var(--danger)"); }
   }
 
   const curPage = pages.find((p) => p.page_no === pageNo);
@@ -85,6 +89,17 @@ function LiveVisor({ docId }: { docId: string }) {
           No se pudieron cargar la transcripción/actas de este libro: {loadErr}. <span style={{ textDecoration: "underline", cursor: "pointer" }} onClick={() => reloadData()}>Reintentar</span>
         </div>
       )}
+
+      {tx && <button onClick={() => {
+        if (history) setHistory(null);
+        else void getTranscriptionHistory(docId, pageNo).then(setHistory).catch((error) => e.notify((error as Error).message, "var(--danger)"));
+      }} style={{ marginBottom: 12 }}>Historial de la transcripción</button>}
+      {history && <div style={{ marginBottom: 20, maxHeight: 340, overflow: "auto" }}>
+        {history.map((revision) => <details key={revision.id} style={{ padding: 10, border: "1px solid var(--line)" }}>
+          <summary>{new Date(revision.created_at).toLocaleString()} · {revision.engine} · {revision.status}{revision.is_active ? " · vigente" : " · conservada"}</summary>
+          <pre style={{ whiteSpace: "pre-wrap", fontFamily: "inherit", fontSize: 13 }}>{revision.text || "(sin texto)"}</pre>
+        </details>)}
+      </div>}
 
       <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 18, flexWrap: "wrap" }}>
         <h1 style={{ fontFamily: fonts.serif, fontWeight: 600, fontSize: 26, margin: 0 }}>Visor</h1>

@@ -70,6 +70,7 @@ export interface PersonDetail {
   id: string;
   sex: string;
   notes: string | null;
+  privacy_status: string;
   names: NameOut[];
   events: EventOut[];
   parents: Related[];
@@ -91,8 +92,12 @@ export const getPersonFamilies = (id: string) => api<FamilyOut[]>(`/tree/persons
 export const addFamilyEvent = (familyId: string, body: EventBody) =>
   api<{ id: string }>(`/tree/families/${familyId}/events`, { method: "POST", body: JSON.stringify(body) });
 
-export type CitationBody = { document_id?: string; page_no?: number; note?: string };
-export const createCitation = (target_type: "person" | "event", target_id: string, body: CitationBody) =>
+export type CitationBody = {
+  document_id?: string; page_no?: number; source_id?: string; assertion_id?: string;
+  locator?: Record<string, unknown>; quote?: string; quality?: string; note?: string;
+  clear_source?: boolean; clear_assertion?: boolean;
+};
+export const createCitation = (target_type: "person" | "name" | "event" | "family" | "assertion", target_id: string, body: CitationBody) =>
   api<{ id: string }>("/tree/citations", { method: "POST", body: JSON.stringify({ target_type, target_id, ...body }) });
 export const updateCitation = (id: string, body: CitationBody) =>
   api<{ id: string }>(`/tree/citations/${id}`, { method: "PATCH", body: JSON.stringify(body) });
@@ -119,6 +124,12 @@ export interface CitationOut {
   target_type: string;
   document_id: string | null;
   document_title: string | null;
+  source_id: string | null;
+  source_title: string | null;
+  assertion_id: string | null;
+  locator: Record<string, unknown> | null;
+  quote: string | null;
+  quality: string | null;
   page_no: number | null;
   record_type: string | null;
   date_raw: string | null;
@@ -126,7 +137,7 @@ export interface CitationOut {
 }
 export const getCitations = (id: string) => api<CitationOut[]>(`/tree/persons/${id}/citations`);
 export type EventBody = { type: string; date_raw?: string; place?: string; place_lat?: number; place_lng?: number; value?: string };
-export const updatePerson = (id: string, body: { sex?: string; given?: string; surname?: string; surname_prefix?: string; nickname?: string; notes?: string }) =>
+export const updatePerson = (id: string, body: { sex?: string; given?: string; surname?: string; surname_prefix?: string; nickname?: string; notes?: string; privacy_status?: string }) =>
   api<PersonDetail>(`/tree/persons/${id}`, { method: "PATCH", body: JSON.stringify(body) });
 export const addEvent = (id: string, body: EventBody) =>
   api<{ id: string }>(`/tree/persons/${id}/events`, { method: "POST", body: JSON.stringify(body) });
@@ -163,6 +174,7 @@ export interface PersonRow {
   sex: string;
   birth_year: number | null;
   death_year: number | null;
+  privacy_status: string;
 }
 export interface PersonPage { total: number; items: PersonRow[] }
 export interface PersonFilters {
@@ -332,9 +344,24 @@ export async function importGedcom(file: File): Promise<GedcomImportResult> {
   return res.json();
 }
 
-export async function downloadGedcom(): Promise<void> {
-  const res = await authFetch("/tree/export/gedcom");
-  if (!res.ok) throw new Error(`${res.status}`);
+export const getGedcomAudit = () => api<import("./types").GedcomExportAudit>("/tree/export/gedcom/audit");
+
+export function downloadGedcomAudit(report: import("./types").GedcomExportAudit): void {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = "gen_suite_gedcom_audit.json"; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export async function downloadGedcom(expectedSha256?: string, expectedReviewToken?: string): Promise<void> {
+  const params = new URLSearchParams();
+  if (expectedSha256) params.set("expected_sha256", expectedSha256);
+  if (expectedReviewToken) params.set("expected_review_token", expectedReviewToken);
+  const res = await authFetch(`/tree/export/gedcom${params.size ? `?${params}` : ""}`);
+  if (!res.ok) {
+    const error = await res.json().catch(() => null) as { detail?: string } | null;
+    throw new Error(typeof error?.detail === "string" ? error.detail : `${res.status}`);
+  }
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");

@@ -1,18 +1,15 @@
-const ACCESS = "gs_access";
-const REFRESH = "gs_refresh";
+let accessToken: string | null = null;
 
-export function setTokens(access: string, refresh: string) {
-  localStorage.setItem(ACCESS, access);
-  localStorage.setItem(REFRESH, refresh);
+export function setTokens(access: string) {
+  accessToken = access;
 }
 
 export function clearTokens() {
-  localStorage.removeItem(ACCESS);
-  localStorage.removeItem(REFRESH);
+  accessToken = null;
 }
 
 export function hasToken(): boolean {
-  return !!localStorage.getItem(ACCESS);
+  return !!accessToken;
 }
 
 // A single in-flight refresh shared by all concurrent 401s, so a burst of expired requests
@@ -20,17 +17,14 @@ export function hasToken(): boolean {
 let refreshing: Promise<boolean> | null = null;
 
 async function refreshTokens(): Promise<boolean> {
-  const refresh = localStorage.getItem(REFRESH);
-  if (!refresh) return false;
   try {
-    const res = await fetch("/api/auth/refresh", {
+    const res = await fetch("/api/auth/session/refresh", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: refresh }),
+      credentials: "same-origin",
     });
     if (!res.ok) return false;
     const t = await res.json();
-    setTokens(t.access_token, t.refresh_token);
+    setTokens(t.access_token);
     return true;
   } catch {
     return false;
@@ -47,10 +41,10 @@ async function doFetch(path: string, opts: RequestInit, auth: boolean): Promise<
     ...((opts.headers as Record<string, string>) || {}),
   };
   if (auth) {
-    const token = localStorage.getItem(ACCESS);
+    const token = accessToken;
     if (token) headers["Authorization"] = `Bearer ${token}`;
   }
-  return fetch(`/api${path}`, { ...opts, headers });
+  return fetch(`/api${path}`, { ...opts, headers, credentials: "same-origin" });
 }
 
 // Authenticated fetch with the same single-flight 401→refresh→retry behavior as api(), but
@@ -58,7 +52,7 @@ async function doFetch(path: string, opts: RequestInit, auth: boolean): Promise<
 // blobs/images, SSE streams) instead of re-implementing the token header by hand.
 export async function authFetch(path: string, opts: RequestInit = {}): Promise<Response> {
   let res = await doFetch(path, opts, true);
-  if (res.status === 401 && localStorage.getItem(REFRESH)) {
+  if (res.status === 401 && accessToken) {
     if (await tryRefresh()) {
       res = await doFetch(path, opts, true);
     } else {
@@ -82,7 +76,7 @@ export async function api<T = any>(
 
   // Access token likely expired — refresh once (deduped) and retry the original request. If the
   // refresh fails, the session is truly gone: clear tokens and signal the app to show login.
-  if (res.status === 401 && auth && localStorage.getItem(REFRESH)) {
+  if (res.status === 401 && auth && accessToken) {
     if (await tryRefresh()) {
       res = await doFetch(path, withJson, auth);
     } else {

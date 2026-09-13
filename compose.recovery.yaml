@@ -1,0 +1,22 @@
+# Optional operator tool, using the already-built backend image. It never starts services.
+# Combine with the same compose.yaml (or compose.release.yaml) as the selected installation.
+services:
+  gen-suite-recovery:
+    image: ${GEN_SUITE_RECOVERY_IMAGE:-gen-suite-backend:latest}
+    profiles: [recovery]
+    entrypoint: [python, -m, app.recovery]
+    env_file: [config/.env]
+    environment:
+      POSTGRES_HOST: gen-suite-db
+      PYTHONDONTWRITEBYTECODE: "1"
+    user: "${GEN_SUITE_RECOVERY_UID:-1000}:${GEN_SUITE_RECOVERY_GID:-1000}"
+    volumes:
+      - type: bind
+        source: ${GEN_SUITE_RECOVERY_DIR:?Selecciona un directorio absoluto preparado para copias}
+        target: /recovery
+        read_only: ${GEN_SUITE_RECOVERY_READ_ONLY:-true}
+        bind:
+          create_host_path: false
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "no"

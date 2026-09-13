@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { useEstela, type Nav } from "./store";
 import { fonts } from "./theme";
 import type { Account } from "./EstelaApp";
@@ -7,6 +7,7 @@ import {
   ClockIcon, ChartIcon, ShieldIcon,
 } from "./icons";
 import ActivityIndicator from "./ActivityIndicator";
+import { getCapabilities, type Capabilities } from "../../api/capabilities";
 
 function navItemStyle(active: boolean): CSSProperties {
   return {
@@ -18,6 +19,8 @@ function navItemStyle(active: boolean): CSSProperties {
 
 export default function Sidebar({ account }: { account?: Account }) {
   const e = useEstela();
+  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
+  useEffect(() => { void getCapabilities().then(setCapabilities).catch(() => setCapabilities(null)); }, []);
   const isActive = (key: Nav) =>
     e.nav === key ||
     (key === "arbol" && e.nav === "persona") ||
@@ -28,14 +31,31 @@ export default function Sidebar({ account }: { account?: Account }) {
     { key: "arbol", label: "Mi árbol", icon: <TreeIcon /> },
     { key: "descubrimientos", label: "Descubrimientos", icon: <SparkIcon /> },
     { key: "biblioteca", label: "Biblioteca", icon: <BookIcon /> },
+    { key: "investigacion", label: "Investigación", icon: <SearchIcon /> },
+  ];
+  const tools: { key: Nav; label: string; icon: JSX.Element }[] = [
+    { key: "compartir", label: "Compartir", icon: <BookIcon /> },
     { key: "lugares", label: "Lugares", icon: <PinIcon /> },
     { key: "historial", label: "Historial", icon: <ClockIcon /> },
     { key: "estadisticas", label: "Estadísticas", icon: <ChartIcon /> },
     { key: "consistencia", label: "Consistencia", icon: <ShieldIcon /> },
     { key: "buscar", label: "Buscar", icon: <SearchIcon /> },
-    { key: "super", label: "Superdescubrimiento", icon: <SparkIcon /> },
-    { key: "familysearch", label: "FamilySearch", icon: <BookIcon /> },
+    { key: "super", label: "Reconstruir corpus", icon: <SparkIcon /> },
   ];
+  if (capabilities?.gramps_sync) tools.splice(1, 0, { key: "sincronizacion", label: "Sincronización", icon: <TreeIcon /> });
+  if (capabilities?.familysearch) tools.push({ key: "familysearch", label: "FamilySearch", icon: <BookIcon /> });
+
+  const renderItem = (it: { key: Nav; label: string; icon: JSX.Element }) => (
+    <div key={it.key} onClick={() => e.go(it.key)} style={navItemStyle(isActive(it.key))}>
+      {it.icon}
+      <span style={{ flex: it.key === "descubrimientos" ? 1 : undefined }}>{it.label}</span>
+      {it.key === "descubrimientos" && e.hasPending && (
+        <span style={{ fontFamily: fonts.mono, fontSize: 11, fontWeight: 500, background: "var(--accent)", color: "#fff", borderRadius: 999, minWidth: 20, height: 20, display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "0 6px" }}>
+          {e.pendingCount}
+        </span>
+      )}
+    </div>
+  );
 
   return (
     <aside style={{ width: 248, flex: "none", height: "100vh", position: "sticky", top: 0, display: "flex", flexDirection: "column", borderRight: "1px solid var(--line)", background: "var(--surface)" }}>
@@ -51,17 +71,10 @@ export default function Sidebar({ account }: { account?: Account }) {
       </div>
 
       <nav style={{ display: "flex", flexDirection: "column", gap: 3, padding: "6px 12px", flex: 1 }}>
-        {items.map((it) => (
-          <div key={it.key} onClick={() => e.go(it.key)} style={navItemStyle(isActive(it.key))}>
-            {it.icon}
-            <span style={{ flex: it.key === "descubrimientos" ? 1 : undefined }}>{it.label}</span>
-            {it.key === "descubrimientos" && e.hasPending && (
-              <span style={{ fontFamily: fonts.mono, fontSize: 11, fontWeight: 500, background: "var(--accent)", color: "#fff", borderRadius: 999, minWidth: 20, height: 20, display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "0 6px" }}>
-                {e.pendingCount}
-              </span>
-            )}
-          </div>
-        ))}
+        {items.map(renderItem)}
+        <div style={{ height: 1, background: "var(--line2)", margin: "9px 4px 6px" }} />
+        <div style={{ fontFamily: fonts.mono, fontSize: 9.5, letterSpacing: ".12em", color: "var(--muted)", padding: "0 12px 4px" }}>HERRAMIENTAS</div>
+        {tools.map(renderItem)}
       </nav>
 
       <div style={{ padding: 12, borderTop: "1px solid var(--line)", display: "flex", flexDirection: "column", gap: 3 }}>

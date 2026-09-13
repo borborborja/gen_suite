@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Presupuesto IA — prueba aislada</title></head>
+<body><div id="root"></div><script type="module">
+import React from "react";
+import { createRoot } from "react-dom/client";
+import { AiPolicyEditor, AiCallsPanel } from "../src/features/estela/views/AiBudgetControls.tsx";
+createRoot(document.getElementById("root")).render(React.createElement(React.Fragment, null,
+  React.createElement(AiPolicyEditor, {
+    binding: { id: "binding", credential_id: "credential", task_type: "inference", model: "synthetic-model", params: null },
+    model: "synthetic-model", async onChanged() {},
+  }),
+  React.createElement(AiCallsPanel, { async onChanged() {} }),
+));
+</script></body></html>

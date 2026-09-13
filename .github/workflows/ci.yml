@@ -1,0 +1,162 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pdfa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Construir perfil PDF/A opcional
+        run: docker build --target pdfa -f docker/backend.Dockerfile -t gen-suite-pdfa:ci .
+      - name: Validación PDF/A real sin red, datos personales ni credenciales
+        run: >-
+          docker run --rm --network none --read-only --cap-drop ALL
+          --security-opt no-new-privileges --pids-limit 256 --memory 4g
+          --tmpfs /tmp:size=4g,mode=1777,nosuid,nodev
+          gen-suite-pdfa:ci python checks/smoke_pdfa.py
+
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Probar instalador y bloqueo de publicación sin datos reales
+        run: |
+          bash -n install.sh
+          python3 -m unittest discover -s scripts/tests -v
+
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: gensuite_ci
+          POSTGRES_USER: gensuite_ci
+          POSTGRES_PASSWORD: gensuite_ci_password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gensuite_ci -d gensuite_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+
+    env:
+      ENVIRONMENT: development
+      GEN_SUITE_ALLOW_TEST_TRUNCATE: "yes"
+      POSTGRES_HOST: localhost
+      POSTGRES_DB: gensuite_ci
+      POSTGRES_USER: gensuite_ci
+      POSTGRES_PASSWORD: gensuite_ci_password
+      APP_DB_USER: gensuite_app_ci
+      APP_DB_PASSWORD: gensuite_app_ci_password
+      REDIS_URL: redis://localhost:6379/0
+      MINIO_ENDPOINT: localhost:9000
+      MINIO_ACCESS_KEY: gensuite_ci
+      MINIO_SECRET_KEY: gensuite_ci_minio_password
+      MINIO_BUCKET_PRIVATE: gensuite-ci-private
+      MINIO_BUCKET_PUBLIC: gensuite-ci-public
+      MINIO_SECURE: "false"
+      JWT_SECRET: ci-only-not-for-production-0123456789
+      SUITE_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      ALLOW_FIRST_USER_ADMIN: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Iniciar almacenamiento de pruebas
+        run: |
+          # Legacy backend under test, not a production recommendation (see docs/ESTADO_VALIDACION_REAL.md).
+          docker run -d --name gensuite-ci-minio -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=gensuite_ci \
+            -e MINIO_ROOT_PASSWORD=gensuite_ci_minio_password \
+            quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          for attempt in $(seq 1 30); do
+            curl -fsS http://localhost:9000/minio/health/live && exit 0
+            sleep 2
+          done
+          docker logs gensuite-ci-minio
+          exit 1
+      - name: Dependencias de OCR para la suite de pruebas
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-spa
+      - name: Instalar backend
+        working-directory: backend
+        run: pip install -e ".[dev]"
+      - name: Migrar esquema desde cero
+        working-directory: backend
+        run: |
+          test "$(alembic heads | wc -l)" -eq 1
+          alembic upgrade head
+      - name: Probar creación local de administración
+        working-directory: backend
+        run: python -m unittest discover -s checks -v
+      - name: Probar manifiesto de 100.000 originales sintéticos
+        working-directory: backend
+        run: python checks/benchmark_ingestion.py --files 100000
+      - name: Construir imagen del backend
+        run: docker build -f docker/backend.Dockerfile -t gen-suite-backend:ci .
+      - name: Ejecutar integración con las herramientas de la imagen runtime
+        run: |
+          docker run --rm --network host \
+            -e ENVIRONMENT -e GEN_SUITE_ALLOW_TEST_TRUNCATE \
+            -e POSTGRES_HOST -e POSTGRES_DB -e POSTGRES_USER -e POSTGRES_PASSWORD \
+            -e APP_DB_USER -e APP_DB_PASSWORD -e REDIS_URL \
+            -e MINIO_ENDPOINT -e MINIO_ACCESS_KEY -e MINIO_SECRET_KEY \
+            -e MINIO_BUCKET_PRIVATE -e MINIO_BUCKET_PUBLIC -e MINIO_SECURE \
+            -e JWT_SECRET -e SUITE_MASTER_KEY -e ALLOW_FIRST_USER_ADMIN \
+            gen-suite-backend:ci pytest -q
+      - name: Construir imagen opcional para integración PDF/A
+        if: ${{ !cancelled() }}
+        run: docker build --target pdfa -f docker/backend.Dockerfile -t gen-suite-pdfa:ci .
+      - name: Probar HTTP → outbox → ARQ → PDF/A → S3 y revisiones con servicios reales
+        if: ${{ !cancelled() }}
+        run: |
+          docker run --rm --network host --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 256 --memory 4g \
+            --tmpfs /tmp:size=4g,mode=1777,nosuid,nodev \
+            -e PYTHONDONTWRITEBYTECODE=1 -e GEN_SUITE_RUN_PDFA_INTEGRATION=yes \
+            -e ENVIRONMENT -e GEN_SUITE_ALLOW_TEST_TRUNCATE \
+            -e POSTGRES_HOST -e POSTGRES_DB -e POSTGRES_USER -e POSTGRES_PASSWORD \
+            -e APP_DB_USER -e APP_DB_PASSWORD -e REDIS_URL \
+            -e MINIO_ENDPOINT -e MINIO_ACCESS_KEY -e MINIO_SECRET_KEY \
+            -e MINIO_BUCKET_PRIVATE -e MINIO_BUCKET_PUBLIC -e MINIO_SECURE \
+            -e JWT_SECRET -e SUITE_MASTER_KEY -e ALLOW_FIRST_USER_ADMIN \
+            gen-suite-pdfa:ci pytest -q -p no:cacheprovider tests/test_pdfa_runtime.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Instalar frontend
+        working-directory: frontend
+        run: npm ci
+      - name: Verificar tipos y empaquetar
+        working-directory: frontend
+        run: npm run typecheck && npm run build
+      - name: Probar planificación y reanudación sin servicios externos
+        working-directory: frontend
+        run: |
+          npm exec --no -- playwright install --with-deps chromium
+          npm run test:offline
+      - name: Construir imagen del frontend
+        run: docker build -f docker/frontend.Dockerfile -t gen-suite-frontend:ci .

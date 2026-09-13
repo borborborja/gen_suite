@@ -1,0 +1,14 @@
+NOTICE:
+
+This work comprises, is based on, or is derived from the FAMILYSEARCH GEDCOM™
+Specification, © 1984-2026 Intellectual Reserve, Inc. All rights reserved.
+
+“FAMILYSEARCH GEDCOM™” and “FAMILYSEARCH®” are trademarks of Intellectual Reserve,
+Inc. and may not be used except as allowed by the Apache 2.0 license that governs
+this work or as expressly authorized in writing and in advance by Intellectual
+Reserve, Inc.
+
+Especificación consultada: FamilySearch GEDCOM 7.0.18 (17 de febrero de 2026).
+https://gedcom.io/specifications/FamilySearchGEDCOMv7.html
+Licencia de la especificación: https://www.apache.org/licenses/LICENSE-2.0
+Este aviso no constituye una certificación ni autorización de marca para gen_suite.

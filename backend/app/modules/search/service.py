@@ -6,9 +6,11 @@ documents; ``scope`` refines further. Hybrid fusion is done in Python over the t
 from __future__ import annotations
 
 import uuid
+from fastapi import HTTPException
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from .indexes import FROM_SQL, LIVE_SQL, ITEM_JOIN, FRESH_SQL, validate_vectors
 
 RRF_K = 60
 
@@ -43,6 +45,8 @@ async def search_records(
     scope: str = "all",
     tenant_id: uuid.UUID | None = None,
     limit: int = 30,
+    generation_id: uuid.UUID | None = None,
+    query_call_id: str | None = None,
 ) -> list[dict]:
     """Structured search over extracted acts: person_mentions JOIN records, filtered by name/type/
     place/year/role/book, with optional free-text (FTS over the page transcription, operators
@@ -117,10 +121,13 @@ async def search_records(
         select_score = "ts_rank(tr.tsv, websearch_to_tsquery('spanish', :q)) AS score"
         order_by = "score DESC"
     elif use_vec:
+        if generation_id is None: raise HTTPException(409, "La consulta necesita una generación vectorial identificada.")
+        validate_vectors([qvec], 1)
         params["qv"] = "[" + ",".join(repr(float(x)) for x in qvec) + "]"
-        conds.append("m.embedding IS NOT NULL")
-        select_score = "1 - (m.embedding <=> (:qv)::vector) AS score"
-        order_by = "m.embedding <=> (:qv)::vector"
+        params["gid"] = generation_id
+        conds.extend(["e.generation_id=:gid AND e.status='ready'", FRESH_SQL["mention"]])
+        select_score = "1 - (e.embedding <=> (:qv)::vector) AS score"
+        order_by = "e.embedding <=> (:qv)::vector"
     elif surname_fuzzy:
         # No free-text: surface the closest spellings first.
         select_score = "similarity(m.norm_surname, :sur_norm) AS score"
@@ -131,7 +138,7 @@ async def search_records(
 
     # superseded records are audit history (replaced after a correction + re-extract) — a search
     # hit on them would open the Visor on an act that no longer exists
-    conds.append("r.status != 'superseded'")
+    conds.append(LIVE_SQL["mention"])
 
     where = (" AND ".join(conds)) if conds else "TRUE"
     where += _REC_SCOPE_SQL.get(scope, "")
@@ -141,7 +148,8 @@ async def search_records(
         SELECT m.id AS mention_id, r.id AS record_id, r.document_id, d.title,
                COALESCE(pg.page_no, tr.page_no) AS page_no,
                r.record_type, r.date_raw, r.date_year, pl.name AS place,
-               m.given, m.surname, m.role, r.summary,
+               m.given, m.surname, m.role, r.summary, r.page_id, r.transcription_id, r.transcription_end_id,
+               {"e.id AS embedding_item_id,e.ai_call_id AS embedding_ai_call_id,e.source_hash," if use_vec else "NULL::uuid AS embedding_item_id,NULL::uuid AS embedding_ai_call_id,NULL::text AS source_hash,"}
                {select_score}
         FROM person_mentions m
         JOIN records r ON r.id = m.record_id
@@ -149,6 +157,8 @@ async def search_records(
         LEFT JOIN places pl ON pl.id = r.place_id
         LEFT JOIN pages pg ON pg.id = r.page_id
         LEFT JOIN transcriptions tr ON tr.id = r.transcription_id
+        LEFT JOIN transcriptions te ON te.id = r.transcription_end_id
+        {"JOIN embedding_items e ON e.kind='mention' AND " + ITEM_JOIN['mention'] if use_vec else ""}
         WHERE {where}
         ORDER BY {order_by}
         LIMIT :limit
@@ -162,6 +172,9 @@ async def search_records(
             "date_raw": r.date_raw, "date_year": r.date_year, "place": r.place,
             "given": r.given, "surname": r.surname, "role": r.role, "summary": r.summary,
             "score": float(r.score) if r.score is not None else 0.0,
+            "page_id": r.page_id, "transcription_id": r.transcription_id, "transcription_end_id": r.transcription_end_id,
+            "index_generation_id": generation_id, "query_ai_call_id": query_call_id,
+            "embedding_item_id": r.embedding_item_id, "embedding_ai_call_id": r.embedding_ai_call_id, "source_hash": r.source_hash,
         }
         for r in rows
     ]
@@ -236,6 +249,11 @@ def _hit(row, score: float) -> dict:
         "page_no": row.page_no,
         "snippet": row.snippet,
         "score": score,
+        "page_id": getattr(row, "page_id", None),
+        "index_generation_id": getattr(row, "index_generation_id", None),
+        "embedding_item_id": getattr(row, "embedding_item_id", None),
+        "embedding_ai_call_id": getattr(row, "embedding_ai_call_id", None),
+        "source_hash": getattr(row, "source_hash", None),
     }
 
 
@@ -244,7 +262,7 @@ async def keyword_search(
 ) -> list[dict]:
     sql = text(
         f"""
-        SELECT t.id, t.document_id, t.page_no, d.title,
+        SELECT t.id, t.document_id, t.page_no, t.page_id, d.title,
                ts_rank(t.tsv, websearch_to_tsquery('spanish', :q)) AS rank,
                ts_headline('spanish', coalesce(t.text, ''),
                            websearch_to_tsquery('spanish', :q),
@@ -261,35 +279,42 @@ async def keyword_search(
 
 
 async def vector_search(
-    session: AsyncSession, qvec: list[float], scope: str, tenant_id: uuid.UUID, limit: int
+    session: AsyncSession, qvec: list[float], scope: str, tenant_id: uuid.UUID, limit: int,
+    *, generation_id: uuid.UUID | None = None, query_call_id: str | None = None,
 ) -> list[dict]:
+    if generation_id is None: raise HTTPException(409, "La consulta necesita una generación vectorial identificada.")
+    validate_vectors([qvec], 1)
     qv = "[" + ",".join(repr(float(x)) for x in qvec) + "]"
     sql = text(
         f"""
-        SELECT t.id, t.document_id, t.page_no, d.title,
-               1 - (t.embedding <=> (:qv)::vector) AS sim,
+        SELECT t.id, t.document_id, t.page_no, t.page_id, d.title,
+               e.generation_id AS index_generation_id, e.id AS embedding_item_id, e.ai_call_id AS embedding_ai_call_id, e.source_hash,
+               1 - (e.embedding <=> (:qv)::vector) AS sim,
                left(coalesce(t.text, ''), 180) AS snippet
-        FROM transcriptions t
-        JOIN documents d ON d.id = t.document_id
-        WHERE t.embedding IS NOT NULL AND t.is_active{_SCOPE_SQL[scope]}
-        ORDER BY t.embedding <=> (:qv)::vector
+        FROM {FROM_SQL['transcription']}
+        JOIN embedding_items e ON e.kind='transcription' AND {ITEM_JOIN['transcription']}
+        WHERE e.tenant_id=:tid AND e.generation_id=:gid AND e.status='ready' AND {LIVE_SQL['transcription']} AND {FRESH_SQL['transcription']}{_SCOPE_SQL[scope]}
+        ORDER BY e.embedding <=> (:qv)::vector
         LIMIT :limit
         """
     )
-    rows = (await session.execute(sql, {"qv": qv, "tid": tenant_id, "limit": limit})).all()
-    return [_hit(r, float(r.sim)) for r in rows]
+    rows = (await session.execute(sql, {"qv": qv, "tid": tenant_id, "gid": generation_id, "limit": limit})).all()
+    return [{**_hit(r, float(r.sim)), "query_ai_call_id": query_call_id} for r in rows]
 
 
 async def hybrid_search(
-    session: AsyncSession, q: str, qvec: list[float], scope: str, tenant_id: uuid.UUID, limit: int
+    session: AsyncSession, q: str, qvec: list[float], scope: str, tenant_id: uuid.UUID, limit: int,
+    *, generation_id: uuid.UUID | None = None, query_call_id: str | None = None,
 ) -> list[dict]:
     keyword = await keyword_search(session, q, scope, tenant_id, 50)
-    vector = await vector_search(session, qvec, scope, tenant_id, 50)
+    vector = await vector_search(session, qvec, scope, tenant_id, 50, generation_id=generation_id, query_call_id=query_call_id)
     fused: dict[uuid.UUID, dict] = {}
     for ranked in (keyword, vector):
         for rank, hit in enumerate(ranked, start=1):
             entry = fused.setdefault(hit["transcription_id"], {**hit, "score": 0.0})
             entry["score"] += 1.0 / (RRF_K + rank)
+            if hit.get("embedding_item_id"):
+                entry.update({key: hit[key] for key in ("index_generation_id", "embedding_item_id", "embedding_ai_call_id", "query_ai_call_id", "source_hash")})
             if hit["snippet"] and not entry.get("snippet"):
                 entry["snippet"] = hit["snippet"]
     return sorted(fused.values(), key=lambda h: h["score"], reverse=True)[:limit]

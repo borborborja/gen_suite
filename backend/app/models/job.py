@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, text
+from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -18,6 +18,7 @@ class Job(Base):
     endpoint relays it to the UI. Tenant-scoped (RLS)."""
 
     __tablename__ = "jobs"
+    __table_args__ = (UniqueConstraint("tenant_id", "id", name="uq_jobs_tenant_id_id"),)
 
     id: Mapped[uuid.UUID] = uuid_pk()
     tenant_id: Mapped[uuid.UUID] = mapped_column(

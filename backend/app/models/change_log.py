@@ -29,7 +29,7 @@ class ChangeLog(Base):
         PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     action: Mapped[str] = mapped_column(String(32), nullable=False)
-    entity_type: Mapped[str | None] = mapped_column(String(16))
+    entity_type: Mapped[str | None] = mapped_column(String(64))
     entity_id: Mapped[uuid.UUID | None] = mapped_column(PGUUID(as_uuid=True))
     summary: Mapped[str | None] = mapped_column(String(512))
     rows: Mapped[list] = mapped_column(JSONB, nullable=False)

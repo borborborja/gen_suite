@@ -1,0 +1,1 @@
+"""Gramps synchronization protocol endpoints."""

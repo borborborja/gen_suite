@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_ttl_minutes: int = 15
     refresh_token_ttl_days: int = 30
+    invitation_only: bool = False
+    frontend_public_url: str = "http://localhost:5173"
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_starttls: bool = True
 
     # ── Secrets at rest (AES-256-GCM envelope for provider API keys) ──────────
     suite_master_key: str = ""  # base64-encoded 32 bytes; required once Phase 3 lands
@@ -55,13 +63,45 @@ class Settings(BaseSettings):
     minio_region: str = "us-east-1"          # AWS needs the bucket's real region for SigV4
     minio_addressing_style: str = ""         # "path" for MinIO/Backblaze; "" = boto3 auto
 
+    # Admission quota for resumable originals, including unfinished manifests.
+    # Separate from physical storage: staging and exports need additional headroom.
+    ingest_tenant_quota_bytes: int = Field(default=500 * 1024 ** 3, ge=1)
+    storage_tenant_quota_bytes: int = Field(default=1024 ** 4, ge=1, le=2**63 - 1)
+    ai_local_endpoint_hosts: str = "localhost,127.0.0.1,::1,ollama,kraken-htr"
+    ingest_max_files: int = Field(default=100_000, ge=1, le=100_000)
+
+    # Optional local archival derivatives; not manuscript OCR or paid inference.
+    pdfa_timeout_seconds: int = Field(default=1800, ge=10, le=7200)
+    pdfa_max_pages: int = Field(default=1000, ge=1, le=10000)
+    pdfa_max_bytes: int = Field(default=2 * 1024 ** 3, ge=1024, le=16 * 1024 ** 3)
+    tree_export_max_rows: int = Field(default=100_000, ge=1, le=1_000_000)
+    tree_export_max_graph_bytes: int = Field(default=32 * 1024**2, ge=1024, le=256 * 1024**2)
+    tree_export_max_files: int = Field(default=10_000, ge=1, le=100_000)
+    tree_export_max_bytes: int = Field(default=2 * 1024**3, ge=1024, le=64 * 1024**3)
+    tree_import_max_bytes: int = Field(default=2 * 1024**3, ge=1024, le=64 * 1024**3)
+    tree_import_max_expanded_bytes: int = Field(default=4 * 1024**3, ge=1024, le=128 * 1024**3)
+    tree_import_max_files: int = Field(default=10_000, ge=1, le=100_000)
+
     # ── Backups (Postgres → S3) ───────────────────────────────────────────────
     backup_to_s3: bool = False               # enable the daily pg_dump → S3 cron
-    backup_retention: int = 14               # keep the N most recent dumps
+    backup_retention: int = 14               # legacy hint; retention is enforced by the destination, never deletions here
     backup_hour: int = 3                      # UTC hour for the daily backup
+    # A production backup must use a distinct bucket and credentials from the
+    # application store, so compromise of the web app cannot erase recovery data.
+    backup_s3_endpoint: str = ""
+    backup_s3_access_key: str = ""
+    backup_s3_secret_key: str = ""
+    backup_s3_bucket: str = ""
+    backup_s3_region: str = "us-east-1"
+    backup_s3_secure: bool = True
+    backup_s3_addressing_style: str = ""
 
     # ── Connector gates (server-admin scope) ──────────────────────────────────
     fs_connector_enabled: bool = False
+    gramps_sync_enabled: bool = False
+    public_sharing_enabled: bool = True
+    api_docs_enabled: bool = True
+    app_version: str = "0.2.0"
 
     # First registered user is auto-promoted to server admin only when this is on (bootstrap).
     # Off by default so an internet-exposed fresh deploy can't be admin-claimed by a stranger.
@@ -106,6 +146,12 @@ class Settings(BaseSettings):
             problems.append("Postgres/app DB password is a known example value")
         if self.minio_secret_key in weak_pw:
             problems.append("MINIO_SECRET_KEY is a known example value")
+        if self.backup_to_s3 and not self.backup_s3_bucket:
+            problems.append("BACKUP_S3_BUCKET is required when BACKUP_TO_S3=true")
+        if self.backup_to_s3 and (not self.backup_s3_endpoint or not self.backup_s3_access_key or not self.backup_s3_secret_key):
+            problems.append("BACKUP_S3_ENDPOINT/ACCESS_KEY/SECRET_KEY are required when BACKUP_TO_S3=true")
+        if self.invitation_only and (not self.smtp_host or not self.smtp_from):
+            problems.append("SMTP_HOST and SMTP_FROM are required when INVITATION_ONLY=true")
         return problems
 
 

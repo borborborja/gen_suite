@@ -6,7 +6,7 @@ import { fonts } from "../theme";
 import {
   getStats, getRoots, getSubtree, searchPersons, importGedcom, downloadGedcom, getPerson,
   listDuplicates, mergePersons, getHome, setHome, createPerson, listPersons,
-  downloadPersonsCsv, listPlaces,
+  downloadPersonsCsv, listPlaces, getGedcomAudit, downloadGedcomAudit,
   displayName, lifespan, type TreeStats, type SearchHit, type TreeGraph, type DuplicatePair,
   type PersonDetail, type PersonPage, type PersonFilters, type PlaceRow,
 } from "../../../api/tree";
@@ -16,6 +16,8 @@ import { computePedigree } from "../../tree/pedigree";
 import { computeFan, arcPath } from "../../tree/fan";
 import { computeDescendants } from "../../tree/descendants";
 import { useConfirm, useDebouncedSearch } from "../ui";
+import TreeExports from "../TreeExports";
+import TreeImports from "../TreeImports";
 
 const tabs: { key: TreeView; label: string }[] = [
   { key: "genograma", label: "Genograma" },
@@ -40,6 +42,34 @@ export default function ArbolView() {
   const [showKinship, setShowKinship] = useState(false);
   const [addRel, setAddRel] = useState<{ id: string; name: string } | null>(null);
   const [refresh, setRefresh] = useState(0);
+  const [exporting, setExporting] = useState(false);
+  const [showExports, setShowExports] = useState(false);
+  const [showImports, setShowImports] = useState(false);
+  const { confirmDialog: exportDialog, ask: askExport } = useConfirm();
+
+  async function exportTree() {
+    setExporting(true);
+    try {
+      const report = await getGedcomAudit();
+      const accepted = await askExport({
+        title: "Revisar exportación GEDCOM 5.5.1",
+        confirmLabel: "Descargar GEDCOM privado",
+        body: <div style={{ maxHeight: "55vh", overflowY: "auto" }}>
+          <p>{report.counts.persons} personas · {report.counts.families} familias · {report.counts.sources} fuentes · {report.counts.repositories} repositorios.</p>
+          <p>Citas exportadas: {report.counts.citations_exported} de {report.counts.citations}.</p>
+          <ul>{report.warnings.map((warning) => <li key={warning} style={{ marginBottom: 8 }}>{warning}</li>)}</ul>
+          {report.unattached_citations > 0 && <p role="alert">{report.unattached_citations} citas no tienen un destino representable en este árbol y quedan fuera.</p>}
+          {report.relocated_child_citations > 0 && <p>{report.relocated_child_citations} citas de filiación se adjuntan al hijo, sin atribuirlas a una familia no identificada.</p>}
+          {report.unresolved_raw_references > 0 && <p role="alert">{report.unresolved_raw_references} estructuras antiguas con referencias sin resolver se conservan como notas, no como enlaces válidos.</p>}
+          <details><summary>Registros que no incluye el archivo</summary><ul>{Object.entries(report.excluded_records).filter(([, count]) => count > 0).map(([name, count]) => <li key={name}>{name}: {count}</li>)}</ul></details>
+          <button type="button" style={{ ...ghostBtn, marginTop: 12 }} onClick={() => downloadGedcomAudit(report)}>Guardar informe de pérdidas (JSON)</button>
+        </div>,
+      });
+      if (accepted) await downloadGedcom(report.sha256, report.review_token);
+    } catch (err) {
+      e.notify(`No se pudo exportar: ${(err as Error).message}`, "var(--danger)");
+    } finally { setExporting(false); }
+  }
 
   const load = useCallback(async () => {
     try {
@@ -80,6 +110,7 @@ export default function ArbolView() {
 
   return (
     <section style={{ padding: "32px 44px 64px" }}>
+      {exportDialog}
       <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 20, flexWrap: "wrap", marginBottom: 22 }}>
         <div>
           <h1 style={{ fontFamily: fonts.serif, fontWeight: 600, fontSize: 34, margin: 0, letterSpacing: "-.02em" }}>Mi árbol</h1>
@@ -99,14 +130,19 @@ export default function ArbolView() {
             <button onClick={() => setShowKinship(true)} title="¿Qué parentesco tienen dos personas?" style={ghostBtn}>Parentesco</button>
             <button onClick={() => setShowDupes(true)} style={ghostBtn}>Fusionar duplicados</button>
             <button
-              onClick={() => downloadGedcom().catch((err) => e.notify(`No se pudo exportar: ${(err as Error).message}`, "var(--danger)"))}
-              title="Descargar el árbol completo como GEDCOM (con fuentes)"
+              onClick={() => void exportTree()}
+              disabled={exporting}
+              title="Revisar fuentes, citas y pérdidas antes de descargar GEDCOM 5.5.1"
               style={ghostBtn}
-            >⬇ Exportar GEDCOM</button>
+            >{exporting ? "Revisando exportación…" : "⬇ Exportar GEDCOM"}</button>
           </div>
         )}
       </div>
 
+      <button style={{ ...ghostBtn, marginBottom: 16 }} aria-expanded={showExports} onClick={() => setShowExports(!showExports)}>Exportaciones en segundo plano y GEDZIP</button>
+      {showExports && <TreeExports />}
+      <button style={{ ...ghostBtn, marginBottom: 16 }} aria-expanded={showImports} onClick={() => setShowImports(!showImports)}>Importación revisada GEDCOM 7 y GEDZIP</button>
+      {showImports && <TreeImports onImported={() => window.location.reload()} />}
       {showDupes && <DuplicatesPanel onClose={() => setShowDupes(false)} onMerged={() => { void load(); setRefresh((n) => n + 1); }} />}
       {showKinship && <RelationshipDialog initialA={focusHit} onClose={() => setShowKinship(false)} />}
       {addRel && (

@@ -23,6 +23,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core import storage
+from ...core.dispatch import schedule
 from ...core.queue import get_queue
 from ...models.document import Document, Page
 from ...models.job import Job
@@ -63,44 +64,49 @@ _RASTER_MAX_W = 3000         # generous per-FACE cap so 300-400 DPI detail survi
 _SPREAD_RATIO = 1.15         # width/height above this ⇒ a two-page spread to split
 
 
-def _rasterize_pdf(
-    data: bytes, *, dpi: int = _RASTER_DPI, fmt: str = "webp",
+def _iter_rasterize_pdf(
+    data: bytes | str, *, dpi: int = _RASTER_DPI, fmt: str = "webp",
     autosplit: bool = True, max_w: int = _RASTER_MAX_W,
-) -> list[tuple[bytes, str]]:
-    """Render each PDF page so the per-page HTR/vision pipeline can READ it. The model reads exactly
-    these pixels, so resolution is the dominant quality lever: too low and dense handwriting becomes
-    illegible and the model hallucinates. Returns (bytes, content_type) per output page.
+) :
+    """Yield one view at a time: bytes, MIME, physical PDF page and relative source region.
 
-    - ``dpi``: render resolution (300 ≈ archival; the source scans are usually higher-res inside the PDF).
-    - ``autosplit``: a landscape page is almost always a two-page *spread* (a book opening); split it
-      into left/right faces so each act is read at full resolution instead of half.
-    - ``fmt``: 'webp' (≈30% smaller than JPEG at equal quality — all major vision models read WebP) or 'jpeg'.
-    - ``max_w``: cap per face so payloads stay sane without throwing away legibility.
+    Autosplit is an operator-selected heuristic, not evidence of a book opening. The original
+    PDF remains the preservation master. Derived dimensions are bounded before rasterization;
+    WebP views are encoded losslessly, with no promise of archival conformance or HTR accuracy.
     """
     import fitz  # pymupdf
 
     ct = "image/webp" if fmt == "webp" else "image/jpeg"
-    out: list[tuple[bytes, str]] = []
-    with fitz.open(stream=data, filetype="pdf") as pdf:
-        for page in pdf:
-            pix = page.get_pixmap(dpi=dpi)
+    pdf = fitz.open(data) if isinstance(data, str) else fitz.open(stream=data, filetype="pdf")
+    with pdf:
+        for physical_no, page in enumerate(pdf, start=1):
+            scale = min(dpi / 72, max_w * 2 / max(page.rect.width, 1),
+                        (64_000_000 / max(page.rect.width * page.rect.height, 1)) ** .5)
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
             mode = "RGBA" if pix.alpha else "RGB"
             im = Image.frombytes(mode, (pix.width, pix.height), pix.samples).convert("RGB")
             if autosplit and im.width > im.height * _SPREAD_RATIO:
                 mid = im.width // 2
-                faces = [im.crop((0, 0, mid, im.height)), im.crop((mid, 0, im.width, im.height))]
+                faces = [(im.crop((0, 0, mid, im.height)), [0, 0, mid / im.width, 1]),
+                         (im.crop((mid, 0, im.width, im.height)), [mid / im.width, 0, 1 - mid / im.width, 1])]
             else:
-                faces = [im]
-            for face in faces:
+                faces = [(im, [0, 0, 1, 1])]
+            for face, region in faces:
                 if face.width > max_w:
                     face = face.resize((max_w, round(face.height * max_w / face.width)))
                 buf = io.BytesIO()
                 if fmt == "webp":
-                    face.save(buf, "WEBP", quality=80, method=4)
+                    face.save(buf, "WEBP", lossless=True, method=4)
                 else:
                     face.save(buf, "JPEG", quality=85)
-                out.append((buf.getvalue(), ct))
-    return out
+                yield buf.getvalue(), ct, physical_no, {"unit": "relative", "bbox": region}
+                face.close()
+            im.close()
+
+
+def _rasterize_pdf(data: bytes, **options) -> list[tuple[bytes, str]]:
+    """Compatibility helper. Workers consume the iterator instead of loading a whole book."""
+    return [(image, ct) for image, ct, _, _ in _iter_rasterize_pdf(data, **options)]
 
 
 async def create_document(
@@ -135,6 +141,8 @@ async def create_document(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "publishing requires a rights declaration")
     if rights_declaration and rights_declaration not in RIGHTS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid rights declaration")
+    if visibility == "public" and (may_contain_living or source_origin == "familysearch"):
+        raise HTTPException(409, "No se puede publicar este documento con posibles personas vivas o restricciones de origen.")
 
     doc_id = uuid.uuid4()
     bucket = storage.bucket_for(visibility)
@@ -151,24 +159,33 @@ async def create_document(
         digest.update(data)
         # Store the original PDF; rasterization to per-page JPEGs runs in a background job
         # (a book of hundreds of pages would time out the HTTP upload). Pages are created by the job.
-        await storage.put_object(bucket, f"{prefix}original.pdf", data, "application/pdf")
         try:
-            page_count = len(PdfReader(io.BytesIO(data)).pages)
-        except Exception:
-            page_count = 0
+            reader = PdfReader(io.BytesIO(data))
+            if reader.is_encrypted:
+                raise ValueError("encrypted PDF")
+            page_count = len(reader.pages)
+            if not page_count:
+                raise ValueError("empty PDF")
+        except Exception as exc:
+            raise HTTPException(422, "PDF vacío, cifrado o no válido") from exc
+        await storage.put_object(bucket, f"{prefix}original.pdf", data, "application/pdf")
         doc_type = "pdf"  # pages_meta stays empty → filled by rasterize_document
     else:
         for i, (fname, ctype, data) in enumerate(files, start=1):
             digest.update(data)
-            ct = ctype or "application/octet-stream"
-            key = f"{prefix}pages/{i}{_ext_for(ct, fname)}"
-            await storage.put_object(bucket, key, data, ct)
-            width = height = None
             try:
                 with Image.open(io.BytesIO(data)) as im:
                     width, height = im.size
-            except Exception:
-                pass
+                    if getattr(im, "n_frames", 1) != 1:
+                        raise ValueError("multi-frame images require an explicit page import")
+                    ct = Image.MIME.get(im.format)
+                    if ct not in _EXT:
+                        raise ValueError("unsupported image")
+                    im.verify()
+            except Exception as exc:
+                raise HTTPException(422, "Imagen no válida o formato no admitido") from exc
+            key = f"{prefix}pages/{i}{_EXT[ct]}"
+            await storage.put_object(bucket, key, data, ct)
             pages_meta.append((i, key, ct, len(data), width, height))
         doc_type = "image_set"
         page_count = len(files)
@@ -216,9 +233,19 @@ async def create_document(
                 byte_size=size,
                 width=width,
                 height=height,
+                original_filename=files[page_no - 1][0],
+                checksum=hashlib.sha256(files[page_no - 1][2]).hexdigest(),
             )
         )
     await session.flush()
+
+    import json
+    manifest = {"schema_version": 1, "document_id": str(doc.id), "files": [
+        {"filename": name, "byte_size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+         "position": i} for i, (name, _ct, payload) in enumerate(files, 1)
+    ]}
+    await storage.put_object(bucket, f"{prefix}original-manifest.json",
+                             json.dumps(manifest, ensure_ascii=False).encode(), "application/json")
 
     # PDFs: enqueue background rasterization (pages get created by the worker). pending_job_id is a
     # transient attribute the router surfaces so the UI can stream progress.
@@ -229,11 +256,7 @@ async def create_document(
             params={"document_id": str(doc.id)}, created_by=created_by,
         )
         session.add(job)
-        await session.commit()  # durable before enqueue so the worker can't race ahead of the row
-        queue = await get_queue()
-        await queue.enqueue_job(
-            "rasterize_document", job_id=str(job.id), tenant_id=str(tenant_id), document_id=str(doc.id)
-        )
+        await schedule(session, job, "rasterize_document", document_id=str(doc.id))
         doc.pending_job_id = job.id  # transient attr surfaced to the router (not a persisted column)
     return doc
 
@@ -242,11 +265,12 @@ async def compact_pdf_job(
     session: AsyncSession, tenant_id: uuid.UUID, created_by: uuid.UUID, document_id: uuid.UUID
 ) -> Job:
     """Enqueue building a single PDF (a new derived document) from an image_set's pages."""
-    doc = await session.get(Document, document_id)
+    doc = await session.scalar(select(Document).where(Document.id == document_id,
+        Document.tenant_id == tenant_id).with_for_update())
     if not doc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
-    if doc.doc_type != "image_set":
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "only image documents can be compacted to PDF")
+    if doc.tenant_id != tenant_id:
+        raise HTTPException(404, "Documento no encontrado")
     from ..jobs.service import active_job_for
     existing = await active_job_for(session, tenant_id, "compact_pdf", document_id)
     if existing:
@@ -254,10 +278,7 @@ async def compact_pdf_job(
     job = Job(tenant_id=tenant_id, type="compact_pdf", status="queued",
               params={"document_id": str(document_id)}, created_by=created_by)
     session.add(job)
-    await session.commit()  # durable before enqueue
-    queue = await get_queue()
-    await queue.enqueue_job(
-        "compact_to_pdf", job_id=str(job.id), tenant_id=str(tenant_id), document_id=str(document_id))
+    await schedule(session, job, "compact_to_pdf", document_id=str(document_id))
     return job
 
 
@@ -314,14 +335,14 @@ async def set_raster_settings(session: AsyncSession, tenant_id: uuid.UUID, *, dp
     fmt = "webp" if fmt not in ("webp", "jpeg") else fmt
     await session.execute(update(Tenant).where(Tenant.id == tenant_id).values(
         raster_dpi=dpi, raster_format=fmt, raster_autosplit=bool(autosplit)))
-    await session.commit()
     return {"dpi": dpi, "format": fmt, "autosplit": bool(autosplit)}
 
 
 async def rerasterize_job(session: AsyncSession, tenant_id: uuid.UUID, created_by: uuid.UUID, document_id: uuid.UUID) -> Job:
     """Re-render an uploaded PDF at the current raster settings + reset its derived data (re-process)."""
-    doc = await session.get(Document, document_id)
-    if not doc:
+    doc = await session.scalar(select(Document).where(Document.id == document_id,
+        Document.tenant_id == tenant_id).with_for_update())
+    if not doc or doc.tenant_id != tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
     if doc.doc_type != "pdf":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "solo PDFs subidos pueden re-rasterizarse")
@@ -332,10 +353,7 @@ async def rerasterize_job(session: AsyncSession, tenant_id: uuid.UUID, created_b
     job = Job(tenant_id=tenant_id, type="rerasterize", status="queued",
               params={"document_id": str(document_id)}, created_by=created_by)
     session.add(job)
-    await session.commit()
-    queue = await get_queue()
-    await queue.enqueue_job("rerasterize_document", job_id=str(job.id), tenant_id=str(tenant_id),
-                            document_id=str(document_id))
+    await schedule(session, job, "rerasterize_document", document_id=str(document_id))
     return job
 
 
@@ -524,13 +542,7 @@ async def discard_images(
     doc = await get_document(session, doc_id)
     if doc.tenant_id != tenant_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "not your document")
-    await storage.delete_prefix(doc.storage_bucket, doc.storage_prefix)
-    pages = (await session.scalars(select(Page).where(Page.document_id == doc_id))).all()
-    for p in pages:
-        p.image_purged = True
-    doc.image_policy = "data_only"
-    await session.flush()
-    return doc
+    raise HTTPException(409, "El descarte irreversible está deshabilitado para proteger los originales. Exporta primero el paquete de preservación; la purga requiere un flujo de retención verificado.")
 
 
 async def set_visibility(
@@ -546,23 +558,44 @@ async def set_visibility(
     doc = await get_document(session, doc_id)
     if doc.tenant_id != tenant_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "not your document")
+    await session.scalar(select(Document.id).where(Document.id == doc_id).with_for_update())
+    await session.refresh(doc)
+    shared = await session.scalar(select(Document.id).where(
+        Document.storage_prefix == doc.storage_prefix, Document.id != doc.id).limit(1))
+    if shared:
+        raise HTTPException(409, "Este documento comparte archivos con otros libros; hay que separar sus originales antes de cambiar su publicación.")
     if visibility == "public":
-        if doc.source_kind == "familysearch":
+        if doc.source_kind.startswith("familysearch") or doc.source_origin == "familysearch":
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "FamilySearch-sourced documents cannot be published"
             )
+        if doc.may_contain_living:
+            raise HTTPException(409, "No se puede publicar un documento marcado con posibles personas vivas.")
         if not rights_declaration or rights_declaration not in RIGHTS:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "valid rights declaration required")
 
+    active = await session.scalar(select(Job.id).where(
+        Job.tenant_id == tenant_id, Job.status.in_(("running", "queued")),
+        Job.params["document_id"].astext == str(doc_id),
+    ).limit(1))
+    if active:
+        raise HTTPException(409, "Espera a que terminen las tareas de este documento antes de cambiar su publicación.")
     new_bucket = storage.bucket_for(visibility)
     if new_bucket != doc.storage_bucket:
-        await storage.move_prefix(doc.storage_bucket, new_bucket, doc.storage_prefix)
+        await storage.copy_prefix(doc.storage_bucket, new_bucket, doc.storage_prefix)
         doc.storage_bucket = new_bucket
 
     doc.visibility = visibility
     await session.execute(
         update(Page).where(Page.document_id == doc_id).values(visibility=visibility)
     )
+    from ...models.transcription import Transcription
+    from ...models.record import Record
+    from ...models.mention import PersonMention
+    await session.execute(update(Transcription).where(Transcription.document_id == doc_id).values(visibility=visibility))
+    await session.execute(update(Record).where(Record.document_id == doc_id).values(visibility=visibility))
+    await session.execute(update(PersonMention).where(PersonMention.record_id.in_(
+        select(Record.id).where(Record.document_id == doc_id))).values(visibility=visibility))
     if visibility == "public":
         doc.rights_declaration = rights_declaration
         doc.rights_declared_by = user_id
@@ -575,5 +608,4 @@ async def delete_document(session: AsyncSession, tenant_id: uuid.UUID, doc_id: u
     doc = await get_document(session, doc_id)
     if doc.tenant_id != tenant_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "not your document")
-    await storage.delete_prefix(doc.storage_bucket, doc.storage_prefix)
-    await session.delete(doc)
+    raise HTTPException(409, "El borrado irreversible está deshabilitado hasta disponer de papelera y recuperación verificadas. Los originales y las citas se conservan.")

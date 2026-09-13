@@ -14,6 +14,9 @@ from app.db.session import SessionLocal
 from app.modules.search import service as search_service
 from app.settings import settings
 from app.tasks.transcription_tasks import transcribe_document
+from app.models.embedding_index import EmbeddingGeneration, EmbeddingItem
+from app.models.job import Job
+from app.modules.search.indexes import capture_manifest
 
 from .test_transcription import _font
 
@@ -81,6 +84,16 @@ async def test_vector_search_orders_by_cosine(client: AsyncClient):
 
     rows = (await client.get(f"/api/transcription/documents/{doc_id}", headers=h)).json()
     by_page = {r["page_no"]: r["id"] for r in rows}
+    generation_id = uuid.uuid4()
+    async with SessionLocal() as session:
+        await set_rls_context(session, tenant_id=uuid.UUID(tenant_id))
+        generation = EmbeddingGeneration(id=generation_id, tenant_id=uuid.UUID(tenant_id), title="Synthetic cosine fixture",
+            purpose="full", status="building", is_active=False, include_public=False, version=1,
+            profile={"engine": "fixture", "model": "synthetic", "base_url": None}, space_key="a" * 64)
+        job = Job(id=uuid.uuid4(), tenant_id=uuid.UUID(tenant_id), type="reembed_corpus", status="running", params={})
+        session.add(generation); session.add(job); await session.flush()
+        await capture_manifest(session, generation, job, "transcription", uuid.UUID(doc_id))
+        await session.commit()
 
     # Inject orthogonal unit embeddings: page 1 -> e0, page 2 -> e1.
     def vec(i: int) -> str:
@@ -91,12 +104,12 @@ async def test_vector_search_orders_by_cosine(client: AsyncClient):
     admin = create_async_engine(settings.admin_database_url)
     async with admin.begin() as conn:
         await conn.execute(
-            text("UPDATE transcriptions SET embedding = (:v)::vector WHERE id = :id"),
-            {"v": vec(0), "id": by_page[1]},
+            text("UPDATE embedding_items SET embedding = (:v)::vector,status='ready' WHERE source_id = :id AND generation_id=:gid"),
+            {"v": vec(0), "id": by_page[1], "gid": generation_id},
         )
         await conn.execute(
-            text("UPDATE transcriptions SET embedding = (:v)::vector WHERE id = :id"),
-            {"v": vec(1), "id": by_page[2]},
+            text("UPDATE embedding_items SET embedding = (:v)::vector,status='ready' WHERE source_id = :id AND generation_id=:gid"),
+            {"v": vec(1), "id": by_page[2], "gid": generation_id},
         )
     await admin.dispose()
 
@@ -105,6 +118,6 @@ async def test_vector_search_orders_by_cosine(client: AsyncClient):
     qvec[0] = 1.0
     async with SessionLocal() as session:
         await set_rls_context(session, tenant_id=uuid.UUID(tenant_id))
-        hits = await search_service.vector_search(session, qvec, "all", uuid.UUID(tenant_id), 5)
+        hits = await search_service.vector_search(session, qvec, "all", uuid.UUID(tenant_id), 5, generation_id=generation_id)
     assert hits[0]["page_no"] == 1
     assert hits[0]["score"] > 0.99

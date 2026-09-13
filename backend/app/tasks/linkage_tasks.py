@@ -8,12 +8,15 @@ from datetime import datetime, timezone
 from sqlalchemy import update
 
 from ..core import events
+from ..core.task_execution import serialized_job
+from ..core.job_lifecycle import job_is_active, update_active_job
 from ..db.rls import commit_keep_rls, set_rls_context
 from ..db.session import SessionLocal
 from ..models.job import Job
 from ..modules.linkage import service as linkage_service
 
 
+@serialized_job
 async def generate_candidates(ctx, *, job_id, tenant_id, person_id, max_candidates=50):
     job_id = uuid.UUID(str(job_id))
     tenant_id = uuid.UUID(str(tenant_id))
@@ -24,16 +27,15 @@ async def generate_candidates(ctx, *, job_id, tenant_id, person_id, max_candidat
 
     async with SessionLocal() as session:
         await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(
-            update(Job).where(Job.id == job_id).values(
-                status="running", started_at=datetime.now(timezone.utc)
-            )
-        )
+        if not await update_active_job(session, job_id, status="running", started_at=datetime.now(timezone.utc)):
+            return
         await session.commit()
 
         await pub({"kind": "book_start"})
 
         async def on_progress(ev: dict) -> None:
+            if not await job_is_active(session, job_id):
+                raise RuntimeError("Investigación pausada o cancelada")
             # Map linkage phases to the generic done/total the UI reads — both via SSE (live stream)
             # and persisted on the Job row (so the Inicio "actividad reciente" polling shows it too).
             done, total = ev.get("done", 0), ev.get("total", 0)
@@ -56,22 +58,14 @@ async def generate_candidates(ctx, *, job_id, tenant_id, person_id, max_candidat
         except Exception as exc:
             await session.rollback()
             await set_rls_context(session, tenant_id=tenant_id)
-            await session.execute(
-                update(Job).where(Job.id == job_id).values(
-                    status="error", error=str(exc)[:1000], finished_at=datetime.now(timezone.utc)
-                )
-            )
+            await update_active_job(session, job_id, status="error", error=str(exc)[:1000], finished_at=datetime.now(timezone.utc))
             await session.commit()
             await pub({"kind": "book_fail", "error": str(exc)[:300]})
             return
 
         await set_rls_context(session, tenant_id=tenant_id)
-        await session.execute(
-            update(Job).where(Job.id == job_id).values(
-                status="completed", finished_at=datetime.now(timezone.utc),
-                result={"candidates": count},
-            )
-        )
+        await update_active_job(session, job_id, status="completed", finished_at=datetime.now(timezone.utc),
+                                result={"candidates": count, "requires_human_review": True})
         await session.commit()
         await pub({"kind": "all_done", "candidates": count})
 

@@ -1,0 +1,10 @@
+import { api } from "./client";
+import type { StorageCancellationPreview, StorageQuota, StorageWrite, StorageWriteAction } from "./types";
+export const getStorageQuota = () => api<StorageQuota>("/storage/quota");
+export const getStorageWrites = (offset = 0) => api<StorageWrite[]>(`/storage/quota/writes?offset=${offset}`);
+export const recountStorage = (body: { client_id: string; reason: string; authorize_write_pause: true; external_writers_stopped: true }) => api<StorageQuota>("/storage/quota/recount", { method: "POST", body: JSON.stringify(body) });
+export const controlStorageRecount = (action: "retry" | "cancel") => api<StorageQuota>(`/storage/quota/recount/${action}`, { method: "POST" });
+export const recheckStorageWrite = (id: string) => api<StorageWrite>(`/storage/quota/writes/${id}/recheck`, { method: "POST" });
+export const previewUnusedStorageCancellation = (id: string, reason: string) => api<StorageCancellationPreview>(`/storage/quota/writes/${id}/cancel-preview`, { method: "POST", body: JSON.stringify({ reason }) });
+export const cancelUnusedStorageReservation = (id: string, body: { reason: string; client_id: string; preview_hash: string; authorize: true; acknowledge_late_response_loss: boolean }) => api<StorageWriteAction>(`/storage/quota/writes/${id}/cancel-unused`, { method: "POST", body: JSON.stringify(body) });
+export const getStorageWriteActions = (offset = 0) => api<StorageWriteAction[]>(`/storage/quota/actions?offset=${offset}`);

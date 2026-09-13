@@ -1,4 +1,4 @@
-from __future__ import annotations
+import uuid
 
 from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel
@@ -9,7 +9,7 @@ from ...core.security import Principal
 from ...models.membership import MembershipRole
 from . import service
 from .reset import reset_tenant_data
-from .schemas import AddMemberRequest, CreateTenantRequest, MemberOut, TenantOut
+from .schemas import AddMemberRequest, CreateTenantRequest, MemberOut, TenantOut, UpdateMemberRequest
 
 router = APIRouter(prefix="/tenants", tags=["tenancy"])
 
@@ -58,3 +58,24 @@ async def add_member(
     db: AsyncSession = Depends(get_tenant_db),
 ) -> MemberOut:
     return await service.add_member(db, principal, body.email, body.role)
+
+
+@router.patch("/members/{user_id}", response_model=MemberOut,
+              dependencies=[Depends(require_roles(MembershipRole.admin.value))])
+async def update_member_role(
+    user_id: uuid.UUID,
+    body: UpdateMemberRequest,
+    principal: Principal = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> MemberOut:
+    return await service.update_member_role(db, principal, user_id, body.role)
+
+
+@router.delete("/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT,
+               dependencies=[Depends(require_roles(MembershipRole.admin.value))])
+async def remove_member(
+    user_id: uuid.UUID,
+    principal: Principal = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> None:
+    await service.remove_member(db, principal, user_id)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pydantic import BaseModel
@@ -20,6 +20,10 @@ from .schemas import (
 )
 
 router = APIRouter(prefix="/tree", tags=["tree"])
+from .exports import router as exports_router
+router.include_router(exports_router)
+from .imports import router as imports_router
+router.include_router(imports_router)
 
 _WRITE = (MembershipRole.tenant_admin.value, MembershipRole.researcher.value)
 
@@ -37,6 +41,7 @@ class PersonPatch(BaseModel):
     surname_prefix: str | None = None
     nickname: str | None = None
     notes: str | None = None
+    privacy_status: str | None = None
 
 
 class EventIn(BaseModel):
@@ -85,7 +90,8 @@ async def update_person(
                        entity_id=person_id, summary="Editó la identidad de una persona"):
         await editing.update_person(db, principal.tenant_id, person_id, sex=body.sex, given=body.given,
                                     surname=body.surname, surname_prefix=body.surname_prefix,
-                                    nickname=body.nickname, notes=body.notes)
+                                    nickname=body.nickname, notes=body.notes,
+                                    privacy_status=body.privacy_status)
     return await service.get_person_detail(db, person_id)
 
 
@@ -173,7 +179,9 @@ async def create_citation(
                        summary="Añadió una fuente"):
         cit = await citations.create_citation(
             db, principal.tenant_id, target_type=body.target_type, target_id=body.target_id,
-            document_id=body.document_id, page_no=body.page_no, note=body.note)
+            document_id=body.document_id, page_no=body.page_no, source_id=body.source_id,
+            assertion_id=body.assertion_id, locator=body.locator, quote=body.quote,
+            quality=body.quality, note=body.note)
     return {"id": str(cit.id)}
 
 
@@ -185,7 +193,10 @@ async def update_citation(
     async with audited(db, principal, action="citation_update", entity_type="citation",
                        entity_id=citation_id, summary="Editó una fuente"):
         cit = await citations.update_citation(db, citation_id, document_id=body.document_id,
-                                              page_no=body.page_no, note=body.note)
+                                              page_no=body.page_no, source_id=body.source_id,
+                                              clear_source=body.clear_source, assertion_id=body.assertion_id,
+                                              clear_assertion=body.clear_assertion, locator=body.locator,
+                                              quote=body.quote, quality=body.quality, note=body.note)
     return {"id": str(cit.id)}
 
 
@@ -523,10 +534,27 @@ async def subtree(
 
 @router.get("/export/gedcom")
 async def export_gedcom(
+    expected_sha256: str | None = Query(None, pattern=r"^[0-9a-f]{64}$"),
+    expected_review_token: str | None = Query(None, pattern=r"^[0-9a-f]{64}$"),
     principal: Principal = Depends(get_current_principal),
     db: AsyncSession = Depends(get_tenant_db),
 ) -> PlainTextResponse:
-    text = await exporter.export_gedcom(db, principal.tenant_id)
+    from fastapi import HTTPException
+    text, report = await exporter.build_export(db, principal.tenant_id)
+    if ((expected_sha256 is not None and expected_sha256 != report["sha256"]) or
+            (expected_review_token is not None and expected_review_token != report["review_token"])):
+        raise HTTPException(409, "El árbol, sus fuentes o el informe cambiaron después de la revisión. Revisa una nueva exportación.")
     return PlainTextResponse(
-        text, headers={"Content-Disposition": 'attachment; filename="gen_suite_export.ged"'}
+        text, headers={"Content-Disposition": 'attachment; filename="gen_suite_export.ged"',
+                       "Cache-Control": "private, no-store", "ETag": f'"{report["sha256"]}"'}
     )
+
+
+@router.get("/export/gedcom/audit")
+async def export_gedcom_audit(
+    principal: Principal = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_tenant_db),
+) -> JSONResponse:
+    _, report = await exporter.build_export(db, principal.tenant_id)
+    return JSONResponse(report, headers={"Cache-Control": "private, no-store",
+        "Content-Disposition": 'attachment; filename="gen_suite_gedcom_audit.json"'})

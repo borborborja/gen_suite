@@ -3,10 +3,10 @@ from __future__ import annotations
 import uuid
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ...core.queue import get_queue
+from ...core.dispatch import schedule
 from ...models.document import Document
 from ...models.job import Job
 from ...models.transcription import Transcription
@@ -31,7 +31,9 @@ def _build_override(body: TranscribeRequest) -> dict:
 async def create_job(
     session: AsyncSession, tenant_id: uuid.UUID, created_by: uuid.UUID, body: TranscribeRequest
 ) -> Job:
-    if not await session.get(Document, body.document_id):
+    if not await session.scalar(select(Document).where(
+        Document.id == body.document_id, Document.tenant_id == tenant_id,
+    ).with_for_update()):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
     from ..jobs.service import active_job_for
     existing = await active_job_for(session, tenant_id, "transcription", body.document_id)
@@ -50,13 +52,7 @@ async def create_job(
         created_by=created_by,
     )
     session.add(job)
-    await session.commit()  # durable before enqueue so the worker can't race ahead of the row
-
-    queue = await get_queue()
-    await queue.enqueue_job(
-        "transcribe_document",
-        job_id=str(job.id),
-        tenant_id=str(tenant_id),
+    await schedule(session, job, "transcribe_document",
         document_id=str(body.document_id),
         override=override,
         options=options,
@@ -73,39 +69,42 @@ async def correct_text(
     session: AsyncSession, transcription_id: uuid.UUID, text: str,
     *, tenant_id: uuid.UUID | None = None, created_by: uuid.UUID | None = None,
 ) -> Transcription:
-    """Human correction of an HTR transcription (eScriptorium-style loop). Marks it ``corrected``
-    so it can be exported as training ground truth and re-extracted. Keeps the original engine/model
-    for provenance — we're recording that a human verified/fixed this page.
-
-    Re-indexes the page: the FTS ``tsv`` column is generated from ``text`` so keyword search updates
-    automatically; the semantic ``embedding`` is now stale, so we NULL it and enqueue ``embed_document``
-    (which re-embeds only the NULL rows — i.e. just this corrected page)."""
+    """Create an immutable human revision; citations keep their original evidence."""
     t = await session.get(Transcription, transcription_id)
-    if not t:
+    if not t or (tenant_id is not None and t.tenant_id != tenant_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "transcription not found")
-    t.text = text
-    t.status = "corrected"
-    t.confidence = 1.0
-    t.embedding = None  # invalidate the now-stale vector; re-embed below recomputes it
+    await session.scalar(select(Document.id).where(Document.id == t.document_id).with_for_update())
+    await session.refresh(t)
+    if not t.is_active:
+        raise HTTPException(409, "La transcripción ha cambiado. Recarga la página antes de corregirla.")
+    if t.text == text and t.status == "corrected":
+        return t
+    t.is_active = False
     await session.flush()
+    revision = Transcription(
+        tenant_id=t.tenant_id, document_id=t.document_id, page_id=t.page_id,
+        page_no=t.page_no, visibility=t.visibility, engine="human", model=None,
+        text=text, status="corrected", confidence=None, is_active=True,
+        supersedes_id=t.id, reviewed_by=created_by,
+    )
+    session.add(revision)
+    await invalidate_evidence(session, t.id)
+    await session.flush()
+    return revision
 
-    # Re-embed just this page so semantic search reflects the correction (best-effort).
-    try:
-        job = Job(
-            tenant_id=tenant_id or t.tenant_id, type="embedding", status="queued",
-            params={"document_id": str(t.document_id)}, created_by=created_by,
-        )
-        session.add(job)
-        await session.commit()  # durable before enqueue
-        jid = job.id
-        queue = await get_queue()
-        await queue.enqueue_job(
-            "embed_document", job_id=str(jid), tenant_id=str(tenant_id or t.tenant_id),
-            document_id=str(t.document_id),
-        )
-    except Exception:  # re-embed is best-effort; the text + FTS index are already corrected
-        pass
-    return t
+
+async def invalidate_evidence(session, transcription_id):
+    """Invalidate derivations, never accepted tree facts or their citations."""
+    from ...models.record import Record
+    from ...models.match_candidate import MatchCandidate
+    records = select(Record.id).where(or_(
+        Record.transcription_id == transcription_id,
+        Record.transcription_end_id == transcription_id,
+    ))
+    await session.execute(update(MatchCandidate).where(
+        MatchCandidate.record_id.in_(records), MatchCandidate.status == "pending",
+    ).values(status="superseded"))
+    await session.execute(update(Record).where(Record.id.in_(records)).values(status="superseded"))
 
 
 async def list_for_document(
@@ -128,91 +127,69 @@ async def list_versions(
     active: dict[int, Transcription] = {}
     cand: dict[int, Transcription] = {}
     for t in rows:
-        (active if t.is_active else cand)[t.page_no] = t  # later row wins (newest)
+        if t.is_active:
+            active[t.page_no] = t
+        elif t.status == "ok":
+            cand[t.page_no] = t
     pages = sorted(set(active) | set(cand))
-    return [(p, active.get(p), cand.get(p)) for p in pages]
+    return [(p, active.get(p), cand.get(p) if p not in active or
+             (p in cand and cand[p].created_at > active[p].created_at) else None) for p in pages]
 
 
 async def reconcile_versions(
     session: AsyncSession, tenant_id: uuid.UUID, document_id: uuid.UUID, *,
     mode: str, criterion: str | None = None, keep_history: bool = False,
     choices: dict[str, str] | None = None, created_by: uuid.UUID | None = None,
+    expected_versions: dict | None = None,
 ) -> int:
-    """Collapse each page's candidate + old active into one active transcription per the chosen mode.
-    The candidate row becomes the new active (carrying the final text); the old active is archived
-    (kept inactive) when ``keep_history`` else deleted. Re-indexes (FTS auto + re-embed)."""
-    from .reconcile import book_frequency, llm_reconcile, merge_by_frequency
+    """Reconcile into new revisions. Legacy keep_history=false can never delete evidence."""
+    from .reconcile import book_frequency, merge_by_frequency
 
-    rows = list((await session.scalars(
-        select(Transcription).where(Transcription.document_id == document_id)
-        .order_by(Transcription.created_at)
-    )).all())
-    active = {t.page_no: t for t in rows if t.is_active}
-    cands: dict[int, list[Transcription]] = {}
-    for t in rows:
-        if not t.is_active:
-            cands.setdefault(t.page_no, []).append(t)
-    if not cands:
-        return 0
-
-    freq = None
-    if mode == "mix" and criterion == "frequency":
-        freq = book_frequency([t.text for t in active.values() if t.text])
-    rc = None
-    if mode == "mix" and criterion == "llm":
-        from ..providers.service import ProviderService
-        try:
-            rc = await ProviderService(session).resolve(tenant_id=tenant_id, task_type="inference")
-        except Exception:
-            rc = None
-
+    if mode not in {"substitute", "manual", "mix"}:
+        raise HTTPException(422, "Modo de reconciliación no válido")
+    if mode == "mix" and criterion != "frequency":
+        raise HTTPException(422, "La mezcla con IA requiere una ejecución presupuestada; utiliza revisión manual o frecuencia.")
+    doc = await session.scalar(select(Document).where(
+        Document.id == document_id, Document.tenant_id == tenant_id,
+    ).with_for_update())
+    if doc is None:
+        raise HTTPException(404, "Documento no encontrado")
+    pairs = await list_versions(session, document_id)
+    if expected_versions is not None:
+        actual = {str(page): {"active_id": str(a.id) if a else None, "candidate_id": str(c.id) if c else None}
+                  for page, a, c in pairs}
+        if any(actual.get(page) != expected for page, expected in expected_versions.items()):
+            raise HTTPException(409, "Las versiones han cambiado. Recarga y revisa las diferencias antes de aplicar.")
+        pairs = [pair for pair in pairs if str(pair[0]) in expected_versions]
+    freq = book_frequency([a.text for _, a, _ in pairs if a and a.text]) if mode == "mix" else None
     applied = 0
-    for page_no, cand_list in cands.items():
-        cand_list.sort(key=lambda t: t.created_at)
-        c = cand_list[-1]
-        for stale in cand_list[:-1]:
-            await session.delete(stale)
-        a = active.get(page_no)
-
-        if mode == "substitute":
-            final = c.text
-        elif mode == "manual":
-            ch = (choices or {}).get(str(page_no))
-            if ch is None:
-                continue  # page left undecided → keep candidate inactive
-            final = (a.text if a else c.text) if ch == "old" else (c.text if ch == "new" else ch)
-        else:  # mix
-            if rc is not None:
-                final = await llm_reconcile(rc, a.text if a else "", c.text or "")
-            elif freq is not None:
-                final = merge_by_frequency(a.text if a else "", c.text or "", freq)
-            else:
-                final = c.text  # graceful fallback
-
-        c.text = final
-        c.is_active = True
-        c.status = "ok"
-        c.embedding = None  # re-embed below
-        if a is not None:
-            if keep_history:
-                a.is_active = False
-                a.status = "archived"
-            else:
-                await session.delete(a)
+    for page_no, a, c in pairs:
+        if c is None:
+            continue
+        choice = (choices or {}).get(str(page_no))
+        if mode == "manual" and choice is None:
+            continue
+        if mode == "manual" and choice == "old":
+            c.status = "dismissed"
+            applied += 1
+            continue
+        final = c.text
+        if mode == "manual" and choice != "new":
+            final = choice
+        elif mode == "mix":
+            final = merge_by_frequency(a.text if a else "", c.text or "", freq)
+        if a:
+            a.is_active = False
+            await invalidate_evidence(session, a.id)
+        await session.flush()  # partial unique index: deactivate before inserting
+        session.add(Transcription(
+            tenant_id=tenant_id, document_id=document_id, page_id=c.page_id,
+            page_no=page_no, visibility=doc.visibility, text=final,
+            engine="human" if mode == "manual" else "reconcile", model=None,
+            confidence=None, status="corrected" if mode == "manual" else "ok",
+            is_active=True, supersedes_id=a.id if a else c.id, reviewed_by=created_by,
+            provenance={"candidate_id": str(c.id), "mode": mode, "criterion": criterion},
+        ))
         applied += 1
-
     await session.flush()
-
-    # re-index: FTS auto-updates (generated tsv); enqueue embed for the now-active corrected pages.
-    try:
-        job = Job(tenant_id=tenant_id, type="embedding", status="queued",
-                  params={"document_id": str(document_id)}, created_by=created_by)
-        session.add(job)
-        await session.commit()  # durable before enqueue
-        jid = job.id
-        queue = await get_queue()
-        await queue.enqueue_job(
-            "embed_document", job_id=str(jid), tenant_id=str(tenant_id), document_id=str(document_id))
-    except Exception:
-        pass
     return applied

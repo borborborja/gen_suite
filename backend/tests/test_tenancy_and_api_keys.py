@@ -74,3 +74,31 @@ async def test_api_key_auth_and_revocation(client: AsyncClient):
     assert rv.status_code == 204
     again = await client.get("/api/tree/stats", headers=kh)
     assert again.status_code == 401
+
+
+async def test_membership_demotion_takes_effect_for_existing_jwt_and_api_key(client: AsyncClient):
+    owner = _auth(await _tenant_token(client, "workspace-owner@example.com", "Casa permisos"))
+    registered = await client.post(
+        "/api/auth/register", json={"email": "editor@example.com", "password": "supersecret123"}
+    )
+    assert registered.status_code == 201
+    added = await client.post(
+        "/api/tenants/members", headers=owner, json={"email": "editor@example.com", "role": "editor"}
+    )
+    assert added.status_code == 201, added.text
+    editor_login = await client.post(
+        "/api/auth/login", json={"email": "editor@example.com", "password": "supersecret123"}
+    )
+    editor = _auth(editor_login.json()["access_token"])
+    key = await client.post("/api/api-keys", headers=editor, json={"name": "companion", "scope": "write"})
+    assert key.status_code == 201, key.text
+    key_headers = _auth(key.json()["token"])
+
+    demoted = await client.patch(
+        f"/api/tenants/members/{added.json()['user_id']}", headers=owner, json={"role": "viewer"}
+    )
+    assert demoted.status_code == 200, demoted.text
+    # Both the old JWT and an already-created write token now see the current viewer role.
+    for headers in (editor, key_headers):
+        blocked = await client.post("/api/tree/persons", headers=headers, json={"given": "No", "surname": "Permiso"})
+        assert blocked.status_code == 403, blocked.text

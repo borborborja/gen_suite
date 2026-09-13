@@ -17,7 +17,9 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 
 from ..core import events, storage
-from ..db.rls import set_rls_context
+from ..core.task_execution import serialized_job
+from ..core.job_lifecycle import job_is_active
+from ..db.rls import set_rls_context, commit_keep_rls
 from ..db.session import SessionLocal
 from ..models.document import Document, Page
 from ..models.job import Job
@@ -28,13 +30,16 @@ PAGE_TIMEOUT = 120
 
 
 def _to_jpeg(img_data: bytes) -> bytes:
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     with Image.open(io.BytesIO(img_data)) as im:
+        if im.format == "JPEG" and im.mode == "RGB" and im.getexif().get(274, 1) == 1:
+            return img_data
+        im = ImageOps.exif_transpose(im)
         if im.mode != "RGB":
             im = im.convert("RGB")
         buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=85)
+        im.save(buf, "JPEG", quality=95)
         return buf.getvalue()
 
 
@@ -53,7 +58,24 @@ def _tesseract_text(img_data: bytes, lang: str, psm: int) -> str:
 _NO_USAGE = {"prompt": 0, "completion": 0}
 
 
-def transcribe_image(
+async def transcribe_image(
+    img_data: bytes, rc: ResolvedCredential, *, prompt: str | None, lang: str, psm: int
+) -> tuple[str, dict]:
+    import hashlib
+    from ..modules.providers.admission import execute
+    from ..modules.transcription.ocr_engines import DEFAULT_VISION_PROMPT
+    from ..modules.providers.admission import LOCAL_ENGINES, policy_for
+    if rc.engine not in LOCAL_ENGINES:
+        if not policy_for(rc, fresh=False).max_output_tokens:
+            raise ValueError("La transcripción necesita un perfil con salida máxima positiva.")
+        # Decode/orient before reserving money; a corrupt original cannot have reached AI.
+        img_data = await asyncio.to_thread(_to_jpeg, img_data)
+    return await execute(rc, kind="vision", request={"image_sha256": hashlib.sha256(img_data).hexdigest(),
+        "prompt": prompt or DEFAULT_VISION_PROMPT, "lang": lang, "psm": psm, "preprocessing": "jpeg-exif-v1"},
+        transport=lambda: _transcribe_image_transport(img_data, rc, prompt=prompt, lang=lang, psm=psm))
+
+
+def _transcribe_image_transport(
     img_data: bytes, rc: ResolvedCredential, *, prompt: str | None, lang: str, psm: int
 ) -> tuple[str, dict]:
     """Blocking OCR for one image — runs in a thread. Uses the in-app vision OCR engines.
@@ -70,18 +92,25 @@ def transcribe_image(
         return htr_via_kraken(jpeg, model=rc.model, base_url=rc.base_url), dict(_NO_USAGE)
     effective_prompt = prompt or DEFAULT_VISION_PROMPT
     if rc.engine == "claude":
-        return _ocr_via_anthropic(jpeg, model=rc.model, api_key=rc.api_key, prompt=effective_prompt)
+        from ..modules.providers.admission import policy_for
+        return _ocr_via_anthropic(jpeg, model=rc.model, api_key=rc.api_key, prompt=effective_prompt,
+                                  base_url=rc.base_url, max_output_tokens=policy_for(rc, fresh=False).max_output_tokens)
+    from ..modules.providers.admission import output_options
     return _ocr_via_openai_compat(
-        jpeg, model=rc.model, api_key=rc.api_key, base_url=rc.base_url, prompt=effective_prompt
+        jpeg, model=rc.model, api_key=rc.api_key, base_url=rc.base_url, prompt=effective_prompt,
+        engine=rc.engine, output_options=output_options(rc),
     )
 
 
-async def _set_job(session, tenant_id: uuid.UUID, job_id: uuid.UUID, **values) -> None:
+async def _set_job(session, tenant_id: uuid.UUID, job_id: uuid.UUID, **values) -> bool:
     await set_rls_context(session, tenant_id=tenant_id)
-    await session.execute(update(Job).where(Job.id == job_id).values(**values))
-    await session.commit()
+    changed = await session.execute(update(Job).where(Job.id == job_id,
+        Job.status.in_(("queued", "running"))).values(**values))
+    await commit_keep_rls(session, tenant_id=tenant_id)
+    return bool(changed.rowcount)
 
 
+@serialized_job
 async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=None, options=None):
     job_id = uuid.UUID(str(job_id))
     tenant_id = uuid.UUID(str(tenant_id))
@@ -96,17 +125,18 @@ async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=N
         await events.publish(tenant_id, job_id, event)
 
     async with SessionLocal() as session:
-        await _set_job(
+        if not await _set_job(
             session, tenant_id, job_id, status="running", started_at=datetime.now(timezone.utc)
-        )
+        ):
+            return
 
         await set_rls_context(session, tenant_id=tenant_id)
         try:
             rc = await ProviderService(session).resolve(
-                tenant_id=tenant_id, task_type="transcription", override=override or None
+                tenant_id=tenant_id, task_type="transcription", override=override or None, job_id=job_id,
             )
             doc = await session.get(Document, document_id)
-            if not doc:
+            if not doc or doc.tenant_id != tenant_id:
                 raise RuntimeError("document not found")
             bucket, visibility = doc.storage_bucket, doc.visibility
             pages = (
@@ -133,11 +163,16 @@ async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=N
                     select(Transcription.page_no).where(
                         Transcription.document_id == document_id,
                         Transcription.is_active.is_(True),
-                        Transcription.status == "ok",
+                        Transcription.status.in_(("ok", "corrected")),
                     )
                 )).all())
                 page_meta = [pm for pm in page_meta if pm[1] not in done_pages]
-            await session.commit()
+            # Redelivery of a re-recognition must not pay for candidates already stored by this job.
+            attempted = set((await session.scalars(select(Transcription.page_no).where(
+                Transcription.job_id == job_id, Transcription.status.in_(("ok", "corrected")),
+            ))).all())
+            page_meta = [pm for pm in page_meta if pm[1] not in attempted]
+            await commit_keep_rls(session, tenant_id=tenant_id)
         except Exception as exc:
             await session.rollback()
             await _set_job(
@@ -156,12 +191,12 @@ async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=N
 
         async def _transcribe(key: str) -> tuple[str, dict]:
             img_data, _ = await storage.get_object(bucket, key)
-            return await asyncio.to_thread(transcribe_image, img_data, rc, prompt=prompt, lang=lang, psm=psm)
+            return await transcribe_image(img_data, rc, prompt=prompt, lang=lang, psm=psm)
 
         for start in range(0, total, CONCURRENCY):
             chunk = page_meta[start : start + CONCURRENCY]
             await set_rls_context(session, tenant_id=tenant_id)
-            if await session.scalar(select(Job.status).where(Job.id == job_id)) == "cancelled":
+            if not await job_is_active(session, job_id):
                 await pub({"kind": "log", "message": "cancelled by user"})
                 return
 
@@ -169,6 +204,8 @@ async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=N
             results = await asyncio.gather(*[_transcribe(key) for (_pid, _pno, key) in chunk], return_exceptions=True)
 
             await set_rls_context(session, tenant_id=tenant_id)
+            # A concurrent correction uses this same lock. Recheck the active revision below.
+            await session.scalar(select(Document.id).where(Document.id == document_id).with_for_update())
             for (page_id, page_no, _key), res in zip(chunk, results):
                 ok = not isinstance(res, Exception)
                 if ok:
@@ -179,6 +216,12 @@ async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=N
                 else:
                     errors += 1
                 new_active = not (replace and page_no in active_pages)
+                active = await session.scalar(select(Transcription).where(
+                    Transcription.document_id == document_id, Transcription.page_no == page_no,
+                    Transcription.is_active.is_(True),
+                ))
+                if active and active.status in ("ok", "corrected"):
+                    new_active = False
                 # When a successful new row becomes the active one (plain transcribe or first-pass of a
                 # re-recognition), supersede any prior active row for this page so there's exactly one
                 # active transcription per page. Only on success — a transient failure must never wipe
@@ -198,6 +241,7 @@ async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=N
                     page_no=page_no, visibility=visibility, engine=rc.engine, model=rc.model,
                     text=res if ok else None, status="ok" if ok else "error", job_id=job_id,
                     is_active=new_active and ok,
+                    provenance={"ai_call_id": usage["ai_call_id"]} if ok and usage.get("ai_call_id") else None,
                 ))
                 await pub(
                     {"kind": "page_ok", "page_no": page_no, "done": done, "total": total} if ok
@@ -206,20 +250,21 @@ async def transcribe_document(ctx, *, job_id, tenant_id, document_id, override=N
             await session.execute(
                 update(Job).where(Job.id == job_id).values(progress={"done": done, "total": total, "errors": errors})
             )
-            await session.commit()
+            await commit_keep_rls(session, tenant_id=tenant_id)
 
-        await _set_job(
-            session, tenant_id, job_id, status="completed",
+        await set_rls_context(session, tenant_id=tenant_id)
+        if not await job_is_active(session, job_id):
+            await pub({"kind": "cancelled", "done": done, "total": total})
+            return
+        final_status = "error" if errors and not done else "partial" if errors else "completed"
+        finished = await _set_job(
+            session, tenant_id, job_id, status=final_status,
             finished_at=datetime.now(timezone.utc),
             result={"done": done, "total": total, "errors": errors, "tokens": tokens},
+            error=f"{errors} páginas no se han podido transcribir" if errors else None,
         )
-
-        # Log AI spend for the spending control (best-effort; local engines report 0 tokens).
-        from ..modules.providers.service import record_usage
-        await set_rls_context(session, tenant_id=tenant_id)
-        await record_usage(session, tenant_id=tenant_id, job_id=job_id, task_type="transcription",
-                           model=rc.model, prompt_tokens=tokens["prompt"],
-                           completion_tokens=tokens["completion"])
-        await session.commit()
-
-        await pub({"kind": "all_done", "done": done, "total": total, "errors": errors})
+        if not finished:
+            await pub({"kind": "cancelled"})
+            return
+        await pub({"kind": "book_fail" if errors else "all_done", "status": final_status,
+                   "done": done, "total": total, "errors": errors})

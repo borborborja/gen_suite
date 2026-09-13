@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_, select, text as sa_text
+from sqlalchemy import or_, select, exists, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...models.citation import Citation
@@ -20,9 +20,10 @@ from ...models.mention import PersonMention
 from ...models.person import Name, Person
 from ...models.place import Place
 from ...models.record import Record
+from ...models.transcription import Transcription
 from ..extraction.normalize import block_key_surname, norm_given, norm_surname, parse_age, split_name
 from ..providers.service import (
-    ProviderService, embed_texts, extract_structured_with_usage, record_usage)
+    ProviderService, embed_texts_with_usage, extract_structured_with_usage)
 from ..tree.service import get_person_detail
 from .scoring import Candidate, ENQUEUE_FLOOR, Seed, score_candidate
 
@@ -42,6 +43,16 @@ _ADJ_SYSTEM = (
 )
 
 
+async def _in_research_run(session, tenant_id):
+    from ...core.execution_context import current_job
+    from ...models.job import Job
+    context = current_job.get()
+    if not context or context[0] != tenant_id:
+        return False
+    params = await session.scalar(select(Job.params).where(Job.id == context[1], Job.tenant_id == tenant_id))
+    return bool((params or {}).get("research_run_id"))
+
+
 async def _adjudicate_band(session, tenant_id, seed: Seed, scored: list, max_llm: int = 5,
                            on_progress=None) -> None:
     """For the top candidates in the ambiguous band (scoring.LLM_BAND), ask an LLM to adjudicate.
@@ -54,6 +65,8 @@ async def _adjudicate_band(session, tenant_id, seed: Seed, scored: list, max_llm
     try:
         rc = await ProviderService(session).resolve(tenant_id=tenant_id, task_type="inference")
     except Exception:
+        if await _in_research_run(session, tenant_id):
+            raise  # Managed jobs must expose a failed stage, not silently omit its AI review.
         return  # no LLM configured → keep heuristic scores
     seed_desc = (
         f"Árbol: {seed.given or ''} {seed.surname or ''}, nacimiento ~{seed.birth_year or '?'}, "
@@ -70,27 +83,25 @@ async def _adjudicate_band(session, tenant_id, seed: Seed, scored: list, max_llm
             "¿Son la misma persona?"
         )
         try:
-            out, usage = await asyncio.to_thread(
-                extract_structured_with_usage, rc, prompt,
+            out, usage = await extract_structured_with_usage(
+                rc, prompt,
                 schema=_ADJ_SCHEMA, system=_ADJ_SYSTEM, schema_name="adjudication",
             )
             tokens["prompt"] += usage.get("prompt", 0)
             tokens["completion"] += usage.get("completion", 0)
         except Exception:
+            if rc.research_run_id:
+                raise
             continue
         match = bool(out.get("match"))
         conf = float(out.get("confidence") or 0.0)
-        result["llm"] = {"match": match, "confidence": conf, "reasoning": out.get("reasoning", "")}
+        result["llm"] = {"match": match, "confidence": conf, "reasoning": out.get("reasoning", ""),
+                         "ai_call_id": usage.get("ai_call_id")}
         mc.method = "llm_adjudicated"
         # nudge the heuristic score toward the LLM verdict (kept transparent in evidence)
         mc.score = round(min(1.0, mc.score + 0.2 * conf) if match else max(0.0, mc.score - 0.2 * conf), 4)
         result["score"] = mc.score
         mc.evidence = result
-    # Log the adjudication spend (best-effort; no job_id here — the caller's job context varies).
-    if tokens["prompt"] or tokens["completion"]:
-        await record_usage(session, tenant_id=tenant_id, job_id=None, task_type="linkage",
-                           model=rc.model, prompt_tokens=tokens["prompt"],
-                           completion_tokens=tokens["completion"])
 
 # Which inferred Event a confirmed record implies for the principal (None = no person event).
 RECORD_EVENT_TYPE = {
@@ -182,7 +193,11 @@ async def generate_candidates(
         (
             await session.scalars(
                 select(PersonMention)
-                .where(PersonMention.tenant_id == tenant_id, or_(*conds))
+                .join(Record, Record.id == PersonMention.record_id)
+                .where(PersonMention.tenant_id == tenant_id, or_(*conds),
+                    Record.status.in_(("extracted", "needs_review", "reviewed")),
+                    or_(Record.transcription_id.is_(None), exists(select(Transcription.id).where(Transcription.id == Record.transcription_id, Transcription.is_active.is_(True)))),
+                    or_(Record.transcription_end_id.is_(None), exists(select(Transcription.id).where(Transcription.id == Record.transcription_end_id, Transcription.is_active.is_(True)))))
                 .limit(max(max_candidates * 6, 60))
             )
         ).all()
@@ -190,7 +205,8 @@ async def generate_candidates(
 
     # hybrid recall: union the phonetic/trigram blocking with semantic vector retrieval over
     # embedded mentions (plan §4). Graceful: no embedding provider or no embeddings → blocking only.
-    vec_ids = await _vector_retrieve(session, tenant_id, seed, limit=max(max_candidates * 4, 40))
+    vector_evidence = await _vector_retrieve(session, tenant_id, seed, limit=max(max_candidates * 4, 40))
+    vec_ids = list(vector_evidence)
     if vec_ids:
         have = {m.id for m in mentions}
         extra = (
@@ -211,8 +227,8 @@ async def generate_candidates(
         r.id: r for r in (await session.scalars(select(Record).where(Record.id.in_(record_ids)))).all()
     }
     # never propose a mention from a superseded act (replaced after correction + re-extract)
-    mentions = [m for m in mentions if records.get(m.record_id) is None or records[m.record_id].status != "superseded"]
-    records = {rid: r for rid, r in records.items() if r.status != "superseded"}
+    records = {rid: r for rid, r in records.items() if r.status in ("extracted", "needs_review", "reviewed")}
+    mentions = [m for m in mentions if m.record_id in records]
     if not mentions:
         return 0
     place_keys = await _place_keys(session, {r.place_id for r in records.values() if r.place_id})
@@ -247,6 +263,10 @@ async def generate_candidates(
             co_mention_names={o for o in others if o},
         )
         result = score_candidate(seed, cand)
+        result["retrieval"] = vector_evidence.get(m.id, {"method": "name_blocking"})
+        result["source"] = {"record_id": str(rec.id), "page_id": str(rec.page_id) if rec.page_id else None,
+            "transcription_id": str(rec.transcription_id) if rec.transcription_id else None,
+            "transcription_end_id": str(rec.transcription_end_id) if rec.transcription_end_id else None}
         if result["score"] < ENQUEUE_FLOOR:
             continue
         mc = MatchCandidate(
@@ -504,38 +524,33 @@ async def _confirm_sibling(
     return mc
 
 
-async def _vector_retrieve(
-    session: AsyncSession, tenant_id: uuid.UUID, seed: Seed, limit: int
-) -> list[uuid.UUID]:
-    """Semantic recall over embedded person_mentions (cosine), cloning search/service.vector_search.
-    Graceful no-op when no embedding provider is configured or no mentions are embedded yet."""
-    # cheap pre-check: are there any embedded mentions at all?
-    any_emb = await session.scalar(
-        select(PersonMention.id).where(
-            PersonMention.tenant_id == tenant_id, PersonMention.embedding.is_not(None)
-        ).limit(1)
-    )
-    if not any_emb:
-        return []
+async def _vector_retrieve(session: AsyncSession, tenant_id: uuid.UUID, seed: Seed, limit: int) -> dict:
+    """Retrieve only compatible, current evidence; retain the complete vector/query trace."""
+    from ..search import indexes
     seed_text = " ".join(filter(None, [seed.given, seed.surname, seed.place_key])).strip()
-    if not seed_text:
-        return []
+    if not seed_text: return {}
     try:
-        rc = await ProviderService(session).resolve(tenant_id=tenant_id, task_type="embedding")
-        qvec = (await asyncio.to_thread(embed_texts, rc, [seed_text]))[0]
+        generation, rc = await indexes.query_context(session, tenant_id)
+        has_mentions = await session.scalar(sa_text(f"SELECT EXISTS (SELECT 1 FROM {indexes.FROM_SQL['mention']} JOIN embedding_items e ON {indexes.ITEM_JOIN['mention']} WHERE e.generation_id=:gid AND e.kind='mention' AND e.status='ready' AND m.tenant_id=:tid AND {indexes.LIVE_SQL['mention']} AND {indexes.FRESH_SQL['mention']})"),
+            {"gid": generation.id, "tid": tenant_id})
+        if not has_mentions: return {}
+        vectors, usage = await embed_texts_with_usage(rc, [seed_text])
+        indexes.validate_vectors(vectors, 1)
     except Exception:
-        return []
-    qv = "[" + ",".join(repr(float(x)) for x in qvec) + "]"
-    sql = sa_text(
-        """
-        SELECT id FROM person_mentions
-        WHERE tenant_id = :tid AND embedding IS NOT NULL
-        ORDER BY embedding <=> (:qv)::vector
-        LIMIT :limit
-        """
-    )
-    rows = (await session.execute(sql, {"tid": tenant_id, "qv": qv, "limit": limit})).all()
-    return [r.id for r in rows]
+        if await _in_research_run(session, tenant_id): raise
+        return {}  # Standalone heuristic discovery remains usable without semantic configuration.
+    qv = "[" + ",".join(repr(float(x)) for x in vectors[0]) + "]"
+    rows = (await session.execute(sa_text(f"""
+        SELECT m.id,e.id AS item_id,e.ai_call_id,e.source_hash
+        FROM {indexes.FROM_SQL['mention']}
+        JOIN embedding_items e ON {indexes.ITEM_JOIN['mention']}
+        WHERE e.generation_id=:gid AND e.kind='mention' AND e.status='ready'
+          AND m.tenant_id=:tid AND {indexes.LIVE_SQL['mention']} AND {indexes.FRESH_SQL['mention']}
+        ORDER BY e.embedding <=> (:qv)::vector LIMIT :limit
+    """), {"gid": generation.id, "tid": tenant_id, "qv": qv, "limit": limit})).all()
+    return {row.id: {"method": "semantic+name_blocking", "index_generation_id": str(generation.id),
+        "embedding_item_id": str(row.item_id), "embedding_ai_call_id": str(row.ai_call_id) if row.ai_call_id else None,
+        "query_ai_call_id": usage.get("ai_call_id"), "source_hash": row.source_hash} for row in rows}
 
 
 async def _place_keys(session: AsyncSession, place_ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
@@ -687,7 +702,7 @@ async def _spouse_family(session: AsyncSession, tenant_id: uuid.UUID, person_id:
 
 async def accept_proposal(
     session: AsyncSession, tenant_id: uuid.UUID, candidate_id: uuid.UUID,
-    mention_id: uuid.UUID, user_id: uuid.UUID,
+    mention_id: uuid.UUID, user_id: uuid.UUID, *, existing_person_id: uuid.UUID | None = None,
 ) -> Person:
     """Write a co-mentioned relative into the tree as an INFERRED person (Person + primary Name with
     is_inferred=True) linked to the confirmed principal, with a Citation back to the source. The
@@ -708,10 +723,12 @@ async def accept_proposal(
     surname = mention.surname or split_name(mention.name_raw)[1] or None
     sex = implied_sex or (mention.sex if mention.sex in ("M", "F") else "U")
 
-    # dedup: if this relative already exists in the tree, corroborate it instead of duplicating
-    existing_id = await _find_existing_person(session, tenant_id, given, surname)
-    if existing_id:
-        person = await session.get(Person, existing_id)
+    # Never merge people from a name alone.  A reviewer may explicitly choose an existing
+    # person; otherwise this decision deliberately creates a new inferred person.
+    if existing_person_id:
+        person = await session.get(Person, existing_person_id)
+        if not person:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "persona elegida no encontrada")
     else:
         person = Person(tenant_id=tenant_id, sex=sex)
         session.add(person)
@@ -753,11 +770,9 @@ async def accept_proposal(
 
     mention.resolved_person_id = person.id
     mention.match_status = "confirmed"
-    note = (
-        f"Corroborado por el acta como «{mention.role}» de la persona confirmada"
-        if existing_id else
-        f"Inferido del acta como «{mention.role}» de la persona confirmada"
-    )
+    note = (f"Corroborado por el acta como «{mention.role}» de la persona confirmada"
+            if existing_person_id else
+            f"Inferido del acta como «{mention.role}» de la persona confirmada")
     session.add(Citation(
         tenant_id=tenant_id, target_type="person", target_id=person.id,
         record_id=mc.record_id, person_mention_id=mention.id, match_candidate_id=mc.id,
@@ -766,6 +781,118 @@ async def accept_proposal(
     ))
     await session.flush()
     return person
+
+
+async def preview_candidate(session: AsyncSession, candidate_id: uuid.UUID) -> dict:
+    """Describe every tree write a reviewer can choose, without mutating the tree."""
+    mc = await session.get(MatchCandidate, candidate_id)
+    if not mc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "candidate not found")
+    if mc.status != "pending":
+        raise HTTPException(status.HTTP_409_CONFLICT, "esta propuesta ya fue revisada")
+    mention = await session.get(PersonMention, mc.person_mention_id)
+    display_name = (mention.name_raw if mention else None) or " ".join(
+        x for x in ((mention.given if mention else None), (mention.surname if mention else None)) if x
+    ) or "Persona sin nombre"
+    relation = getattr(mc, "relation", "self")
+    actions: list[dict] = [{
+        "kind": "confirm_identity" if relation == "self" else "create_sibling",
+        "mention_id": str(mc.person_mention_id),
+        "name": display_name,
+        "relation": relation,
+        "required": True,
+    }]
+    for proposal in await list_proposals(session, candidate_id):
+        suggested, _ = ROLE_RELATION.get(proposal.role, ("other", None))
+        actions.append({
+            "kind": "relative", "mention_id": str(proposal.id),
+            "name": proposal.name_raw or " ".join(x for x in (proposal.given, proposal.surname) if x) or "Persona sin nombre",
+            "relation": suggested, "role": proposal.role, "required": False,
+        })
+    return {
+        "candidate_id": str(mc.id), "status": mc.status, "relation": relation,
+        "tree_person_id": str(mc.tree_person_id), "actions": actions,
+        "updated_at": mc.updated_at.isoformat(),
+    }
+
+
+async def _apply_sibling_candidate(
+    session: AsyncSession, mc: MatchCandidate, user_id: uuid.UUID, existing_person_id: uuid.UUID | None,
+) -> Person:
+    mention = await session.get(PersonMention, mc.person_mention_id)
+    if existing_person_id:
+        sibling = await session.get(Person, existing_person_id)
+        if not sibling:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "persona elegida no encontrada")
+    else:
+        given = (mention.given if mention else None) or (split_name(mention.name_raw)[0] if mention else None) or None
+        surname = (mention.surname if mention else None) or (split_name(mention.name_raw)[1] if mention else None) or None
+        sex = mention.sex if mention and mention.sex in ("M", "F") else "U"
+        sibling = Person(tenant_id=mc.tenant_id, sex=sex)
+        session.add(sibling)
+        await session.flush()
+        session.add(Name(tenant_id=mc.tenant_id, person_id=sibling.id, type="birth", given=given,
+                         surname=surname, is_primary=True, is_inferred=True))
+
+    family = await _parent_family(session, mc.tenant_id, mc.tree_person_id)
+    await _add_child(session, mc.tenant_id, family.id, sibling.id)
+    if mention:
+        mention.resolved_person_id = sibling.id
+        mention.match_status = "confirmed"
+    mc.status, mc.decided_by, mc.decided_at = "confirmed", user_id, datetime.now(timezone.utc)
+    record = await session.get(Record, mc.record_id) if mc.record_id else None
+    page_id = record.page_id if record else None
+    if record and RECORD_EVENT_TYPE.get(record.record_type):
+        event = Event(tenant_id=mc.tenant_id, type=RECORD_EVENT_TYPE[record.record_type],
+                      date_raw=record.date_raw, date_year=record.date_year, place_id=record.place_id,
+                      is_inferred=True, subject_person_id=sibling.id)
+        session.add(event)
+        await session.flush()
+        session.add(Citation(tenant_id=mc.tenant_id, target_type="event", target_id=event.id,
+                             record_id=mc.record_id, person_mention_id=mc.person_mention_id,
+                             match_candidate_id=mc.id, page_id=page_id))
+    session.add(Citation(tenant_id=mc.tenant_id, target_type="person", target_id=sibling.id,
+                         record_id=mc.record_id, person_mention_id=mc.person_mention_id,
+                         match_candidate_id=mc.id, page_id=page_id,
+                         note="Hermano/a confirmado por revisión humana"))
+    await session.flush()
+    return sibling
+
+
+async def apply_reviewed_candidate(
+    session: AsyncSession, tenant_id: uuid.UUID, candidate_id: uuid.UUID, user_id: uuid.UUID,
+    *, relative_mention_ids: list[uuid.UUID], existing_person_ids: dict[uuid.UUID, uuid.UUID],
+    candidate_person_id: uuid.UUID | None = None,
+) -> tuple[MatchCandidate, list[Person]]:
+    """Apply one explicitly reviewed identity decision and selected relatives atomically."""
+    mc = await session.get(MatchCandidate, candidate_id)
+    if not mc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "candidate not found")
+    if mc.status != "pending":
+        raise HTTPException(status.HTTP_409_CONFLICT, "esta propuesta ya fue revisada")
+    if getattr(mc, "relation", "self") == "sibling":
+        primary = await _apply_sibling_candidate(session, mc, user_id, candidate_person_id)
+    else:
+        if candidate_person_id:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                "solo una propuesta de hermano puede vincular otra persona")
+        primary_mc = await confirm_candidate(session, candidate_id, user_id)
+        mc = primary_mc
+        primary = await session.get(Person, mc.tree_person_id)
+
+    valid = {m.id for m in await list_proposals(session, candidate_id)}
+    requested = list(dict.fromkeys(relative_mention_ids))
+    if any(mid not in valid for mid in requested):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            "uno de los familiares ya no pertenece a esta propuesta")
+    people = [primary] if primary else []
+    for mention_id in requested:
+        people.append(await accept_proposal(
+            session, tenant_id, candidate_id, mention_id, user_id,
+            existing_person_id=existing_person_ids.get(mention_id),
+        ))
+    await session.flush()
+    return mc, people
 
 
 async def reject_candidate(

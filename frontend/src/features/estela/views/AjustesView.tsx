@@ -1,17 +1,24 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { useEstela } from "../store";
 import { fonts } from "../theme";
 import { api } from "../../../api/client";
 import { getRasterSettings, setRasterSettings, type RasterSettings } from "../../../api/documents";
 import {
   getCatalog, listBindings, listCredentials, createCredential, deleteCredential,
-  upsertBinding, reembedCorpus, getJob, getSpend, setBudget,
+  upsertBinding, getSpend, setBudget,
   type CatalogEntry, type Credential, type Binding,
 } from "../../../api/providers";
-import { getMe, updateMe, changePassword, type MeOut } from "../../../api/account";
+import { beginMfa, changePassword, confirmMfa, disableMfa, getMe, updateMe, type MeOut } from "../../../api/account";
 import { setTokens } from "../../../api/client";
 import { listApiKeys, createApiKey, revokeApiKey, type ApiKey } from "../../../api/apiKeys";
+import { addWorkspaceMember, listWorkspaceMembers, removeWorkspaceMember, updateWorkspaceMember, type WorkspaceMember } from "../../../api/tenancy";
 import { useConfirm } from "../ui";
+
+const IndexGenerationsPanel = lazy(() => import("./IndexGenerationsPanel"));
+const StorageInventoryPanel = lazy(() => import("./StorageInventoryPanel"));
+const StorageQuotaPanel = lazy(() => import("./StorageQuotaPanel"));
+const AiPolicyEditor = lazy(() => import("./AiBudgetControls").then((m) => ({ default: m.AiPolicyEditor })));
+const AiCallsPanel = lazy(() => import("./AiBudgetControls").then((m) => ({ default: m.AiCallsPanel })));
 
 const TASK_LABEL: Record<string, string> = {
   transcription: "Lectura del manuscrito (HTR / visión)",
@@ -25,7 +32,6 @@ export default function AjustesView() {
   const [creds, setCreds] = useState<Credential[]>([]);
   const [bindings, setBindings] = useState<Binding[]>([]);
   const [loaded, setLoaded] = useState(false);
-  const [reembed, setReembed] = useState<{ status: string; detail: string } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -52,26 +58,6 @@ export default function AjustesView() {
     await load();
   }
 
-  async function doReembed() {
-    setReembed({ status: "running", detail: "Encolando…" });
-    try {
-      const job = await reembedCorpus();
-      for (let i = 0; i < 60; i++) {
-        await new Promise((r) => setTimeout(r, 1500));
-        const j = await getJob(job.id);
-        const p = j.progress as { done?: number; total?: number } | null;
-        setReembed({ status: j.status, detail: p ? `${p.done ?? 0}/${p.total ?? "?"}` : j.status });
-        if (j.status === "completed") {
-          const r = j.result as { mentions?: number; transcriptions?: number; model?: string } | null;
-          setReembed({ status: "completed", detail: `Listo · ${r?.mentions ?? 0} menciones + ${r?.transcriptions ?? 0} transcripciones con ${r?.model ?? ""}` });
-          return;
-        }
-        if (j.status === "error") { setReembed({ status: "error", detail: j.error || "error" }); return; }
-      }
-    } catch (err) {
-      setReembed({ status: "error", detail: (err as Error).message });
-    }
-  }
 
   return (
     <section style={{ padding: "32px 44px 64px", maxWidth: 860 }}>
@@ -80,7 +66,14 @@ export default function AjustesView() {
 
       <AccountSection />
 
+      <TeamSection />
+
+      <Suspense fallback={<p>Cargando almacenamiento…</p>}><StorageInventoryPanel /></Suspense>
+      <Suspense fallback={<p>Cargando cuota…</p>}><StorageQuotaPanel /></Suspense>
+
       <SpendSection />
+
+      <Suspense fallback={<p>Cargando índices…</p>}><IndexGenerationsPanel /></Suspense>
 
       <RasterSection />
 
@@ -124,28 +117,11 @@ export default function AjustesView() {
               })}
             </div>
 
-            {/* re-embed control lives under the embedding selector */}
-            {task === "embedding" && options.length > 0 && (
-              <div style={{ marginTop: 12, background: "var(--bg)", border: "1px solid var(--line2)", borderRadius: 11, padding: "13px 16px" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-                  <div style={{ flex: 1, minWidth: 240 }}>
-                    <div style={{ fontWeight: 600, fontSize: 13.5 }}>Re-embeber el corpus</div>
-                    <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 3, lineHeight: 1.45 }}>
-                      Los vectores de modelos distintos no son compatibles. Tras cambiar de modelo, recalcula los embeddings o la búsqueda dará resultados incorrectos.
-                    </div>
-                  </div>
-                  <button onClick={doReembed} disabled={reembed?.status === "running"}
-                    style={{ flex: "none", background: reembed?.status === "running" ? "var(--line)" : "var(--accent)", color: reembed?.status === "running" ? "var(--muted)" : "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontFamily: "inherit", fontSize: 13.5, fontWeight: 600, cursor: reembed?.status === "running" ? "default" : "pointer" }}>
-                    {reembed?.status === "running" ? "Re-embebiendo…" : "Re-embeber ahora"}
-                  </button>
-                </div>
-                {reembed && (
-                  <div style={{ marginTop: 10, fontFamily: fonts.mono, fontSize: 11.5, color: reembed.status === "error" ? "var(--danger)" : reembed.status === "completed" ? "var(--ok)" : "var(--muted)" }}>
-                    {reembed.detail}
-                  </div>
-                )}
-              </div>
-            )}
+            {active && !["tesseract", "kraken", "ollama"].includes(creds.find((c) => c.id === active.credential_id)?.provider_key ?? "") &&
+              <Suspense fallback={<p>Cargando controles de IA…</p>}><AiPolicyEditor key={`${active.id}:${active.credential_id}`} binding={active}
+                model={active.model ?? creds.find((c) => c.id === active.credential_id)?.model_default ?? ""} onChanged={load} /></Suspense>}
+
+
           </div>
         );
       })}
@@ -161,6 +137,67 @@ export default function AjustesView() {
       <DangerZone />
     </section>
   );
+}
+
+function TeamSection() {
+  const e = useEstela();
+  const [members, setMembers] = useState<WorkspaceMember[]>([]);
+  const [myRole, setMyRole] = useState("");
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState("contributor");
+  const [busy, setBusy] = useState(false);
+  const canManage = myRole === "owner" || myRole === "admin";
+  const roles = myRole === "owner"
+    ? ["owner", "admin", "editor", "contributor", "viewer", "guest"]
+    : ["editor", "contributor", "viewer", "guest"];
+  const load = useCallback(() => {
+    void Promise.all([listWorkspaceMembers(), getMe()]).then(([next, me]) => {
+      setMembers(next); setMyRole(me.active_role || "");
+    }).catch(() => setMembers([]));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  async function invite() {
+    if (!email.trim()) return;
+    setBusy(true);
+    try {
+      await addWorkspaceMember({ email: email.trim(), role });
+      setEmail(""); e.notify("Persona añadida al espacio", "var(--ok)"); load();
+    } catch (error) { e.notify((error as Error).message, "var(--danger)"); }
+    finally { setBusy(false); }
+  }
+  async function change(member: WorkspaceMember, next: string) {
+    try { await updateWorkspaceMember(member.user_id, next); e.notify("Rol actualizado", "var(--ok)"); load(); }
+    catch (error) { e.notify((error as Error).message, "var(--danger)"); }
+  }
+  async function remove(member: WorkspaceMember) {
+    try { await removeWorkspaceMember(member.user_id); e.notify("Persona retirada del espacio", "var(--ok)"); load(); }
+    catch (error) { e.notify((error as Error).message, "var(--danger)"); }
+  }
+  const fld: React.CSSProperties = { background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 8, padding: "9px 11px", color: "var(--fg)", fontFamily: "inherit", fontSize: 13, boxSizing: "border-box" };
+
+  return <section style={{ marginBottom: 28 }}>
+    <h3 style={{ fontSize: 15, fontWeight: 600, margin: "0 0 10px" }}>Equipo y permisos</h3>
+    <div style={{ border: "1px solid var(--line)", borderRadius: 12, overflow: "hidden" }}>
+      {members.map((member, index) => <div key={member.user_id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 14px", background: "var(--surface)", borderBottom: index < members.length - 1 || canManage ? "1px solid var(--line2)" : "none", flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 190 }}>
+          <div style={{ fontSize: 13.5, fontWeight: 600 }}>{member.full_name || member.email}</div>
+          {member.full_name && <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 2 }}>{member.email}</div>}
+        </div>
+        {canManage && (myRole === "owner" || (member.role !== "owner" && member.role !== "admin"))
+          ? <select value={member.role} onChange={(event) => void change(member, event.target.value)} style={fld}>{roles.map((item) => <option key={item} value={item}>{item}</option>)}</select>
+          : <span style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)" }}>{member.role.toUpperCase()}</span>}
+        {canManage && (myRole === "owner" || (member.role !== "owner" && member.role !== "admin")) && <button onClick={() => void remove(member)} style={{ background: "transparent", color: "var(--danger)", border: "1px solid var(--line)", borderRadius: 7, padding: "6px 9px", cursor: "pointer", font: "inherit", fontSize: 12 }}>Retirar</button>}
+      </div>)}
+      {members.length === 0 && <div style={{ padding: 14, color: "var(--muted)", fontSize: 12.5 }}>No se pudieron cargar los miembros del espacio.</div>}
+      {canManage && <form onSubmit={(event) => { event.preventDefault(); void invite(); }} style={{ display: "flex", gap: 8, padding: 12, background: "var(--bg)", flexWrap: "wrap" }}>
+        <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="correo@ejemplo.com" style={{ ...fld, flex: 1, minWidth: 180 }} />
+        <select value={role} onChange={(event) => setRole(event.target.value)} style={fld}>{roles.map((item) => <option key={item} value={item}>{item}</option>)}</select>
+        <button disabled={busy} style={{ background: "var(--accent)", color: "#fff", border: "none", borderRadius: 8, padding: "9px 14px", font: "inherit", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>{busy ? "Añadiendo…" : "Añadir"}</button>
+      </form>}
+    </div>
+    <p style={{ color: "var(--muted)", fontSize: 11.5, margin: "7px 0 0" }}>Las personas colaboradoras presentan propuestas; editoras, administradoras y propietarias pueden aplicar cambios según su nivel. Nunca puede quedar un espacio sin una persona propietaria.</p>
+  </section>;
 }
 
 // Add/list/delete AI provider credentials — the entry point the bindings below depend on.
@@ -281,6 +318,11 @@ function AccountSection() {
   const [cur, setCur] = useState("");
   const [nw, setNw] = useState("");
   const [pmsg, setPmsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [mfaUrl, setMfaUrl] = useState<string | null>(null);
+  const [mfaCode, setMfaCode] = useState("");
+  const [mfaPassword, setMfaPassword] = useState("");
+  const [mfaMessage, setMfaMessage] = useState<string | null>(null);
+  const [recoveryCodes, setRecoveryCodes] = useState<string[]>([]);
   const [me, setMe] = useState<MeOut | null>(null);
   const [switching, setSwitching] = useState(false);
 
@@ -292,8 +334,8 @@ function AccountSection() {
   async function switchTenant(tid: string) {
     setSwitching(true);
     try {
-      const t = await api<{ access_token: string; refresh_token: string }>(`/auth/switch/${tid}`, { method: "POST" });
-      setTokens(t.access_token, t.refresh_token);
+      const t = await api<{ access_token: string }>(`/auth/session/switch/${tid}`, { method: "POST" });
+      setTokens(t.access_token);
       window.location.reload(); // whole app state is per-tenant — a clean reload is the honest reset
     } catch (err) {
       setSwitching(false);
@@ -311,6 +353,18 @@ function AccountSection() {
     if (nw.length < 8) { setPmsg({ kind: "err", text: "La nueva contraseña debe tener 8+ caracteres" }); return; }
     try { await changePassword(cur, nw); setCur(""); setNw(""); setPmsg({ kind: "ok", text: "Contraseña cambiada" }); }
     catch (err) { setPmsg({ kind: "err", text: (err as Error).message }); }
+  }
+  async function startMfa() {
+    try { const next = await beginMfa(); setMfaUrl(next.otpauth_url); setMfaMessage("Añade la clave en tu app y confirma el código."); }
+    catch (err) { setMfaMessage((err as Error).message); }
+  }
+  async function finishMfa() {
+    try { const next = await confirmMfa(mfaCode); setRecoveryCodes(next.recovery_codes); setMfaUrl(null); setMfaCode(""); setMfaMessage("MFA activado. Guarda los códigos de recuperación fuera de la aplicación."); }
+    catch (err) { setMfaMessage((err as Error).message); }
+  }
+  async function removeMfa() {
+    try { await disableMfa(mfaPassword, mfaCode); setMfaPassword(""); setMfaCode(""); setRecoveryCodes([]); setMfaMessage("MFA desactivado."); }
+    catch (err) { setMfaMessage((err as Error).message); }
   }
 
   const fld: React.CSSProperties = { background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 8, padding: "10px 12px", color: "var(--fg)", fontFamily: "inherit", fontSize: 13.5, width: "100%", boxSizing: "border-box" };
@@ -334,6 +388,23 @@ function AccountSection() {
           <label style={lbl}>Nueva contraseña<input style={fld} type="password" value={nw} onChange={(e) => setNw(e.target.value)} /></label>
           <button onClick={savePassword} style={btn}>Cambiar contraseña</button>
           {pmsg && <div style={{ fontSize: 12.5, color: pmsg.kind === "ok" ? "var(--ok)" : "var(--danger)" }}>{pmsg.text}</div>}
+        </div>
+        <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 12, padding: 18, display: "flex", flexDirection: "column", gap: 11 }}>
+          <div style={{ fontWeight: 600, fontSize: 14 }}>Autenticación en dos pasos</div>
+          <div style={{ fontSize: 12.5, color: "var(--muted)" }}>Opcional: usa una app compatible con TOTP y guarda los códigos de recuperación.</div>
+          {!mfaUrl && recoveryCodes.length === 0 && <button onClick={startMfa} style={btn}>Configurar MFA</button>}
+          {mfaUrl && <>
+            <code style={{ fontSize: 10.5, overflowWrap: "anywhere", color: "var(--muted)" }}>{mfaUrl}</code>
+            <label style={lbl}>Código de 6 dígitos<input style={fld} inputMode="numeric" value={mfaCode} onChange={(event) => setMfaCode(event.target.value)} /></label>
+            <button onClick={finishMfa} disabled={mfaCode.length < 6} style={btn}>Confirmar MFA</button>
+          </>}
+          {recoveryCodes.length > 0 && <code style={{ fontSize: 11, overflowWrap: "anywhere" }}>{recoveryCodes.join(" · ")}</code>}
+          {!mfaUrl && <>
+            <label style={lbl}>Contraseña para desactivar<input style={fld} type="password" value={mfaPassword} onChange={(event) => setMfaPassword(event.target.value)} /></label>
+            <label style={lbl}>Código MFA<input style={fld} inputMode="numeric" value={mfaCode} onChange={(event) => setMfaCode(event.target.value)} /></label>
+            <button onClick={removeMfa} disabled={!mfaPassword || mfaCode.length < 6} style={{ ...btn, background: "var(--danger)" }}>Desactivar MFA</button>
+          </>}
+          {mfaMessage && <div style={{ fontSize: 12.5, color: "var(--muted)" }}>{mfaMessage}</div>}
         </div>
       </div>
 
@@ -365,15 +436,26 @@ function AccountSection() {
 
 function SpendSection() {
   const [month, setMonth] = useState(0);
+  const [reserved, setReserved] = useState(0);
+  const [unknown, setUnknown] = useState(0);
   const [budget, setBudgetState] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
-  useEffect(() => { getSpend().then((s) => { setMonth(s.month_cents); setBudgetState(s.budget_cents); setDraft(s.budget_cents != null ? (s.budget_cents / 100).toString() : ""); }).catch(() => {}); }, []);
-  const pct = budget ? Math.min(100, Math.round((month / budget) * 100)) : 0;
+  const refresh = useCallback(async () => {
+    const s = await getSpend();
+    setMonth(s.settled_microusd / 10000); setReserved(s.reserved_microusd / 10000); setUnknown(s.unknown_calls);
+    setBudgetState(s.budget_cents);
+  }, []);
+  useEffect(() => { getSpend().then((s) => {
+    setMonth(s.settled_microusd / 10000); setReserved(s.reserved_microusd / 10000); setUnknown(s.unknown_calls);
+    setBudgetState(s.budget_cents); setDraft(s.budget_cents != null ? (s.budget_cents / 100).toString() : "");
+  }).catch((error: Error) => setMsg(error.message)); }, []);
+  const pct = budget ? Math.min(100, Math.round(((month + reserved) / budget) * 100)) : 0;
   async function save() {
     try {
       const cents = draft.trim() === "" ? null : Math.round(parseFloat(draft) * 100);
-      const s = await setBudget(cents); setBudgetState(s.budget_cents); setMsg("Guardado");
+      if (cents !== null && (!Number.isFinite(cents) || cents < 0)) throw new Error("Introduce un importe válido.");
+      const s = await setBudget(cents); setBudgetState(s.budget_cents); await refresh(); setMsg("Guardado");
       setTimeout(() => setMsg(null), 2000);
     } catch (e) { setMsg((e as Error).message); }
   }
@@ -383,21 +465,24 @@ function SpendSection() {
       <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 12, padding: 18, marginBottom: 14 }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
           <span style={{ fontFamily: fonts.serif, fontSize: 26, fontWeight: 700 }}>${(month / 100).toFixed(2)}</span>
-          <span style={{ color: "var(--muted)", fontSize: 13 }}>gastado este mes{budget != null ? ` · de un tope de $${(budget / 100).toFixed(2)}` : ""}</span>
+          <span style={{ color: "var(--muted)", fontSize: 13 }}>consumo estimado liquidado este mes{budget != null ? ` · de un tope de $${(budget / 100).toFixed(2)}` : " · IA de pago desactivada sin presupuesto"}</span>
         </div>
+        <p style={{ fontSize: 12 }}>${(reserved / 100).toFixed(6)} reservados en llamadas pendientes.</p>
+        {unknown > 0 && <p role="alert" style={{ color: "var(--warn)", fontSize: 12 }}>{unknown} llamadas inciertas o interrumpidas. Las nuevas llamadas de pago están detenidas hasta conciliarlas.</p>}
         {budget != null && (
           <div style={{ height: 8, borderRadius: 999, background: "var(--line2)", overflow: "hidden", marginTop: 10 }}>
             <div style={{ height: "100%", width: `${pct}%`, background: pct >= 100 ? "var(--danger)" : pct >= 80 ? "var(--warn)" : "linear-gradient(90deg,var(--accent),var(--gold))" }} />
           </div>
         )}
         <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginTop: 14, flexWrap: "wrap" }}>
-          <label style={{ display: "flex", flexDirection: "column", gap: 5, fontSize: 12, color: "var(--muted)" }}>Tope mensual (USD, vacío = sin tope)
+          <label style={{ display: "flex", flexDirection: "column", gap: 5, fontSize: 12, color: "var(--muted)" }}>Tope mensual (USD, vacío = desactivar IA de pago)
             <input style={{ background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 8, padding: "9px 11px", color: "var(--fg)", fontFamily: "inherit", fontSize: 13.5, width: 140 }} value={draft} onChange={(e) => setDraft(e.target.value.replace(/[^\d.]/g, ""))} placeholder="p. ej. 20" />
           </label>
           <button onClick={save} style={{ background: "var(--accent)", color: "#fff", border: "none", borderRadius: 8, padding: "9px 16px", fontFamily: "inherit", fontSize: 13.5, fontWeight: 600, cursor: "pointer", height: 38 }}>Guardar tope</button>
           {msg && <span style={{ fontSize: 12.5, color: "var(--ok)" }}>{msg}</span>}
         </div>
-        <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 8 }}>Coste estimado a partir de los tokens de transcripción/extracción y los precios por modelo. Al alcanzar el tope, los nuevos trabajos se rechazan hasta el mes siguiente o hasta que lo subas.</div>
+        <div style={{ fontSize: 11.5, color: "var(--muted)", marginTop: 8 }}>Cada llamada reserva su máximo estimado antes de salir. Las tarifas y ventanas deben confirmarse por modelo; no equivalen a la factura del proveedor. Las reservas inciertas no caducan al cambiar el mes.</div>
+        <Suspense fallback={<p>Cargando registro…</p>}><AiCallsPanel onChanged={refresh} /></Suspense>
       </div>
     </>
   );

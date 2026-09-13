@@ -18,10 +18,12 @@ from typing import Any
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.rls import set_rls_context
 from ..db.session import SessionLocal
+from ..models.membership import Membership
 from .security import Principal, decode_token
 
 _bearer = HTTPBearer(auto_error=True)
@@ -39,9 +41,13 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def rate_limit(bucket: str, *, limit: int, window_s: int) -> Callable[..., Coroutine[Any, Any, None]]:
-    """Fixed-window per-IP limiter on the shared Redis. Fail-open if Redis is unreachable so an
-    outage never locks legitimate users out. Use on unauthenticated endpoints (login/register)."""
+def rate_limit(bucket: str, *, limit: int, window_s: int, fail_closed: bool = False) -> Callable[..., Coroutine[Any, Any, None]]:
+    """Fixed-window per-IP limiter.
+
+    Authentication and recovery endpoints must fail closed: serving a temporary 503 is
+    safer than offering unlimited password guesses while Redis is unavailable. Public
+    read-only sharing may still choose availability over throttling.
+    """
 
     async def _dep(request: Request) -> None:
         from .events import get_redis
@@ -52,7 +58,9 @@ def rate_limit(bucket: str, *, limit: int, window_s: int) -> Callable[..., Corou
             n = await r.incr(key)
             if n == 1:
                 await r.expire(key, window_s)
-        except Exception:
+        except Exception as exc:
+            if fail_closed:
+                raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "protección temporalmente no disponible") from exc
             return
         if n > limit:
             raise HTTPException(
@@ -88,12 +96,28 @@ async def get_current_principal(
     except jwt.PyJWTError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")
     tid = claims.get("tid")
-    return Principal(
+    principal = Principal(
         user_id=uuid.UUID(claims["sub"]),
         is_server_admin=bool(claims.get("sa")),
         tenant_id=uuid.UUID(tid) if tid else None,
         role=claims.get("role"),
     )
+    if principal.tenant_id is None or principal.is_server_admin:
+        return principal
+    # JWTs are intentionally short lived, but membership changes (a demotion, removal or owner
+    # transfer) are security events and must take effect before their expiry.  Read the current
+    # membership under the user RLS branch and replace the token's historical role.
+    async with SessionLocal() as session:
+        await set_rls_context(
+            session, user_id=principal.user_id, tenant_id=principal.tenant_id, role=principal.role
+        )
+        membership = await session.scalar(select(Membership).where(
+            Membership.tenant_id == principal.tenant_id, Membership.user_id == principal.user_id
+        ))
+    if membership is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "membership is no longer active")
+    principal.role = membership.role
+    return principal
 
 
 async def _scoped_session(principal: Principal) -> AsyncIterator[AsyncSession]:
@@ -130,12 +154,22 @@ async def get_tenant_db(
 
 
 def require_roles(*roles: str) -> Callable[..., Coroutine[Any, Any, Principal]]:
-    """Dependency factory: allow server-admins, or members holding one of ``roles``."""
+    """Dependency factory with the workspace-role hierarchy.
+
+    Existing routers name the lowest role that may perform an action (for example ``editor``
+    for tree writes).  Owners and admins consequently retain access without every router having
+    to repeat their roles.  Legacy tokens remain valid until refresh, but are normalized here.
+    """
+
+    ranks = {"guest": 0, "viewer": 1, "contributor": 2, "editor": 3, "admin": 4, "owner": 5}
+    aliases = {"tenant_admin": "admin", "researcher": "editor"}
+    minimum = min((ranks.get(aliases.get(role, role), 99) for role in roles), default=99)
 
     async def _dep(principal: Principal = Depends(get_current_principal)) -> Principal:
         if principal.is_server_admin:
             return principal
-        if principal.role not in roles:
+        actual = aliases.get(principal.role or "", principal.role or "")
+        if ranks.get(actual, -1) < minimum:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "insufficient role")
         return principal
 

@@ -68,7 +68,7 @@ async def create_person(session, tenant_id, *, given, surname, sex="U", inferred
 
 
 async def update_person(session, tenant_id, person_id, *, sex=None, given=None, surname=None,
-                        surname_prefix=None, nickname=None, notes=None) -> Person:
+                        surname_prefix=None, nickname=None, notes=None, privacy_status=None) -> Person:
     p = await session.get(Person, person_id)
     if not p:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "person not found")
@@ -76,6 +76,10 @@ async def update_person(session, tenant_id, person_id, *, sex=None, given=None, 
         p.sex = _norm_sex(sex)
     if notes is not None:
         p.notes = notes or None
+    if privacy_status is not None:
+        if privacy_status not in {"unknown", "living", "deceased", "public", "private"}:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "estado de privacidad inválido")
+        p.privacy_status = privacy_status
     name = await session.scalar(
         select(Name).where(Name.person_id == person_id).order_by(Name.is_primary.desc())
     )
@@ -93,7 +97,7 @@ async def update_person(session, tenant_id, person_id, *, sex=None, given=None, 
 
 
 async def add_event(session, tenant_id, person_id, *, type, date_raw=None, place=None,
-                    place_lat=None, place_lng=None, value=None) -> Event:
+                    place_lat=None, place_lng=None, value=None, inferred: bool = False) -> Event:
     if not await session.get(Person, person_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "person not found")
     if type not in TYPE2TAG:
@@ -101,7 +105,7 @@ async def add_event(session, tenant_id, person_id, *, type, date_raw=None, place
     from .mapping import extract_year
     ev = Event(
         tenant_id=tenant_id, type=type, date_raw=date_raw, date_year=extract_year(date_raw),
-        value=value or None, is_inferred=False, subject_person_id=person_id,
+        value=value or None, is_inferred=inferred, subject_person_id=person_id,
         place_id=await _resolve_place(session, tenant_id, place, place_lat, place_lng),
     )
     session.add(ev)

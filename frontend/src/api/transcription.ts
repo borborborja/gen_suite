@@ -10,6 +10,11 @@ export interface TranscriptionOut {
   text: string | null;
   status: string;
 }
+export interface TranscriptionRevision extends TranscriptionOut {
+  is_active: boolean; supersedes_id: string | null; reviewed_by: string | null; created_at: string;
+}
+export const getTranscriptionHistory = (docId: string, pageNo: number) =>
+  api<TranscriptionRevision[]>(`/transcription/documents/${docId}/history?page_no=${pageNo}`);
 
 export interface TranscribeOpts {
   engine?: string; model?: string; credential_id?: string; replace?: boolean;
@@ -37,6 +42,7 @@ export interface ReconcileBody {
   criterion?: "frequency" | "llm";
   keep_history?: boolean;
   choices?: Record<string, string>; // page_no -> "old" | "new" | edited text
+  expected_versions: Record<string, { active_id: string | null; candidate_id: string | null }>;
 }
 export const reconcile = (docId: string, body: ReconcileBody) =>
   api<{ pages: number }>(`/transcription/documents/${docId}/reconcile`, {
@@ -50,5 +56,5 @@ export const correctTranscription = (id: string, text: string) =>
     body: JSON.stringify({ text }),
   });
 
-const TERMINAL = new Set(["completed", "error", "cancelled"]);
+const TERMINAL = new Set(["completed", "partial", "error", "cancelled"]);
 export const isTerminal = (s: string) => TERMINAL.has(s);

@@ -7,20 +7,21 @@ import {
 import { type Discovery } from "./data";
 import { candidateToDiscovery } from "./mapCandidate";
 import {
-  confirmCandidate, rejectCandidate, acceptProposal, listCandidates,
+  applyCandidate, previewCandidate, rejectCandidate, listCandidates,
 } from "../../api/linkage";
+import { revertChange } from "../../api/tree";
 import type { ThemeMode } from "./theme";
 
 export type Nav =
   | "inicio" | "descubrimientos" | "arbol" | "persona"
   | "biblioteca" | "visor" | "buscar" | "super" | "familysearch" | "ajustes"
-  | "lugares" | "historial" | "estadisticas" | "consistencia";
+  | "lugares" | "historial" | "estadisticas" | "consistencia" | "investigacion" | "compartir" | "sincronizacion";
 export type TreeView = "genograma" | "pedigree" | "abanico" | "descendientes" | "lista";
 export type Decision = "yes" | "no" | "skip";
 export type ToastKind = "confirm" | "reject" | "skip" | "addrel" | null;
 export type DiscSource = "sample" | "live";
 
-interface Toast { show: boolean; msg: string; color: string; kind: ToastKind; prev: string | null }
+interface Toast { show: boolean; msg: string; color: string; kind: ToastKind; changeId: string | null }
 
 interface EstelaState {
   theme: ThemeMode;
@@ -35,6 +36,7 @@ interface EstelaState {
   discIndex: number;
   decisions: Record<string, Decision>;
   panelOpen: boolean;
+  reviewToken: string | null;
   added: Record<string, boolean>;
   zoom: boolean;
   toast: Toast;
@@ -59,9 +61,11 @@ interface EstelaCtx extends EstelaState {
   jumpTo: (index: number) => void;
   reloadDiscoveries: () => Promise<void>;
   notify: (msg: string, color?: string) => void;
+  notifyChange: (msg: string, changeId: string, color?: string) => void;
   addRel: (id: string) => Promise<void>;
   addAllRel: () => Promise<void>;
-  undo: () => void;
+  applyReview: () => Promise<void>;
+  undo: () => Promise<void>;
   setZoom: (z: boolean) => void;
   setSearchTab: (t: string) => void;
   setVisorHover: (h: string) => void;
@@ -90,9 +94,10 @@ export function EstelaProvider({ children, startTheme = "light" }: { children: R
     discIndex: 0,
     decisions: {},
     panelOpen: false,
+    reviewToken: null,
     added: {},
     zoom: false,
-    toast: { show: false, msg: "", color: "", kind: null, prev: null },
+    toast: { show: false, msg: "", color: "", kind: null, changeId: null },
     searchTab: "archivo",
     visorHover: "a1",
   });
@@ -116,7 +121,7 @@ export function EstelaProvider({ children, startTheme = "light" }: { children: R
       // backend answered → switch to live (even if empty: shows a real empty state, not fake data)
       setS((p) => ({
         ...p, discoveries: cands.map(candidateToDiscovery), source: "live", discError: false,
-        discIndex: 0, decisions: {}, added: {}, panelOpen: false,
+        discIndex: 0, decisions: {}, added: {}, panelOpen: false, reviewToken: null,
       }));
     } catch {
       // backend unreachable → flag it so the UI shows an error + retry, not "todo revisado"
@@ -126,9 +131,9 @@ export function EstelaProvider({ children, startTheme = "light" }: { children: R
 
   useEffect(() => { void reloadDiscoveries(); }, [reloadDiscoveries]);
 
-  const showToast = useCallback((msg: string, color: string, kind: ToastKind, prev: string | null) => {
+  const showToast = useCallback((msg: string, color: string, kind: ToastKind, changeId: string | null = null) => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
-    setS((p) => ({ ...p, toast: { show: true, msg, color, kind, prev } }));
+    setS((p) => ({ ...p, toast: { show: true, msg, color, kind, changeId } }));
     toastTimer.current = setTimeout(() => setS((p) => ({ ...p, toast: { ...p.toast, show: false } })), 4200);
   }, []);
 
@@ -148,9 +153,9 @@ export function EstelaProvider({ children, startTheme = "light" }: { children: R
       const nxt = nextPending(p.discIndex + 1, p.discoveries, p.decisions);
       if (nxt === -1) {
         const back = nextPending(0, p.discoveries, p.decisions);
-        return { ...p, panelOpen: false, discIndex: back === -1 ? p.discIndex : back };
+        return { ...p, panelOpen: false, reviewToken: null, discIndex: back === -1 ? p.discIndex : back };
       }
-      return { ...p, discIndex: nxt, panelOpen: false };
+      return { ...p, discIndex: nxt, panelOpen: false, reviewToken: null };
     });
   }, [nextPending]);
 
@@ -158,29 +163,28 @@ export function EstelaProvider({ children, startTheme = "light" }: { children: R
     const c = s.discoveries[s.discIndex];
     if (!c) return;
     if (c.candidateId) {
-      try { await confirmCandidate(c.candidateId); }
-      catch (err) { showToast("No se pudo confirmar: " + (err as Error).message, "var(--danger)", null, null); return; }
+      try {
+        const preview = await previewCandidate(c.candidateId);
+        setS((p) => ({ ...p, panelOpen: true, reviewToken: preview.preview_token, added: {} }));
+        showToast("Revisa los cambios antes de aplicarlos al árbol.", "var(--warn)", null);
+      } catch (err) {
+        showToast("No se pudo preparar la revisión: " + (err as Error).message, "var(--danger)", null);
+      }
+      return;
     }
-    const dec: Record<string, Decision> = { ...s.decisions, [c.id]: "yes" };
-    if (c.relatives && c.relatives.length) {
-      setS((p) => ({ ...p, decisions: dec, panelOpen: true }));
-      showToast("Confirmado. Añadido a tu árbol con su fuente.", "var(--ok)", "confirm", c.id);
-    } else {
-      setS((p) => ({ ...p, decisions: dec }));
-      showToast("Confirmado y añadido a tu árbol, con su fuente.", "var(--ok)", "confirm", c.id);
-      setTimeout(advance, 0);
-    }
-  }, [s.discIndex, s.decisions, s.discoveries, showToast, advance]);
+    showToast("Esta propuesta no tiene una decisión persistente asociada.", "var(--danger)", null);
+  }, [s.discIndex, s.discoveries, showToast]);
 
   const reject = useCallback(async () => {
     const c = s.discoveries[s.discIndex];
     if (!c) return;
+    let changeId: string | null = null;
     if (c.candidateId) {
-      try { await rejectCandidate(c.candidateId); }
-      catch (err) { showToast("No se pudo descartar: " + (err as Error).message, "var(--danger)", null, null); return; }
+      try { changeId = (await rejectCandidate(c.candidateId)).change_id ?? null; }
+      catch (err) { showToast("No se pudo descartar: " + (err as Error).message, "var(--danger)", null); return; }
     }
     setS((p) => ({ ...p, decisions: { ...p.decisions, [c.id]: "no" } }));
-    showToast("Descartado. No se ha tocado tu árbol.", "var(--danger)", "reject", c.id);
+    showToast("Descartado. No se ha tocado tu árbol.", "var(--danger)", "reject", changeId);
     setTimeout(advance, 0);
   }, [s.discIndex, s.discoveries, showToast, advance]);
 
@@ -188,58 +192,50 @@ export function EstelaProvider({ children, startTheme = "light" }: { children: R
     const c = s.discoveries[s.discIndex];
     if (!c) return;
     setS((p) => ({ ...p, decisions: { ...p.decisions, [c.id]: "skip" } }));
-    showToast("Marcado como «no lo sé». Volverá a la cola.", "var(--muted)", "skip", c.id);
+    showToast("Marcado como «no lo sé». Volverá a la cola.", "var(--muted)", "skip");
     setTimeout(advance, 0);
   }, [s.discIndex, s.discoveries, showToast, advance]);
 
   const addRel = useCallback(async (id: string) => {
-    const c = s.discoveries[s.discIndex];
-    const rel = c?.relatives.find((r) => r.id === id);
-    if (c?.candidateId && rel?.mentionId) {
-      try { await acceptProposal(c.candidateId, rel.mentionId); }
-      catch (err) { showToast("No se pudo añadir: " + (err as Error).message, "var(--danger)", null, null); return; }
-    }
-    setS((p) => ({ ...p, added: { ...p.added, [id]: true } }));
-    showToast("Añadido a tu árbol como inferido, con su fuente.", "var(--warn)", "addrel", id);
-  }, [s.discIndex, s.discoveries, showToast]);
+    if (!s.reviewToken) return;
+    setS((p) => ({ ...p, added: { ...p.added, [id]: !p.added[id] } }));
+  }, [s.reviewToken]);
 
   const addAllRel = useCallback(async () => {
     const c = s.discoveries[s.discIndex];
-    if (!c) return;
-    const ok: string[] = [];
-    let failed = 0;
-    for (const r of c.relatives) {
-      if (c.candidateId && r.mentionId) {
-        try { await acceptProposal(c.candidateId, r.mentionId); ok.push(r.id); }
-        catch { failed++; }
-      } else {
-        ok.push(r.id);
-      }
+    if (!c || !s.reviewToken) return;
+    setS((p) => ({ ...p, added: Object.fromEntries(c.relatives.map((r) => [r.id, true])) }));
+  }, [s.discIndex, s.discoveries, s.reviewToken]);
+
+  const applyReview = useCallback(async () => {
+    const c = s.discoveries[s.discIndex];
+    if (!c?.candidateId || !s.reviewToken) return;
+    const relative_mention_ids = c.relatives.filter((r) => s.added[r.id]).map((r) => r.mentionId).filter(Boolean) as string[];
+    try {
+      const result = await applyCandidate(c.candidateId, { preview_token: s.reviewToken, relative_mention_ids });
+      setS((p) => ({ ...p, decisions: { ...p.decisions, [c.id]: "yes" }, panelOpen: false, reviewToken: null }));
+      showToast("Propuesta aplicada al árbol con sus fuentes.", "var(--ok)", "confirm", result.change_id);
+      setTimeout(advance, 0);
+    } catch (err) {
+      showToast("No se pudo aplicar: " + (err as Error).message, "var(--danger)", null);
     }
-    if (ok.length) setS((p) => { const add = { ...p.added }; ok.forEach((id) => (add[id] = true)); return { ...p, added: add }; });
-    if (failed) showToast(`Añadidos ${ok.length}; ${failed} fallaron — reintenta.`, "var(--danger)", null, null);
-    else showToast("Parientes añadidos como inferidos, con su fuente.", "var(--warn)", "addrel", null);
-  }, [s.discIndex, s.discoveries, showToast]);
+  }, [s.discIndex, s.discoveries, s.reviewToken, s.added, showToast, advance]);
 
-  const undo = useCallback(() => {
-    setS((p) => {
-      const t = p.toast;
-      if (t.kind === "addrel" && t.prev) {
-        const a = { ...p.added };
-        delete a[t.prev];
-        return { ...p, added: a, toast: { ...p.toast, show: false } };
-      }
-      if ((t.kind === "confirm" || t.kind === "reject" || t.kind === "skip") && t.prev) {
-        const d = { ...p.decisions };
-        delete d[t.prev];
-        return { ...p, decisions: d, panelOpen: false, toast: { ...p.toast, show: false } };
-      }
-      return { ...p, toast: { ...p.toast, show: false } };
-    });
-  }, []);
+  const undo = useCallback(async () => {
+    const changeId = s.toast.changeId;
+    if (!changeId) { setS((p) => ({ ...p, toast: { ...p.toast, show: false } })); return; }
+    try {
+      await revertChange(changeId);
+      await reloadDiscoveries();
+      showToast("Cambio deshecho en el árbol.", "var(--ok)", null);
+    } catch (err) {
+      showToast("No se pudo deshacer: " + (err as Error).message, "var(--danger)", null);
+    }
+  }, [s.toast.changeId, reloadDiscoveries, showToast]);
 
-  const jumpTo = useCallback((index: number) => setS((p) => ({ ...p, discIndex: index, panelOpen: false })), []);
-  const notify = useCallback((msg: string, color = "var(--accent)") => showToast(msg, color, null, null), [showToast]);
+  const jumpTo = useCallback((index: number) => setS((p) => ({ ...p, discIndex: index, panelOpen: false, reviewToken: null })), []);
+  const notify = useCallback((msg: string, color = "var(--accent)") => showToast(msg, color, null), [showToast]);
+  const notifyChange = useCallback((msg: string, changeId: string, color = "var(--accent)") => showToast(msg, color, "confirm", changeId), [showToast]);
   const go = useCallback((n: Nav) => setS((p) => ({ ...p, nav: n, zoom: false })), []);
   const openPerson = useCallback((id: string) => setS((p) => ({ ...p, selPerson: id, nav: "persona", zoom: false })), []);
   const openDoc = useCallback((id: string, page?: number) => setS((p) => ({ ...p, selDoc: id, selPage: page ?? null, nav: "visor", zoom: false })), []);
@@ -268,9 +264,9 @@ export function EstelaProvider({ children, startTheme = "light" }: { children: R
 
   const value = useMemo<EstelaCtx>(() => ({
     ...s, cur, pendingCount, hasPending, allDone,
-    go, openPerson, openDoc, setTree, toggleTheme, confirm, reject, skip, advance, jumpTo, reloadDiscoveries, notify,
-    addRel, addAllRel, undo, setZoom, setSearchTab, setVisorHover,
-  }), [s, cur, pendingCount, hasPending, allDone, go, openPerson, openDoc, setTree, toggleTheme, confirm, reject, skip, advance, jumpTo, reloadDiscoveries, notify, addRel, addAllRel, undo, setZoom, setSearchTab, setVisorHover]);
+    go, openPerson, openDoc, setTree, toggleTheme, confirm, reject, skip, advance, jumpTo, reloadDiscoveries, notify, notifyChange,
+    addRel, addAllRel, applyReview, undo, setZoom, setSearchTab, setVisorHover,
+  }), [s, cur, pendingCount, hasPending, allDone, go, openPerson, openDoc, setTree, toggleTheme, confirm, reject, skip, advance, jumpTo, reloadDiscoveries, notify, notifyChange, addRel, addAllRel, applyReview, undo, setZoom, setSearchTab, setVisorHover]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

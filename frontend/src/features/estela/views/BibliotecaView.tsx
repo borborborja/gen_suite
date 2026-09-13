@@ -1,10 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useEstela } from "../store";
 import { fonts } from "../theme";
 import { Plus } from "../icons";
 import {
-  listDocuments, uploadDocument, discardImages, getRecordTypes, getSeriesGaps,
+  listDocuments, uploadDocument, getRecordTypes, getSeriesGaps,
   parseIndex, getDocumentIndex, rerasterize,
+  listDocumentExports, createDocumentExport, downloadDocumentExport,
+  getExportCapabilities, downloadExportValidation,
+  type DocumentExport,
   type DocumentOut, type UploadFlags, type RecordType, type SeriesGap, type IndexReport,
 } from "../../../api/documents";
 import { startTranscription, getVersions, reconcile, type VersionPair, type ReconcileBody } from "../../../api/transcription";
@@ -14,6 +17,7 @@ import { geoSearch, type GeoResult } from "../../../api/geo";
 import { useConfirm, useDebouncedSearch } from "../ui";
 import { jobGerund } from "../labels";
 import { getCatalog, listCredentials, type CatalogEntry, type Credential } from "../../../api/providers";
+const IngestPanel = lazy(() => import("./IngestPanel"));
 
 interface Prog { label: string; done: number; total: number; status: string }
 
@@ -32,6 +36,7 @@ export default function BibliotecaView() {
   const [docs, setDocs] = useState<DocumentOut[] | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [showUpload, setShowUpload] = useState(false);
+  const [showIngest, setShowIngest] = useState(false);
   const [dropped, setDropped] = useState<File[]>([]);
   const [pageDrag, setPageDrag] = useState(false);
   const [progress, setProgress] = useState<Record<string, Prog>>({});
@@ -40,14 +45,18 @@ export default function BibliotecaView() {
   const [reconDoc, setReconDoc] = useState<DocumentOut | null>(null);
   const [extractDoc, setExtractDoc] = useState<DocumentOut | null>(null);
   const [indexDoc, setIndexDoc] = useState<DocumentOut | null>(null);
+  const [exportDoc, setExportDoc] = useState<DocumentOut | null>(null);
+  const [offset, setOffset] = useState(0);
+  const [loadError, setLoadError] = useState("");
   const streamed = useRef<Set<string>>(new Set());
   const { confirmDialog, ask } = useConfirm();
 
   const [gaps, setGaps] = useState<SeriesGap[]>([]);
   const load = useCallback(async () => {
-    try { setDocs(await listDocuments("mine")); } catch { setDocs([]); }
+    try { setDocs(await listDocuments("mine", offset)); setLoadError(""); }
+    catch (error) { setLoadError((error as Error).message); }
     getSeriesGaps().then((g) => setGaps(g.filter((s) => s.missing.length > 0))).catch(() => setGaps([]));
-  }, []);
+  }, [offset]);
   useEffect(() => { void load(); getRecordTypes().then(setTypes).catch(() => setTypes([])); }, [load]);
 
   const track = useCallback((docId: string, label: string, jobId: string, init?: { done?: number; total?: number }) => {
@@ -107,13 +116,6 @@ export default function BibliotecaView() {
     return () => { alive = false; clearInterval(t); };
   }, [docs, track]);
 
-  async function action(id: string, label: string, fn: () => Promise<unknown>) {
-    setBusy(`${id}:${label}`);
-    try { await fn(); await load(); e.notify("Hecho", "var(--ok)"); }
-    catch (err) { e.notify((err as Error).message, "var(--danger)"); }
-    setBusy(null);
-  }
-
   async function runJob(docId: string, label: string, start: () => Promise<{ id: string }>) {
     setBusy(`${docId}:${label}`);
     try { const job = await start(); e.notify(`${label}…`); track(docId, label, job.id); }
@@ -144,13 +146,19 @@ export default function BibliotecaView() {
         <div>
           <h1 style={{ fontFamily: fonts.serif, fontWeight: 600, fontSize: 34, margin: 0, letterSpacing: "-.02em" }}>Biblioteca</h1>
           <p style={{ color: "var(--muted)", fontSize: 14, margin: "6px 0 0" }}>
-            {docs === null ? "Cargando…" : hasReal ? `${docs.length} libros · arrastra PDFs aquí o pulsa Añadir` : "Arrastra tus PDFs aquí, o pulsa Añadir libros"}
+            {docs === null ? "Cargando…" : hasReal ? `Libros ${offset + 1}–${offset + docs.length} · añade PDFs o imágenes` : "No hay libros en esta página"}
           </p>
         </div>
         <button onClick={() => { setDropped([]); setShowUpload((v) => !v); }} style={{ flex: "none", display: "inline-flex", alignItems: "center", gap: 9, background: "var(--accent)", color: "#fff", border: "none", borderRadius: 9, padding: "13px 20px", fontFamily: "inherit", fontSize: 14.5, fontWeight: 600, cursor: "pointer", boxShadow: "0 5px 18px rgba(217,83,30,.3)" }}>
           <Plus size={18} />Añadir libros
         </button>
       </div>
+
+      {loadError && <p role="alert" style={{ color: "var(--danger)" }}>No se pudo cargar la biblioteca: {loadError} <button onClick={() => void load()}>Reintentar</button></p>}
+      <nav aria-label="Páginas de la biblioteca" style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <Act label="Anterior" on={offset === 0} onClick={() => setOffset((n) => Math.max(0, n - 100))} />
+        <Act label="Siguiente" on={!docs || docs.length < 100} onClick={() => setOffset((n) => n + 100)} />
+      </nav>
 
       {gaps.length > 0 && (
         <div style={{ background: "var(--warn-faint)", border: "1px solid var(--warn)", borderRadius: 12, padding: "12px 16px", marginBottom: 18 }}>
@@ -164,6 +172,8 @@ export default function BibliotecaView() {
         </div>
       )}
 
+      <button onClick={() => setShowIngest((value) => !value)} style={{ marginBottom: 16, padding: "9px 14px", borderRadius: 8, border: "1px solid var(--line)", background: "var(--surface)", color: "var(--fg)", cursor: "pointer" }}>Importación masiva / reanudar colección</button>
+      {showIngest && <Suspense fallback={<p role="status">Cargando importador…</p>}><IngestPanel onClose={() => setShowIngest(false)} onChanged={load} /></Suspense>}
       {showUpload && <UploadForm initial={dropped} onDone={() => { setShowUpload(false); setDropped([]); void load(); }} />}
 
       {/* real documents */}
@@ -205,18 +215,13 @@ export default function BibliotecaView() {
                   <Act on={!!progress[d.id]} label="Re-reconocer" onClick={() => setRetxDoc(d)} />
                   <Act label="Reconciliar" onClick={() => setReconDoc(d)} />
                   <Act label="Índice" onClick={() => setIndexDoc(d)} />
-                  <Act label="Re-procesar" onClick={async () => {
-                    if (await ask({ title: "¿Re-procesar el libro?", body: "Re-rasteriza este libro a la calidad actual (Ajustes) desde el PDF original y borra sus transcripciones/actas para volver a procesarlo.", confirmLabel: "Re-procesar" }))
+                  {d.doc_type === "pdf" && <Act label="Nueva digitalización" on={!!progress[d.id]} onClick={async () => {
+                    if (await ask({ title: "¿Crear una nueva digitalización?", body: "Crea otro documento desde el PDF original con la calidad actual. El libro anterior conserva sus imágenes, transcripciones, actas y citas.", confirmLabel: "Crear versión" }))
                       runJob(d.id, "Re-procesando", () => rerasterize(d.id));
-                  }} />
+                  }} />}
+                  <Act label="Exportar / preservar" onClick={() => setExportDoc(d)} />
                   <Act on={busy === `${d.id}:ex` || !!progress[d.id]} label="Extraer" onClick={() => setExtractDoc(d)} />
-                  {d.image_policy !== "data_only" && (
-                    <Act danger on={busy === `${d.id}:di`} label="Descartar imágenes"
-                      onClick={async () => {
-                        if (await ask({ title: "¿Descartar las imágenes?", body: "Se conservan los datos y la cita, pero no podrás volver a ver el escaneo.", danger: true, confirmLabel: "Descartar" }))
-                          void action(d.id, "di", () => discardImages(d.id));
-                      }} />
-                  )}
+                  <span style={{ fontSize: 11, color: "var(--muted)", alignSelf: "center" }}>Borrado irreversible bloqueado</span>
                 </div>
               </div>
             </div>
@@ -235,8 +240,9 @@ export default function BibliotecaView() {
       {indexDoc && <IndexPanel doc={indexDoc} onClose={() => setIndexDoc(null)} notify={e.notify} />}
       {reconDoc && (
         <ReconcilePanel doc={reconDoc} onClose={() => setReconDoc(null)}
-          onDone={() => { setReconDoc(null); void load(); e.notify("Reconciliación aplicada — re-indexando", "var(--ok)"); }} />
+          onDone={() => { setReconDoc(null); void load(); e.notify("Revisión guardada con historial. Las actas anteriores quedan pendientes de actualización.", "var(--ok)"); }} />
       )}
+      {exportDoc && <ExportPanel doc={exportDoc} onClose={() => setExportDoc(null)} notify={e.notify} />}
 
       {/* empty state when there's no real data yet */}
       {docs !== null && !hasReal && !showUpload && (
@@ -254,13 +260,13 @@ export default function BibliotecaView() {
   );
 }
 
-function Act({ label, onClick, on, danger }: { label: string; onClick: () => void; on?: boolean; danger?: boolean }) {
+function Act({ label, onClick, on, danger, disabled }: { label: string; onClick: () => void; on?: boolean; danger?: boolean; disabled?: boolean }) {
   return (
-    <button onClick={onClick} disabled={on} style={{
+    <button onClick={onClick} disabled={on || disabled} style={{
       background: "transparent", color: danger ? "var(--danger)" : "var(--fg)",
       border: `1px solid ${danger ? "var(--danger)" : "var(--line)"}`, borderRadius: 7,
       padding: "7px 11px", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600,
-      cursor: on ? "default" : "pointer", opacity: on ? 0.5 : 1,
+      cursor: on || disabled ? "default" : "pointer", opacity: on || disabled ? 0.5 : 1,
     }}>{on ? "…" : label}</button>
   );
 }
@@ -269,6 +275,62 @@ const ov: React.CSSProperties = { position: "fixed", inset: 0, zIndex: 70, backg
 const card: React.CSSProperties = { width: "100%", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16, padding: 24, boxShadow: "0 24px 80px rgba(0,0,0,.4)" };
 const fldS: React.CSSProperties = { background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 8, padding: "9px 11px", color: "var(--fg)", fontFamily: "inherit", fontSize: 13.5, width: "100%", boxSizing: "border-box" };
 const primaryBtn: React.CSSProperties = { background: "var(--accent)", color: "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontFamily: "inherit", fontSize: 13.5, fontWeight: 600, cursor: "pointer" };
+
+export function ExportPanel({ doc, onClose, notify }: { doc: DocumentOut; onClose: () => void; notify: (message: string, color?: string) => void }) {
+  const [items, setItems] = useState<DocumentExport[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [pdfaAvailable, setPdfaAvailable] = useState(false);
+  const reload = useCallback(() => {
+    listDocumentExports(doc.id).then((rows) => { setItems(rows); setError(""); }).catch((err) => setError((err as Error).message));
+  }, [doc.id]);
+  useEffect(() => { reload(); }, [reload]);
+  useEffect(() => {
+    let active = true;
+    const check = () => { void getExportCapabilities(doc.id).then((value) => {
+      if (active) setPdfaAvailable(value.pdfa_available);
+    }).catch(() => { if (active) setPdfaAvailable(false); }); };
+    check();
+    const timer = setInterval(check, 15000);
+    return () => { active = false; clearInterval(timer); };
+  }, [doc.id]);
+  useEffect(() => {
+    if (!jobId) return;
+    return streamJob(jobId, () => {}, (last) => {
+      setBusy(false); setJobId(null); reload();
+      if (jobOutcome(last) !== "ok") setError(last?.error || "Exportación no completada; consulta Actividad.");
+      else notify("Exportación disponible", "var(--ok)");
+    });
+  }, [jobId, reload, notify]);
+  async function create(kind: "pdf" | "pdfa" | "bagit") {
+    setBusy(true); setError("");
+    try { setJobId((await createDocumentExport(doc.id, kind)).id); }
+    catch (err) { setBusy(false); setError((err as Error).message); }
+  }
+  return <div style={ov} onClick={onClose}><div role="dialog" aria-modal="true" aria-label="Exportar documento" style={{ ...card, maxWidth: 660 }} onClick={(event) => event.stopPropagation()}>
+    <h2>Exportar «{doc.title}»</h2>
+    <p style={{ color: "var(--muted)", fontSize: 13 }}>Sin nuevas llamadas de IA. El PDF incluye las imágenes y un anexo de transcripción cercable; no inventa posiciones de palabras. El PDF normal no está validado como PDF/A.</p>
+    <p style={{ color: "var(--muted)", fontSize: 13 }}>La opción PDF/A-2b convierte una copia y exige validación con veraPDF. Conserva los originales; la conformidad del formato no certifica la exactitud de la transcripción.</p>
+    {!pdfaAvailable && <p role="status" style={{ color: "var(--muted)", fontSize: 13 }}>PDF/A no disponible: activa o revisa el perfil pdfa de Docker Compose. El PDF normal y BagIt siguen disponibles.</p>}
+    <p style={{ color: "var(--muted)", fontSize: 13 }}>El paquete BagIt conserva las imágenes disponibles, las revisiones, actas, menciones, fuentes y citas de este libro con checksums. No sustituye una copia completa de la aplicación.</p>
+    {error && <p role="alert" style={{ color: "var(--danger)" }}>{error}</p>}
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+      <Act on={busy} label="Crear PDF con transcripción" onClick={() => void create("pdf")} />
+      <Act on={busy} disabled={!pdfaAvailable} label="Crear PDF/A-2b validado" onClick={() => void create("pdfa")} />
+      <Act on={busy} label="Crear paquete de preservación" onClick={() => void create("bagit")} />
+      <Act label="Actualizar lista" onClick={reload} />
+    </div>
+    {busy && <p role="status">Generando en segundo plano… Puedes cerrar esta ventana y consultar Actividad.</p>}
+    {items.map((item) => <div key={item.id} style={{ borderTop: "1px solid var(--line)", padding: "10px 0" }}>
+      <div>{item.kind === "pdfa" ? (item.pdfa === "validated" ? "PDF/A-2b validado por veraPDF" : "PDF/A sin validación confirmada") : item.kind === "pdf" ? "PDF + transcripción" : "Paquete BagIt"} · {fmtSize(item.byte_size)} · {new Date(item.created_at).toLocaleString()}</div>
+      {item.stale && <p style={{ color: "var(--warn)", fontSize: 12 }}>Hay transcripciones posteriores; esta exportación conserva la versión anterior.</p>}
+      <Act label="Descargar" onClick={() => { void downloadDocumentExport(doc.id, item).catch((err) => setError((err as Error).message)); }} />
+      {item.kind === "pdfa" && <Act label="Descargar informe de validación" onClick={() => { void downloadExportValidation(doc.id, item).catch((err) => setError((err as Error).message)); }} />}
+    </div>)}
+    <button onClick={onClose} style={{ ...primaryBtn, marginTop: 14 }}>Cerrar</button>
+  </div></div>;
+}
 
 function RetxPanel({ doc, onClose, onStart }: { doc: DocumentOut; onClose: () => void; onStart: (opts: { credential_id?: string; model?: string }) => void }) {
   const [creds, setCreds] = useState<Credential[]>([]);
@@ -411,6 +473,9 @@ function IndexPanel({ doc, onClose, notify }: { doc: DocumentOut; onClose: () =>
 function wordDiff(a: string, b: string): { a: { w: string; same: boolean }[]; b: { w: string; same: boolean }[] } {
   const aw = (a || "").split(/\s+/), bw = (b || "").split(/\s+/);
   const n = aw.length, m = bw.length;
+  if (n * m > 1_000_000) return {
+    a: aw.map((w, i) => ({ w, same: bw[i] === w })), b: bw.map((w, i) => ({ w, same: aw[i] === w })),
+  };
   const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
   for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
     dp[i][j] = aw[i] === bw[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
@@ -436,8 +501,6 @@ function ReconcilePanel({ doc, onClose, onDone }: { doc: DocumentOut; onClose: (
   const e = useEstela();
   const [versions, setVersions] = useState<VersionPair[] | null>(null);
   const [mode, setMode] = useState<"substitute" | "mix" | "manual">("substitute");
-  const [criterion, setCriterion] = useState<"frequency" | "llm">("frequency");
-  const [keepHistory, setKeepHistory] = useState(true);
   const [choices, setChoices] = useState<Record<string, string>>({});
   const [idx, setIdx] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -447,8 +510,9 @@ function ReconcilePanel({ doc, onClose, onDone }: { doc: DocumentOut; onClose: (
 
   async function apply() {
     setBusy(true);
-    const body: ReconcileBody = { mode, keep_history: keepHistory };
-    if (mode === "mix") body.criterion = criterion;
+    const body: ReconcileBody = { mode, keep_history: true, expected_versions: Object.fromEntries(
+      pending.map((v) => [String(v.page_no), { active_id: v.active?.id ?? null, candidate_id: v.candidate?.id ?? null }])) };
+    if (mode === "mix") body.criterion = "frequency";
     if (mode === "manual") body.choices = choices;
     try { await reconcile(doc.id, body); onDone(); }
     catch (err) { e.notify((err as Error).message, "var(--danger)"); setBusy(false); }
@@ -473,8 +537,7 @@ function ReconcilePanel({ doc, onClose, onDone }: { doc: DocumentOut; onClose: (
           </div>
           {mode === "mix" && (
             <div style={{ display: "flex", gap: 14, marginBottom: 12, fontSize: 13 }}>
-              <label style={{ display: "inline-flex", gap: 6, alignItems: "center", cursor: "pointer" }}><input type="radio" checked={criterion === "frequency"} onChange={() => setCriterion("frequency")} /> Frecuencia en el libro</label>
-              <label style={{ display: "inline-flex", gap: 6, alignItems: "center", cursor: "pointer" }}><input type="radio" checked={criterion === "llm"} onChange={() => setCriterion("llm")} /> Reconciliar con LLM</label>
+              <span>Frecuencia en el libro. Sin llamadas de IA adicionales.</span>
             </div>
           )}
           {mode === "manual" && cur && (
@@ -501,9 +564,7 @@ function ReconcilePanel({ doc, onClose, onDone }: { doc: DocumentOut; onClose: (
               ); })()}
             </div>
           )}
-          <label style={{ display: "inline-flex", gap: 7, alignItems: "center", fontSize: 13, marginBottom: 14, cursor: "pointer" }}>
-            <input type="checkbox" checked={keepHistory} onChange={(ev) => setKeepHistory(ev.target.checked)} /> Guardar la versión anterior como histórico (no borrarla)
-          </label>
+          <p style={{ fontSize: 13 }}>Las versiones anteriores se conservan siempre. No se modifican automáticamente las conclusiones del árbol.</p>
           <div style={{ display: "flex", gap: 8 }}>
             <button disabled={busy} onClick={apply} style={primaryBtn}>{busy ? "Aplicando…" : "Aplicar"}</button>
             <button onClick={onClose} style={{ ...primaryBtn, background: "transparent", color: "var(--fg)", border: "1px solid var(--line)" }}>Cancelar</button>
@@ -551,12 +612,14 @@ function parseYears(name: string): [string, string] {
   return s ? [s[1], ""] : ["", ""];
 }
 function toItem(f: File): FileItem {
-  const [yf, yt] = parseYears(f.name);
-  return { file: f, type: parseType(f.name), yf, yt, bn: parseBookNumber(f.name) };
+  const name = f.webkitRelativePath || f.name;
+  const [yf, yt] = parseYears(name);
+  return { file: f, type: parseType(name), yf, yt, bn: parseBookNumber(name) };
 }
 
 function UploadForm({ initial = [], onDone }: { initial?: File[]; onDone: () => void }) {
-  const [items, setItems] = useState<FileItem[]>(() => initial.map(toItem));
+  const [items, setItems] = useState<FileItem[]>(() => initial.map(toItem).sort((a, b) =>
+    (a.file.webkitRelativePath || a.file.name).localeCompare(b.file.webkitRelativePath || b.file.name, "es", { numeric: true })));
   const [origin, setOrigin] = useState("own_photo");
   const [living, setLiving] = useState(false);
   const [isIndex, setIsIndex] = useState(false);
@@ -567,15 +630,20 @@ function UploadForm({ initial = [], onDone }: { initial?: File[]; onDone: () => 
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<Record<string, ItemStatus>>({});
   const [dragOver, setDragOver] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const completedUploads = useRef(new Set<string>());
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { getRecordTypes().then(setTypes).catch(() => setTypes([])); }, []);
 
   function addFiles(list: FileList | File[]) {
+    if (busy) return;
     const incoming = Array.from(list).filter((f) => f.type === "application/pdf" || f.type.startsWith("image/") || /\.(pdf|jpe?g|png|tiff?|webp)$/i.test(f.name));
     setItems((prev) => {
-      const seen = new Set(prev.map((it) => it.file.name + it.file.size));
-      return [...prev, ...incoming.filter((f) => !seen.has(f.name + f.size)).map(toItem)];
+      const key = (f: File) => `${f.webkitRelativePath || f.name}:${f.size}:${f.lastModified}`;
+      const seen = new Set(prev.map((it) => key(it.file)));
+      return [...prev, ...incoming.filter((f) => { const k = key(f); if (seen.has(k)) return false; seen.add(k); return true; }).map(toItem)]
+        .sort((a, b) => (a.file.webkitRelativePath || a.file.name).localeCompare(b.file.webkitRelativePath || b.file.name, "es", { numeric: true }));
     });
   }
   const remove = (i: number) => setItems((prev) => prev.filter((_, j) => j !== i));
@@ -585,29 +653,41 @@ function UploadForm({ initial = [], onDone }: { initial?: File[]; onDone: () => 
   async function submit() {
     if (items.length === 0) return;
     setBusy(true);
+    setUploadError("");
     const shared = {
       source_origin: origin, may_contain_living: living, image_policy: policy, is_index: isIndex,
       municipality: municipality || undefined, municipality_lat: coords?.lat, municipality_lng: coords?.lng,
     };
     const pdfs = items.filter((it) => isPdf(it.file));
     const imgs = items.filter((it) => !isPdf(it.file));
+    const groups = new Map<string, FileItem[]>();
+    for (const item of imgs) {
+      const path = item.file.webkitRelativePath;
+      const folder = path ? path.slice(0, path.lastIndexOf("/")) : "Imágenes seleccionadas";
+      const group = groups.get(folder);
+      if (group) group.push(item); else groups.set(folder, [item]);
+    }
     const tasks: { key: string; title: string; payload: File[]; flags: UploadFlags }[] = [
       ...pdfs.map((it) => ({
-        key: it.file.name + it.file.size, title: it.file.name.replace(/\.pdf$/i, ""), payload: [it.file],
+        key: `pdf:${it.file.webkitRelativePath || it.file.name}:${it.file.size}`, title: it.file.name.replace(/\.pdf$/i, ""), payload: [it.file],
         flags: { ...shared, record_type: it.type || undefined, year_from: it.yf ? Number(it.yf) : undefined, year_to: it.yt ? Number(it.yt) : undefined, book_number: it.bn ? Number(it.bn) : undefined } as UploadFlags,
       })),
-      ...(imgs.length ? [{
-        key: "__imgs__", title: imgs[0].file.name.replace(/\.[^.]+$/, "") || "Libro de imágenes", payload: imgs.map((it) => it.file),
-        flags: { ...shared, record_type: imgs[0].type || undefined, year_from: imgs[0].yf ? Number(imgs[0].yf) : undefined, year_to: imgs[0].yt ? Number(imgs[0].yt) : undefined, book_number: imgs[0].bn ? Number(imgs[0].bn) : undefined } as UploadFlags,
-      }] : []),
+      ...Array.from(groups, ([folder, group]) => ({
+        key: `images:${folder}`, title: folder,
+        payload: group.map((it) => it.file).sort((a, b) => a.name.localeCompare(b.name, "es", { numeric: true })),
+        flags: { ...shared, record_type: group[0].type || undefined, year_from: group[0].yf ? Number(group[0].yf) : undefined, year_to: group[0].yt ? Number(group[0].yt) : undefined, book_number: group[0].bn ? Number(group[0].bn) : undefined } as UploadFlags,
+      })),
     ];
+    let failed = false;
     for (const t of tasks) {
+      const fingerprint = JSON.stringify([t.key, t.payload.map((f) => [f.webkitRelativePath || f.name, f.size, f.lastModified])]);
+      if (completedUploads.current.has(fingerprint)) continue;
       setStatus((s) => ({ ...s, [t.key]: "uploading" }));
-      try { await uploadDocument(t.title, t.payload, t.flags); setStatus((s) => ({ ...s, [t.key]: "done" })); }
-      catch { setStatus((s) => ({ ...s, [t.key]: "error" })); }
+      try { await uploadDocument(t.title, t.payload, t.flags); completedUploads.current.add(fingerprint); setStatus((s) => ({ ...s, [t.key]: "done" })); }
+      catch (error) { failed = true; setUploadError(`${t.title}: ${(error as Error).message}`); setStatus((s) => ({ ...s, [t.key]: "error" })); }
     }
     setBusy(false);
-    onDone();
+    if (!failed) onDone();
   }
 
   const field: React.CSSProperties = { background: "var(--bg)", border: "1px solid var(--line)", borderRadius: 8, padding: "9px 12px", color: "var(--fg)", fontFamily: "inherit", fontSize: 13.5 };
@@ -617,6 +697,10 @@ function UploadForm({ initial = [], onDone }: { initial?: File[]; onDone: () => 
   return (
     <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 14, padding: 22, marginBottom: 22, boxShadow: "var(--shadow)" }}>
       <h3 style={{ margin: "0 0 16px", fontSize: 16, fontWeight: 600 }}>Añadir libros</h3>
+      {uploadError && <p role="alert" style={{ color: "var(--danger)" }}>{uploadError}. Puedes reintentar; los libros confirmados en esta ventana no se vuelven a enviar.</p>}
+      <label style={{ display: "block", marginBottom: 12 }}>Añadir carpetas (un libro por carpeta, imágenes en orden natural)
+        <input type="file" multiple disabled={busy} ref={(node) => node?.setAttribute("webkitdirectory", "")} onChange={(event) => { if (event.target.files) addFiles(event.target.files); }} />
+      </label>
 
       {/* dropzone */}
       <div
@@ -633,10 +717,13 @@ function UploadForm({ initial = [], onDone }: { initial?: File[]; onDone: () => 
       {/* selected files — each with its own type + year range (auto-detected from the filename) */}
       {items.length > 0 && (
         <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 6, maxHeight: 320, overflowY: "auto" }}>
-          {items.map((it, i) => {
-            const key = it.file.name + it.file.size;
+          {items.length > 100 && <p>Vista previa de los primeros 100 archivos; se enviarán los {items.length} seleccionados.</p>}
+          {items.slice(0, 100).map((it, i) => {
+            const relative = it.file.webkitRelativePath || it.file.name;
+            const key = isPdf(it.file) ? `pdf:${relative}:${it.file.size}` :
+              `images:${it.file.webkitRelativePath ? relative.slice(0, relative.lastIndexOf("/")) : "Imágenes seleccionadas"}`;
             return (
-              <div key={key} style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--bg)", border: "1px solid var(--line2)", borderRadius: 8, padding: "7px 10px", flexWrap: "wrap" }}>
+              <div key={`${relative}:${it.file.size}:${it.file.lastModified}`} style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--bg)", border: "1px solid var(--line2)", borderRadius: 8, padding: "7px 10px", flexWrap: "wrap" }}>
                 <span style={{ fontFamily: fonts.mono, fontSize: 10, color: "var(--accent)", flex: "none" }}>{isPdf(it.file) ? "PDF" : "IMG"}</span>
                 <span style={{ flex: "1 1 200px", minWidth: 120, fontSize: 12.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={it.file.name}>{it.file.name}</span>
                 <span style={{ fontFamily: fonts.mono, fontSize: 10.5, color: "var(--muted)", flex: "none" }}>{fmtSize(it.file.size)}</span>

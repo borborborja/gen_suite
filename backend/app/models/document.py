@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, text
-from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy.dialects.postgresql import UUID as PGUUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..db.base import Base, TimestampMixin, uuid_pk
@@ -15,6 +15,7 @@ class Document(Base, TimestampMixin):
     readable cross-tenant (RLS exception). Publishing requires a rights declaration."""
 
     __tablename__ = "documents"
+    __table_args__ = (UniqueConstraint("tenant_id", "id", name="uq_documents_tenant_id_id"),)
 
     id: Mapped[uuid.UUID] = uuid_pk()
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -31,7 +32,7 @@ class Document(Base, TimestampMixin):
     rights_declared_ip: Mapped[str | None] = mapped_column(String(64))
     source_kind: Mapped[str] = mapped_column(
         String(32), server_default=text("'upload'"), nullable=False
-    )  # upload/familysearch/transcription_output
+    )  # upload/familysearch/transcription_output/resumable_upload
     # Mode A (retain) keeps page images so the source page can be re-shown; Mode B (data_only)
     # keeps only the extracted facts + citation. ``may_contain_living`` is a GDPR flag.
     image_policy: Mapped[str] = mapped_column(
@@ -103,5 +104,9 @@ class Page(Base, TimestampMixin):
     byte_size: Mapped[int | None] = mapped_column(Integer)
     width: Mapped[int | None] = mapped_column(Integer)
     height: Mapped[int | None] = mapped_column(Integer)
+    original_filename: Mapped[str | None] = mapped_column(Text)
+    checksum: Mapped[str | None] = mapped_column(String(64))
+    source_page_no: Mapped[int | None] = mapped_column(Integer)
+    source_region: Mapped[dict | None] = mapped_column(JSONB)
 
     __table_args__ = (UniqueConstraint("document_id", "page_no", name="uq_pages_document_page"),)

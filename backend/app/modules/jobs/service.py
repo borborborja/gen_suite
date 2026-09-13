@@ -30,6 +30,8 @@ async def cancel_job(session: AsyncSession, job_id: uuid.UUID) -> Job:
     A still-active worker stops at its next checkpoint; a stuck/orphaned job is simply marked done
     so it leaves the activity list. Idempotent on already-terminal jobs."""
     job = await get_job(session, job_id)
+    if job.type == "recount_storage" and job.status in ACTIVE_STATUSES:
+        raise HTTPException(409, "Cancela el recuento desde Ajustes > Cuota de almacenamiento para liberar su bloqueo de forma segura.")
     if job.status in ACTIVE_STATUSES:
         job.status = JobStatus.CANCELLED
         job.finished_at = datetime.now(timezone.utc)

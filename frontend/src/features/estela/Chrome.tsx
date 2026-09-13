@@ -5,7 +5,7 @@ import { Cross } from "./icons";
 export function Toast() {
   const e = useEstela();
   if (!e.toast.show) return null;
-  const canUndo = e.toast.kind !== null;
+  const canUndo = !!e.toast.changeId;
   return (
     <div style={{
       position: "fixed", left: "50%", bottom: 28, transform: "translateX(-50%)", zIndex: 60,
@@ -38,27 +38,10 @@ export function ZoomModal() {
           <span style={{ fontFamily: fonts.mono, fontSize: 12, color: "var(--muted)", letterSpacing: ".08em" }}>{e.cur.recRef} · {e.cur.folio}</span>
           <div onClick={() => e.setZoom(false)} style={{ cursor: "pointer", color: "var(--muted)", display: "flex" }}><Cross size={18} /></div>
         </div>
-        <ManuscriptPlate quote={e.cur.recQuote} tall />
+        <div style={{ minHeight: 220, padding: 32, display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", color: "var(--muted)", fontSize: 14 }}>
+          No hay una imagen original disponible para ampliar. Consulta el Visor o la transcripción asociada.
+        </div>
       </div>
-    </div>
-  );
-}
-
-// A stylised manuscript "page" plate standing in for the <dc-import name="Manuscrito"> import.
-export function ManuscriptPlate({ quote, label, tall = false }: { quote?: string; label?: string; tall?: boolean }) {
-  return (
-    <div style={{
-      position: "relative", height: tall ? 460 : "100%", minHeight: tall ? undefined : 150,
-      background: "linear-gradient(155deg,#efe4ca,#dcc9a2)", overflow: "hidden",
-      boxShadow: "inset 0 0 0 1px rgba(120,85,40,.25)",
-    }}>
-      <div style={{ position: "absolute", inset: 0, background: "repeating-linear-gradient(transparent 0 26px, rgba(96,64,30,.12) 26px 27px)" }} />
-      <div style={{ position: "absolute", inset: 0, padding: tall ? "40px 56px" : "18px 22px", fontFamily: fonts.serif, fontStyle: "italic", color: "#4a3414", fontSize: tall ? 22 : 13, lineHeight: tall ? "27px" : "20px", textShadow: "0 1px 0 rgba(255,255,255,.3)" }}>
-        {quote || "Joannes, fill de Francesc Vidal y de Maria Soler…"}
-      </div>
-      {label && (
-        <span style={{ position: "absolute", bottom: 8, left: 10, background: "rgba(20,16,10,.6)", color: "#fff", fontFamily: fonts.mono, fontSize: 10, padding: "3px 7px", borderRadius: 5 }}>{label}</span>
-      )}
     </div>
   );
 }

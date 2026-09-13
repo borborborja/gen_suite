@@ -12,6 +12,12 @@ class SearchHit(BaseModel):
     page_no: int
     snippet: str | None
     score: float
+    page_id: uuid.UUID | None = None
+    index_generation_id: uuid.UUID | None = None
+    embedding_item_id: uuid.UUID | None = None
+    embedding_ai_call_id: uuid.UUID | None = None
+    query_ai_call_id: uuid.UUID | None = None
+    source_hash: str | None = None
 
 
 class SuggestionOut(BaseModel):
@@ -35,3 +41,11 @@ class RecordHit(BaseModel):
     role: str | None
     summary: str | None
     score: float = 0.0
+    page_id: uuid.UUID | None = None
+    transcription_id: uuid.UUID | None = None
+    transcription_end_id: uuid.UUID | None = None
+    index_generation_id: uuid.UUID | None = None
+    embedding_item_id: uuid.UUID | None = None
+    embedding_ai_call_id: uuid.UUID | None = None
+    query_ai_call_id: uuid.UUID | None = None
+    source_hash: str | None = None

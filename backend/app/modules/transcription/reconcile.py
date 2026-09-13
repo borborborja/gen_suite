@@ -68,8 +68,8 @@ async def llm_reconcile(rc, old: str, new: str) -> str:
 
     prompt = f"VERSIÓN A:\n{old or ''}\n\nVERSIÓN B:\n{new or ''}\n\nTranscripción final:"
     try:
-        out = await asyncio.to_thread(
-            extract_structured, rc, prompt,
+        out = await extract_structured(
+            rc, prompt,
             schema=_RECONCILE_SCHEMA, system=_RECONCILE_SYSTEM, schema_name="reconcile",
         )
         return out.get("text") or (new or "")

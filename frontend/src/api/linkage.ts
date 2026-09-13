@@ -50,6 +50,8 @@ export interface CandidateOut {
   person_mention_id: string;
   record_id: string | null;
   score: number;
+  score_kind: string;
+  score_version: string;
   status: string;
   method: string;
   relation: string; // "self" | "sibling"
@@ -95,6 +97,31 @@ export interface DecisionOut {
   id: string;
   status: string;
   resolved_person_id: string | null;
+  change_id?: string | null;
+}
+
+export interface DecisionAction {
+  kind: "confirm_identity" | "create_sibling" | "relative";
+  mention_id: string;
+  name: string;
+  relation: string;
+  role?: string | null;
+  required: boolean;
+}
+
+export interface CandidatePreview {
+  candidate_id: string;
+  status: string;
+  relation: string;
+  tree_person_id: string;
+  actions: DecisionAction[];
+  updated_at: string;
+  preview_token: string;
+}
+
+export interface CandidateApplyOut extends DecisionOut {
+  change_id: string;
+  created_or_linked_person_ids: string[];
 }
 
 export const discover = (person_id: string, max_candidates = 50) =>
@@ -118,8 +145,20 @@ export function listCandidates(person_id?: string, status?: string) {
   return api<CandidateOut[]>(`/linkage/candidates${q ? `?${q}` : ""}`);
 }
 
-export const confirmCandidate = (id: string) =>
-  api<DecisionOut>(`/linkage/candidates/${id}/confirm`, { method: "POST" });
+export const previewCandidate = (id: string) =>
+  api<CandidatePreview>(`/linkage/candidates/${id}/preview`, { method: "POST" });
+
+export const applyCandidate = (
+  id: string,
+  body: { preview_token: string; relative_mention_ids?: string[]; existing_person_ids?: Record<string, string>; candidate_person_id?: string | null },
+) => api<CandidateApplyOut>(`/linkage/candidates/${id}/apply`, {
+  method: "POST",
+  headers: { "Idempotency-Key": crypto.randomUUID() },
+  body: JSON.stringify(body),
+});
+
+/** @deprecated Unsafe direct confirmation is intentionally disabled on the server. */
+export const confirmCandidate = (id: string) => previewCandidate(id);
 
 export const rejectCandidate = (id: string) =>
   api<DecisionOut>(`/linkage/candidates/${id}/reject`, { method: "POST" });

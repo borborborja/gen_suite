@@ -1,6 +1,8 @@
 # Secrets / env
 .env
 config/.env
+config/installer.json
+config/Caddyfile.example
 *.local
 
 # Private homelab deployment overlay (Cloudflare tunnel, external nets, bind IPs)
@@ -21,6 +23,8 @@ venv/
 # Node / frontend
 node_modules/
 frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
 
 # Data (host-mapped persistent volumes: postgres/redis/minio under DATA_DIR)
 dades/

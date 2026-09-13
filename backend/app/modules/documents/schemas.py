@@ -39,6 +39,10 @@ class PageOut(BaseModel):
     height: int | None
     byte_size: int | None
     source_ref: str | None = None  # exact image origin (e.g. FamilySearch ARK)
+    original_filename: str | None = None
+    checksum: str | None = None
+    source_page_no: int | None = None
+    source_region: dict | None = None
 
 
 class PublishRequest(BaseModel):

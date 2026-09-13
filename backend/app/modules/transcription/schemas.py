@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TranscribeRequest(BaseModel):
@@ -31,14 +32,31 @@ class TranscriptionOut(BaseModel):
     status: str
 
 
+class CorrectionRequest(BaseModel):
+    text: str = Field(max_length=500_000)
+
+
+class ExpectedVersion(BaseModel):
+    active_id: uuid.UUID | None
+    candidate_id: uuid.UUID | None
+
+
 class VersionPairOut(BaseModel):
     page_no: int
     active: TranscriptionOut | None
     candidate: TranscriptionOut | None
 
 
+class TranscriptionRevisionOut(TranscriptionOut):
+    is_active: bool
+    supersedes_id: uuid.UUID | None
+    reviewed_by: uuid.UUID | None
+    created_at: datetime
+
+
 class ReconcileRequest(BaseModel):
     mode: str  # substitute | mix | manual
     criterion: str | None = None  # for mix: frequency | llm
-    keep_history: bool = False  # keep the old transcription as an archived version
+    keep_history: bool = True  # compatibility field; evidence history is always preserved
     choices: dict[str, str] | None = None  # manual: page_no -> "old" | "new" | edited text
+    expected_versions: dict[str, ExpectedVersion]
